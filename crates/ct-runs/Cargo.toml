@@ -5,3 +5,15 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+libc.workspace = true
+regex.workspace = true
+ct-agentd = { path = "../ct-agentd" }
+ct-core = { path = "../ct-core" }
+ct-store = { path = "../ct-store" }
+ct-agent = { path = "../ct-agent" }
+
+[dev-dependencies]
+tempfile.workspace = true

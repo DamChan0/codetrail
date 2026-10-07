@@ -183,6 +183,19 @@ pub enum Msg {
     Prompt(Result<agent_ask::Prompt, String>),
     AskChunk(String),
     AskDone(Result<(), String>),
+    Accounts { accounts: Vec<crate::agents::Account>, runtime: crate::agents::RuntimeStatus },
+    RuntimeProgress(String),
+    RuntimeDone(Result<(), String>),
+    Models { backend: crate::agents::Backend, res: Result<Vec<crate::agents::ModelInfo>, String> },
+    LoginSession(Arc<dyn crate::agents::LoginSession>),
+    LoginEv(crate::agents::LoginEvent),
+    LoggedOut { id: String, res: Result<(), String> },
+    RunsOpened(Result<(Arc<dyn crate::agents::RunService>, Vec<crate::agents::RunInfo>), String>),
+    RunUpd(crate::agents::RunUpdate),
+    RunSubmitted(Result<String, String>),
+    RunControl { what: &'static str, res: Result<(), String> },
+    RunFinished { what: &'static str, res: Result<String, String> },
+    RunReview { res: Result<(String, String), String> },
 }
 
 // ---------------------------------------------------------------- panel state
@@ -192,10 +205,12 @@ pub enum RailTab {
     Commits,
     Search,
     Files,
+    Runs,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Centre {
     Diff,
+    Run,
     Blame,
     Editor,
 }
@@ -298,14 +313,11 @@ pub enum AskPhase {
 
 pub struct AskState {
     pub question: String,
-    pub agent: usize,
     pub phase: AskPhase,
     pub output: String,
     pub started: Option<Instant>,
     pub for_ref: Option<String>,
 }
-
-pub const AGENTS: [&str; 3] = ["claude", "omp", "codex"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaletteMode {
@@ -342,6 +354,7 @@ pub struct Smoke {
 }
 
 pub struct App {
+    pub ag: crate::agentapp::AgentState,
     pub th: Theme,
     pub settings: Settings,
     pub banners: Vec<(crate::widgets::Level, String)>,
@@ -414,14 +427,15 @@ pub fn short_repo_name(p: &std::path::Path) -> String {
 }
 
 impl App {
-    pub fn new(ctx: egui::Context, repo_arg: PathBuf, theme_file: ThemeFile, settings: Settings, banners: Vec<(crate::widgets::Level, String)>, fonts_note: String, smoke: Option<Smoke>) -> App {
+    pub fn new(ctx: egui::Context, repo_arg: PathBuf, theme_file: ThemeFile, settings: Settings, banners: Vec<(crate::widgets::Level, String)>, fonts_note: String, smoke: Option<Smoke>, svc: Arc<dyn crate::agents::AgentService>) -> App {
         let th = Theme { file: theme_file, ui_font: settings.ui_font_size, code_font: settings.code_font_size };
         let rc = ctx.clone();
         let jobs = Jobs::new(move || rc.request_repaint());
         let mut app = App {
+            ag: crate::agentapp::AgentState::new(svc),
             th,
             diff_opts: DiffOpts::default(),
-            ask: AskState { question: String::new(), agent: AGENTS.iter().position(|a| *a == settings.ask_agent).unwrap_or(0), phase: AskPhase::Idle, output: String::new(), started: None, for_ref: None },
+            ask: AskState { question: String::new(), phase: AskPhase::Idle, output: String::new(), started: None, for_ref: None },
             settings,
             banners,
             fonts_note,
@@ -1037,18 +1051,28 @@ impl App {
 
     pub fn send_ask(&mut self, prompt: &agent_ask::Prompt) {
         let Some(repo) = self.repo.clone() else { return };
-        let Ok(kind) = agent_ask::AgentKind::parse(AGENTS[self.ask.agent]) else { return };
+        let sel = match self.ag_ask_target() {
+            Ok(s) => s,
+            Err(why) => return self.ag_ask_phase_failed(why),
+        };
         self.ask.phase = AskPhase::Running;
         self.ask.output.clear();
         self.ask.started = Some(Instant::now());
         let text = prompt.render();
         let timeout = Duration::from_secs(self.settings.ask_timeout_secs);
+        let svc = self.ag.svc.clone();
         self.jobs.spawn(JobKind::Ask, move |c| {
-            let opts = agent_ask::RunOpts { timeout, cancel: c.cancel.clone(), cwd: repo.root.clone() };
+            let opts = crate::agents::SessionOpts {
+                cwd: repo.root.clone(),
+                model: Some(sel.clone()),
+                read_only: true,
+                env_allow: Vec::new(),
+                system_note: Some("Answer from the context given. Read-only question: do not modify files or run commands that change anything.".into()),
+            };
             let mut chunk = |s: &str| {
                 c.stream(Msg::AskChunk(s.to_string()));
             };
-            let res = run_ask(kind, &text, &opts, &mut chunk, timeout);
+            let res = crate::agentapp::run_ask_session(&*svc, sel.backend, opts, &text, &c.cancel, timeout, &mut chunk);
             c.finish_forced(Msg::AskDone(res));
         });
     }
@@ -1062,6 +1086,9 @@ impl App {
     // ------------------------------------------------------------ message pump
 
     pub fn pump(&mut self) {
+        while let Ok(m) = self.ag.side_rx.try_recv() {
+            self.handle(m);
+        }
         for (_, msg) in self.jobs.poll() {
             self.handle(msg);
         }
@@ -1250,6 +1277,7 @@ impl App {
                     Err(e) => AskPhase::Failed(e),
                 };
             }
+            other => self.ag_handle(other),
         }
     }
 
@@ -1263,19 +1291,6 @@ pub fn short_ref(r: &str) -> String {
         crate::timefmt::short(r).to_string()
     } else {
         r.to_string()
-    }
-}
-
-/// Runs the agent and maps the outcome to a user-facing message.
-pub fn run_ask(kind: agent_ask::AgentKind, prompt: &str, opts: &agent_ask::RunOpts, on_chunk: &mut dyn FnMut(&str), timeout: Duration) -> Result<(), String> {
-    match agent_ask::run_agent(kind, prompt, opts, on_chunk) {
-        Err(e) => Err(format!("{e}. Is the agent installed and on PATH?")),
-        Ok(r) => match r.status {
-            agent_ask::RunStatus::Exited(0) => Ok(()),
-            agent_ask::RunStatus::Exited(code) => Err(format!("The agent exited with status {code}.{}", if r.stderr.trim().is_empty() { String::new() } else { format!(" {}", r.stderr.trim()) })),
-            agent_ask::RunStatus::TimedOut => Err(format!("No answer within {}s: the agent was stopped. Raise the timeout in Settings, or retry.", timeout.as_secs())),
-            agent_ask::RunStatus::Cancelled => Err("Cancelled.".into()),
-        },
     }
 }
 
@@ -1382,37 +1397,5 @@ mod tests {
     fn short_ref_only_shortens_full_shas() {
         assert_eq!(short_ref("main"), "main");
         assert_eq!(short_ref(&"a".repeat(40)), "aaaaaaa");
-    }
-
-    #[test]
-    fn ask_error_messages_name_the_recovery() {
-        let opts = |cancel: bool| {
-            let c = Arc::new(std::sync::atomic::AtomicBool::new(cancel));
-            agent_ask::RunOpts { timeout: Duration::from_secs(5), cancel: c, cwd: std::env::temp_dir() }
-        };
-        // missing binary: spawn error mentions PATH
-        std::env::set_var("CODETRAIL_CODEX_BIN", "definitely-not-an-agent-binary");
-        let e = run_ask(agent_ask::AgentKind::Codex, "hi", &opts(false), &mut |_| {}, Duration::from_secs(5)).unwrap_err();
-        assert!(e.contains("PATH"), "{e}");
-        // timeout and cancel use a fake agent script
-        let d = tempfile::tempdir().unwrap();
-        let script = d.path().join("slow-agent");
-        std::fs::write(&script, "#!/bin/sh\necho partial\nsleep 30\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        std::env::set_var("CODETRAIL_CODEX_BIN", &script);
-        let mut o = opts(false);
-        o.timeout = Duration::from_millis(300);
-        let mut got = String::new();
-        let t = Instant::now();
-        let e = run_ask(agent_ask::AgentKind::Codex, "hi", &o, &mut |s| got.push_str(s), Duration::from_millis(300)).unwrap_err();
-        assert!(e.contains("No answer within"), "{e}");
-        assert!(got.contains("partial"), "streamed output must reach the caller: {got:?}");
-        assert!(t.elapsed() < Duration::from_secs(10));
-        let e = run_ask(agent_ask::AgentKind::Codex, "hi", &opts(true), &mut |_| {}, Duration::from_secs(5)).unwrap_err();
-        assert_eq!(e, "Cancelled.");
     }
 }

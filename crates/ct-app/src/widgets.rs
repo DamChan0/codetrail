@@ -359,6 +359,42 @@ pub fn segmented(ui: &mut Ui, th: &Theme, options: &[&str], selected: &mut usize
     changed
 }
 
+/// Segmented control where some segments are disabled; `disabled[i] = Some(reason)` shows the
+/// reason as a tooltip and blocks selection.
+pub fn segmented_gated(ui: &mut Ui, th: &Theme, options: &[&str], disabled: &[Option<String>], selected: &mut usize, pad_x: f32) -> bool {
+    let m = th.m();
+    let h = m.control_height;
+    let widths: Vec<f32> = options.iter().map(|o| galley(ui, o, ui_font(th), th.fg()).size().x + 2.0 * pad_x).collect();
+    let total: f32 = widths.iter().sum();
+    let (rect, _) = ui.allocate_exact_size(vec2(total + 2.0, h), Sense::hover());
+    ui.painter().rect(rect, m.radius, th.sunken(), Stroke::new(1.0, th.border()), egui::StrokeKind::Inside);
+    let mut x = rect.min.x + 1.0;
+    let mut changed = false;
+    for (i, w) in widths.iter().enumerate() {
+        let seg = Rect::from_min_size(pos2(x, rect.min.y + 1.0), vec2(*w, h - 2.0));
+        let reason = disabled.get(i).and_then(|d| d.as_deref());
+        let resp = ui.interact(seg, ui.id().with(("segg", i, options[i])), Sense::click());
+        let sel = *selected == i;
+        if sel {
+            ui.painter().rect_filled(seg, m.radius_small, if reason.is_some() { th.border() } else { th.accent() });
+        } else if resp.hovered() && reason.is_none() {
+            ui.painter().rect_filled(seg, m.radius_small, th.hover());
+        }
+        paint_focus(ui, th, seg, &resp, m.radius_small);
+        let col = if reason.is_some() { th.disabled() } else if sel { th.p().accent_fg.0 } else if resp.hovered() { th.fg() } else { th.muted() };
+        let g2 = galley(ui, options[i], ui_font(th), col);
+        ui.painter().galley(pos2(seg.center().x - g2.size().x / 2.0, seg.center().y - g2.size().y / 2.0), g2, col);
+        if let Some(r) = reason {
+            resp.on_hover_text(r);
+        } else if resp.clicked() && !sel {
+            *selected = i;
+            changed = true;
+        }
+        x += w;
+    }
+    changed
+}
+
 // ---------- ListRow ----------
 
 /// Allocates a full-width row, paints hover/selected background, returns the response and the

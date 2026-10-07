@@ -1,3 +1,9 @@
+mod agentapp;
+mod agents;
+mod agents_fake;
+mod agents_real;
+mod agentui;
+mod agentvm;
 mod app;
 mod diffmodel;
 mod editor;
@@ -5,6 +11,7 @@ mod fonts;
 mod fsutil;
 mod highlight;
 mod jobs;
+mod runs_real;
 mod selection;
 mod settings;
 mod theme;
@@ -16,7 +23,7 @@ mod widgets;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "codetrail [REPO]\n       codetrail <install|hook|note|record|ask|export> ...\n       codetrail --smoke REPO --screenshot OUT.png [--scene commit|split|search|why|light|settings] [--size WxH] [--query TEXT]";
+const USAGE: &str = "codetrail [REPO]\n       codetrail <install|hook|note|record|ask|export> ...\n       codetrail --smoke REPO --screenshot OUT.png [--scene commit|split|search|why|light|settings|runs|runs-stream|accounts|model-picker|new-run] [--size WxH] [--query TEXT]";
 
 struct Args {
     repo: Option<PathBuf>,
@@ -39,7 +46,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--screenshot" => shot = Some(PathBuf::from(val("--screenshot")?)),
             "--scene" => {
                 scene = val("--scene")?;
-                if !["commit", "split", "search", "why", "light", "settings"].contains(&scene.as_str()) {
+                if !["commit", "split", "search", "why", "light", "settings", "runs", "runs-stream", "accounts", "model-picker", "new-run"].contains(&scene.as_str()) {
                     return Err(format!("unknown scene {scene:?}"));
                 }
             }
@@ -101,8 +108,9 @@ fn main() -> ExitCode {
             let note = fonts::install(&cc.egui_ctx, &choice);
             let th = theme::Theme { file: theme_file.clone(), ui_font: settings.ui_font_size, code_font: settings.code_font_size };
             th.apply(&cc.egui_ctx);
+            let svc: std::sync::Arc<dyn agents::AgentService> = if smoke.is_some() { std::sync::Arc::new(agents_fake::FakeAgents::seeded()) } else { std::sync::Arc::new(agents_real::RealAgents) };
             let smoke = smoke.map(|(out, scene, query)| app::Smoke { scene, out, query, started: std::time::Instant::now(), stable: 0, settled_at: None, requested: false, prepared: false });
-            Ok(Box::new(app::App::new(cc.egui_ctx.clone(), repo_arg, theme_file, settings, banners, note, smoke)))
+            Ok(Box::new(app::App::new(cc.egui_ctx.clone(), repo_arg, theme_file, settings, banners, note, smoke, svc)))
         }),
     );
     match res {

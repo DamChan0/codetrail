@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+# Fake `claude`: `auth status` -> JSON; otherwise reads the prompt from stdin and replays ./scenario
+# (lines OUT:/ERR:/SLEEP:/EXIT:) or a default successful run. Records its argv in ./argv.json.
+import json, sys, time, os
+if sys.argv[1:3] == ["auth", "status"]:
+    print(json.dumps({"loggedIn": True, "authMethod": "claude.ai"}))
+    sys.exit(0)
+json.dump(sys.argv[1:], open("argv.json", "w"))
+prompt = sys.stdin.read()
+sc = [l for l in open("scenario").read().split("\n") if l] if os.path.exists("scenario") else []
+if not sc:
+    sc = ['OUT:{"type":"system","subtype":"init"}',
+          'OUT:{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}}',
+          'OUT:{"type":"result","subtype":"success","is_error":false,"result":"ok","total_cost_usd":0.01,"usage":{"input_tokens":3,"output_tokens":1}}']
+for l in sc:
+    if l.startswith("OUT:"): print(l[4:], flush=True)
+    elif l.startswith("ERR:"): sys.stderr.write(l[4:] + "\n"); sys.stderr.flush()
+    elif l.startswith("SLEEP:"): time.sleep(float(l[6:]))
+    elif l.startswith("EXIT:"): os._exit(int(l[5:]))

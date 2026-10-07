@@ -490,6 +490,13 @@ name = "ct-agentd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -498,11 +505,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ct-agent",
+ "ct-agentd",
  "ct-core",
+ "ct-runs",
  "ct-store",
  "eframe",
  "egui",
  "image",
+ "parking_lot",
  "serde",
  "similar",
  "tempfile",
@@ -530,6 +540,16 @@ name = "ct-runs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ct-agent",
+ "ct-agentd",
+ "ct-core",
+ "ct-store",
+ "libc",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

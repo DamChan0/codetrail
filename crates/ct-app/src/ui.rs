@@ -46,6 +46,7 @@ pub const COMMANDS: [(Cmd, &str, &str); 13] = [
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump();
+        self.ag_close_requested(ctx);
         self.smoke_prepare();
         self.shortcuts(ctx);
         self.debounce(ctx);
@@ -122,6 +123,7 @@ impl eframe::App for App {
         self.palette_ui(ctx);
         self.ask_preview_window(ctx);
         self.settings_window(ctx);
+        self.agent_windows(ctx);
         self.smoke_tick(ctx);
     }
 }
@@ -384,11 +386,19 @@ impl App {
                 RailTab::Commits => 0,
                 RailTab::Search => 1,
                 RailTab::Files => 2,
+                RailTab::Runs => 3,
             };
-            if widgets::segmented(ui, &th, &["Commits", "Search", "Files"], &mut i) {
-                self.rail = [RailTab::Commits, RailTab::Search, RailTab::Files][i];
+            let badge = self.ag.runs.badge();
+            let runs_label = if badge > 0 { format!("Runs {badge}") } else { "Runs".to_string() };
+            if widgets::segmented_gated(ui, &th, &["Commits", "Search", "Files", &runs_label], &[], &mut i, 8.0) {
+                self.rail = [RailTab::Commits, RailTab::Search, RailTab::Files, RailTab::Runs][i];
                 if self.rail == RailTab::Search {
                     self.search.focus = true;
+                }
+                if self.rail == RailTab::Runs {
+                    self.ag_open_runs();
+                } else if self.centre == Centre::Run {
+                    self.centre = Centre::Diff;
                 }
             }
         });
@@ -397,6 +407,7 @@ impl App {
             RailTab::Commits => self.commits_panel(ui),
             RailTab::Search => self.search_panel(ui),
             RailTab::Files => self.files_panel(ui),
+            RailTab::Runs => self.runs_panel(ui),
         }
     }
 
@@ -1098,6 +1109,8 @@ impl App {
                 let ratio = theme::contrast(self.th.fg(), self.th.bg());
                 let (lvl, msg) = if ratio >= 4.5 { (Level::Info, format!("Text contrast {ratio:.1}:1")) } else { (Level::Warn, format!("Text contrast {ratio:.1}:1 is below the 4.5:1 minimum for readable text.")) };
                 widgets::banner(ui, &th, lvl, &msg, None, false);
+                ui.add_space(4.0);
+                self.accounts_section(ui);
                 ui.add_space(4.0);
                 widgets::heading(ui, &th, "Behaviour");
                 ui.horizontal(|ui| {

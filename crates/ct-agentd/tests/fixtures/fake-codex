@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+# Fake `codex`: `login status`, `debug models`, and `exec --json ... -` (prompt on stdin).
+import json, sys, time, os
+a = sys.argv[1:]
+if a[:2] == ["login", "status"]:
+    print("Logged in using ChatGPT"); sys.exit(0)
+if a[:2] == ["debug", "models"]:
+    print(json.dumps({"models":[{"slug":"gx-1","display_name":"GX One","visibility":"list","context_window":4000,"supported_reasoning_levels":["low"]},{"slug":"hidden","visibility":"hide"}]})); sys.exit(0)
+json.dump(a, open("argv.json", "w"))
+prompt = sys.stdin.read()
+sc = [l for l in open("scenario").read().split("\n") if l] if os.path.exists("scenario") else []
+if not sc:
+    sc = ['OUT:{"type":"thread.started","thread_id":"t"}','OUT:{"type":"turn.started"}',
+          'OUT:{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"ok"}}',
+          'OUT:{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":1}}']
+for l in sc:
+    if l.startswith("OUT:"): print(l[4:], flush=True)
+    elif l.startswith("ERR:"): sys.stderr.write(l[4:] + "\n"); sys.stderr.flush()
+    elif l.startswith("SLEEP:"): time.sleep(float(l[6:]))
+    elif l.startswith("EXIT:"): os._exit(int(l[5:]))

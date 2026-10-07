@@ -1,7 +1,25 @@
 //! ~/.config/codetrail/config.toml — behavioural settings (colours live in theme.toml).
 
+use crate::agents::Backend;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// `[agent]` table: the one backend/model/thinking selection shared by Ask AI and new runs.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AgentCfg {
+    pub backend: Backend,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+    pub max_concurrent: usize,
+}
+
+impl Default for AgentCfg {
+    fn default() -> Self {
+        AgentCfg { backend: Backend::Pi, provider: None, model: None, thinking: None, max_concurrent: 3 }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -11,7 +29,9 @@ pub struct Settings {
     pub tab_width: usize,
     pub split_view: bool,
     pub ask_preview: bool,
-    pub ask_agent: String,
+    pub agent: AgentCfg,
+    /// Kill switch: account ids listed here are shown as unavailable and never used.
+    pub accounts_disabled: Vec<String>,
     pub ask_timeout_secs: u64,
     pub git_timeout_secs: u64,
     pub rail_width: f32,
@@ -26,7 +46,8 @@ impl Default for Settings {
             tab_width: 4,
             split_view: false,
             ask_preview: true,
-            ask_agent: "claude".into(),
+            agent: AgentCfg::default(),
+            accounts_disabled: Vec::new(),
             ask_timeout_secs: 180,
             git_timeout_secs: 30,
             rail_width: 340.0,
@@ -49,6 +70,7 @@ impl Settings {
         self.inspector_width = self.inspector_width.clamp(260.0, 640.0);
         self.ask_timeout_secs = self.ask_timeout_secs.clamp(5, 3600);
         self.git_timeout_secs = self.git_timeout_secs.clamp(1, 600);
+        self.agent.max_concurrent = self.agent.max_concurrent.clamp(1, 8);
         self
     }
 

@@ -18,6 +18,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 ct-core = { path = "../ct-core" }
 ct-store = { path = "../ct-store" }
 ct-agent = { path = "../ct-agent" }
+ct-agentd = { path = "../ct-agentd" }
+ct-runs = { path = "../ct-runs" }
+parking_lot.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

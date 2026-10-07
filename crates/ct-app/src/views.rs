@@ -56,6 +56,10 @@ impl App {
             widgets::empty_state(ui, &th, "No repository", "Start CodeTrail inside a git repository, or pass its path as an argument.");
             return;
         }
+        if self.centre == Centre::Run {
+            self.run_ui(ui);
+            return;
+        }
         // Header: file path + view switch.
         egui::Frame::new().fill(th.raised()).stroke(egui::Stroke::new(1.0, th.border())).inner_margin(egui::Margin::symmetric(12, 6)).show(ui, |ui| {
             ui.set_height(m.control_height);
@@ -64,7 +68,7 @@ impl App {
                 let name = match self.centre {
                     Centre::Editor => self.editor.as_ref().map(|e| e.path.clone()),
                     Centre::Blame => Some(self.blame.path.clone()).filter(|p| !p.is_empty()),
-                    Centre::Diff => self.file_sel.clone(),
+                    Centre::Diff | Centre::Run => self.file_sel.clone(),
                 };
                 let w = (ui.available_width() - 330.0).max(80.0);
                 match &name {
@@ -83,7 +87,7 @@ impl App {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let mut i = match self.centre {
-                        Centre::Diff => 0,
+                        Centre::Diff | Centre::Run => 0,
                         Centre::Blame => 1,
                         Centre::Editor => 2,
                     };
@@ -100,7 +104,7 @@ impl App {
             });
         });
         match self.centre {
-            Centre::Diff => self.diff_ui(ui),
+            Centre::Diff | Centre::Run => self.diff_ui(ui),
             Centre::Blame => self.blame_ui(ui),
             Centre::Editor => self.editor_ui(ui),
         }
@@ -733,13 +737,7 @@ impl App {
         ui.add_space(m.space[1]);
         ui.horizontal(|ui| {
             ui.add_space(m.space[2]);
-            ui.label(RichText::new("Agent").color(th.muted()));
-            let mut a = self.ask.agent;
-            if widgets::segmented(ui, &th, &AGENTS, &mut a) {
-                self.ask.agent = a;
-                self.settings.ask_agent = AGENTS[a].to_string();
-                self.settings_dirty_at = Some(Instant::now());
-            }
+            ui.vertical(|ui| self.model_picker(ui, "ask"));
         });
         ui.add_space(m.space[1]);
         ui.horizontal(|ui| {
@@ -895,6 +893,32 @@ impl App {
                     self.th.apply(&self.ctx);
                 }
                 "settings" => self.settings_open = true,
+                "accounts" => {
+                    self.settings_open = true;
+                    self.ag.how_open = Some("claude".into());
+                    let mut lu = crate::agentvm::LoginUi::new("github-copilot");
+                    lu.apply(crate::agents::LoginEvent::OpenUrl("https://github.com/login/device".into()));
+                    lu.apply(crate::agents::LoginEvent::NeedCode { prompt: "Paste the code from the browser".into() });
+                    self.ag.login = Some((lu, None));
+                }
+                "runs" | "runs-stream" => {
+                    self.rail = RailTab::Runs;
+                    self.ag_open_runs();
+                }
+                "model-picker" => {
+                    self.insp_open = true;
+                    self.insp = InspTab::Ask;
+                    self.ag_ensure_models();
+                }
+                "new-run" => {
+                    self.rail = RailTab::Runs;
+                    self.ag_open_runs();
+                    self.ag_new_run_dialog();
+                    if let Some(n) = &mut self.ag.new_run {
+                        n.prompt = "Add a --json flag to the export command and cover it with a test.".into();
+                        n.focus = false;
+                    }
+                }
                 "search" => {
                     self.rail = RailTab::Search;
                     self.search.query = self.smoke.as_ref().map(|s| s.query.clone()).unwrap_or_default();
@@ -914,7 +938,27 @@ impl App {
         if scene == "search" && self.repo.is_some() && self.search.ran.is_none() {
             self.start_search();
         }
-        let mut settled = ready && (scene != "search" || self.search.ran.is_some());
+        if scene == "model-picker" && !self.insp_open && !self.smoke.as_ref().is_some_and(|s| s.requested) {
+            self.insp_open = true;
+        }
+        let ag_scene = matches!(scene.as_str(), "runs" | "runs-stream" | "accounts" | "model-picker" | "new-run");
+        let ag_ready = !ag_scene || (self.ag.accounts.ready().is_some() && !self.ag.models.is_loading() && (self.ag.runs_svc.ready().is_some() || !matches!(scene.as_str(), "runs" | "runs-stream" | "new-run")));
+        if scene == "runs-stream" && self.ag.runs_svc.ready().is_some() && self.centre != Centre::Run {
+            use crate::agents::{AgentEvent as E, RunUpdate as U};
+            for e in [
+                E::TextDelta("I'll start by reading the export command.\n".into()),
+                E::ToolStart { id: "t1".into(), name: "read".into(), summary: "crates/ct-cli/src/export.rs".into() },
+                E::ToolEnd { id: "t1".into(), name: "read".into(), ok: true, path: Some("crates/ct-cli/src/export.rs".into()) },
+                E::TextDelta("The export has one format today. I'll add a `--json` switch next to `--format` and a test that parses its output.\n".into()),
+                E::ToolStart { id: "t2".into(), name: "edit".into(), summary: "add --json flag".into() },
+                E::ToolEnd { id: "t2".into(), name: "edit".into(), ok: true, path: Some("crates/ct-cli/src/export.rs".into()) },
+                E::ToolStart { id: "t3".into(), name: "bash".into(), summary: "cargo test -p ct-cli".into() },
+            ] {
+                self.ag.runs.apply(U::Event("r1".into(), e));
+            }
+            self.ag_select_run("r1");
+        }
+        let mut settled = ag_ready && ready && (scene != "search" || self.search.ran.is_some());
         if scene == "why" && ready {
             if let Loadable::Ready(p) = &self.prepared {
                 if self.selection.is_none() {

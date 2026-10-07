@@ -27,6 +27,16 @@ pub enum JobKind {
     Save,
     Watch,
     Prompt,
+    Accounts,
+    Runtime,
+    Models,
+    Login,
+    Logout,
+    RunsOpen,
+    RunSubmit,
+    RunControl,
+    RunFinish,
+    RunReview,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
