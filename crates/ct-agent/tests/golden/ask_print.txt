@@ -1,0 +1,28 @@
+You are helping understand a code change. Answer using only the context below.
+
+## Code: f.txt:3-4@worktree
+    3  NEW1
+    4  NEW2
+
+## Diff (hunks overlapping the range)
+diff --git a/f.txt b/f.txt
+index 9405325..084e839 100644
+--- a/f.txt
++++ b/f.txt
+@@ -1,5 +1,7 @@
+ a
+ b
++NEW1
++NEW2
+ c
+ d
+ e
+
+## Recorded reasons
+- [high] claude session sess1 at 2023-11-14T22:13:20Z (record 00018d000000000000000000000000ab): User asked to add NEW lines for the feature.
+
+## Transcript pointers
+- record 00018d000000000000000000000000ab: /t/session.jsonl @ byte 4096
+
+## Question
+Why NEW?

@@ -3,5 +3,18 @@ name = "ct-agent"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "ct-agent"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+postcard.workspace = true
+similar.workspace = true
+regex.workspace = true
+ct-store = { path = "../ct-store" }
+
+[dev-dependencies]
+tempfile.workspace = true

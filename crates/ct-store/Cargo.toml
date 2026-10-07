@@ -5,3 +5,15 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+zstd.workspace = true
+crc32fast.workspace = true
+xxhash-rust.workspace = true
+fs2.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

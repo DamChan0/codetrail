@@ -5,3 +5,22 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+thiserror.workspace = true
+ignore.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+grep-matcher.workspace = true
+nucleo-matcher.workspace = true
+rayon.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "ct-core-bench"
+path = "src/bin/ct-core-bench.rs"
+
+[[bin]]
+name = "ct-core-truth"
+path = "src/bin/ct-core-truth.rs"

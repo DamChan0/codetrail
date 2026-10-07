@@ -9,6 +9,15 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+serde.workspace = true
+toml.workspace = true
+similar.workspace = true
+egui.workspace = true
+eframe.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
 ct-core = { path = "../ct-core" }
 ct-store = { path = "../ct-store" }
 ct-agent = { path = "../ct-agent" }
+
+[dev-dependencies]
+tempfile.workspace = true
