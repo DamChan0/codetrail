@@ -27,7 +27,7 @@ pub type Oid = String;
 pub const FORMAT_VERSION: u16 = 1;
 const LOG_MAGIC: &[u8; 4] = b"CTLG";
 const FRAME_MAGIC: &[u8; 4] = b"CTF1";
-const IDX_MAGIC: &[u8; 4] = b"CTIX";
+const IDX_MAGIC: &[u8; 4] = b"CTI2";
 const LOG_HEADER_LEN: usize = 6;
 const FRAME_HEADER_LEN: usize = 20;
 pub const MAX_FRAME_LEN: usize = 1 << 20;
@@ -237,6 +237,8 @@ pub fn parse_id(s: &str) -> Option<u128> {
 struct Scan {
     frames: Vec<Frame>,
     skipped: u64,
+    /// Scan consumed the buffer exactly (no trailing garbage / torn frame).
+    clean: bool,
 }
 
 fn find_magic(buf: &[u8], from: usize) -> Option<usize> {
@@ -246,10 +248,12 @@ fn find_magic(buf: &[u8], from: usize) -> Option<usize> {
     buf[from..].windows(4).position(|w| w == FRAME_MAGIC).map(|p| p + from)
 }
 
-fn scan_frames(buf: &[u8]) -> Scan {
+/// `from`: first byte to parse (log header length for a full scan, 0 for a tail slice).
+fn scan_frames(buf: &[u8], from: usize) -> Scan {
     let mut frames = Vec::new();
     let mut skipped = 0u64;
-    let mut pos = LOG_HEADER_LEN.min(buf.len());
+    let mut pos = from.min(buf.len());
+    let mut clean = true;
     while pos < buf.len() {
         let ok = (|| {
             let h = buf.get(pos..pos + FRAME_HEADER_LEN)?;
@@ -275,14 +279,18 @@ fn scan_frames(buf: &[u8]) -> Scan {
             }
             None => {
                 skipped += 1;
+                clean = false;
                 match find_magic(buf, pos + 1) {
                     Some(n) => pos = n,
-                    None => break,
+                    None => {
+                        clean = false;
+                        break;
+                    }
                 }
             }
         }
     }
-    Scan { frames, skipped }
+    Scan { frames, skipped, clean: clean && pos == buf.len() }
 }
 
 // ---------------------------------------------------------------- index
@@ -294,22 +302,26 @@ struct IndexBody {
     frames: u64,
     orphan_notes: u64,
     skipped: u64,
+    /// Byte offset the body is complete up to when the scan ended cleanly (0 = not clean: always rescan).
+    clean_end: u64,
 }
 
 struct Index {
     body: IndexBody,
     by_path: HashMap<String, Vec<usize>>,
     stats: Stats,
+    len: u64,
+    mtime: u64,
 }
 
 impl Index {
-    fn from_body(body: IndexBody, log_len: u64, read_only: bool, from_cache: bool) -> Index {
+    fn from_body(body: IndexBody, len: u64, mtime: u64, read_only: bool, from_cache: bool) -> Index {
         let mut by_path: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, r) in body.records.iter().enumerate() {
             by_path.entry(r.path.clone()).or_default().push(i);
         }
         let stats = Stats {
-            log_len,
+            log_len: len,
             frames: body.frames,
             records: body.records.len() as u64,
             notes: body.notes.len() as u64,
@@ -318,13 +330,13 @@ impl Index {
             read_only,
             from_cache,
         };
-        Index { body, by_path, stats }
+        Index { body, by_path, stats, len, mtime }
     }
 
-    fn build(buf: &[u8]) -> IndexBody {
-        let scan = scan_frames(buf);
-        let mut body = IndexBody { skipped: scan.skipped, frames: scan.frames.len() as u64, ..Default::default() };
-        let mut pos: HashMap<u128, usize> = HashMap::new();
+    fn apply(body: &mut IndexBody, scan: Scan) {
+        let mut pos: HashMap<u128, usize> = body.records.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
+        body.skipped += scan.skipped;
+        body.frames += scan.frames.len() as u64;
         for f in scan.frames {
             match f {
                 Frame::Edit(r) | Frame::Unattributed(r) => {
@@ -341,7 +353,24 @@ impl Index {
             }
         }
         body.records.sort_by_key(|r| (r.ts_ms, r.id));
+    }
+
+    fn build(buf: &[u8]) -> IndexBody {
+        let scan = scan_frames(buf, LOG_HEADER_LEN);
+        let clean = scan.clean;
+        let mut body = IndexBody::default();
+        Index::apply(&mut body, scan);
+        body.clean_end = if clean { buf.len() as u64 } else { 0 };
         body
+    }
+
+    /// Extend with frames appended after `clean_end`. `tail` = log bytes from `clean_end` to the new length.
+    fn extend(mut self, tail: &[u8], new_len: u64, mtime: u64) -> Index {
+        let scan = scan_frames(tail, 0);
+        let clean = scan.clean;
+        Index::apply(&mut self.body, scan);
+        self.body.clean_end = if clean { new_len } else { 0 };
+        Index::from_body(self.body, new_len, mtime, false, false)
     }
 }
 
@@ -455,7 +484,6 @@ impl Store {
         })();
         let _ = FileExt::unlock(&f);
         res?;
-        *self.cache.lock() = None;
         Ok(())
     }
 
@@ -478,38 +506,70 @@ impl Store {
         }))
     }
 
+    /// Current index. Every call stats the log (cheap) and, when another process appended, reloads
+    /// only the new tail. The shared flock excludes in-flight appends so a half-written frame is
+    /// never observed.
     fn index(&self) -> Arc<Index> {
-        if let Some(i) = self.cache.lock().as_ref() {
-            return i.clone();
-        }
-        let idx = Arc::new(self.load_index());
-        *self.cache.lock() = Some(idx.clone());
-        idx
+        let mut cache = self.cache.lock();
+        let fresh = self.refresh(cache.as_ref());
+        *cache = Some(fresh.clone());
+        fresh
     }
 
-    fn load_index(&self) -> Index {
+    fn refresh(&self, cached: Option<&Arc<Index>>) -> Arc<Index> {
         let read_only = self.read_only.is_some();
-        let meta = match fs::metadata(&self.log) {
-            Ok(m) => m,
-            Err(_) => return Index::from_body(IndexBody::default(), 0, read_only, false),
-        };
+        let empty = |len| Arc::new(Index::from_body(IndexBody::default(), len, 0, read_only, false));
+        let Ok(mut f) = File::open(&self.log) else { return empty(0) };
+        let Ok(meta) = f.metadata() else { return empty(0) };
         if read_only {
-            return Index::from_body(IndexBody::default(), meta.len(), true, false);
+            return empty(meta.len());
         }
-        let len = meta.len();
-        let mtime = mtime_ns(&meta);
-        let idx_path = self.dir.join("index.ct");
-        if let Some(body) = read_cache(&idx_path, len, mtime) {
-            return Index::from_body(body, len, false, true);
-        }
-        let buf = fs::read(&self.log).unwrap_or_default();
-        // Re-stat after reading: only cache when no append raced the scan.
-        let body = Index::build(&buf);
-        let len2 = fs::metadata(&self.log).map(|m| m.len()).unwrap_or(0);
-        if len2 == buf.len() as u64 && len == len2 {
-            let _ = write_cache(&idx_path, &body, len, mtime);
-        }
-        Index::from_body(body, buf.len() as u64, false, false)
+        let _ = f.lock_shared();
+        let out = (|| {
+            let meta = f.metadata().ok()?;
+            let (len, mtime) = (meta.len(), mtime_ns(&meta));
+            if let Some(c) = cached {
+                if c.len == len && c.mtime == mtime {
+                    return Some(c.clone());
+                }
+                if len > c.len && c.body.clean_end == c.len && c.len >= LOG_HEADER_LEN as u64 {
+                    f.seek(SeekFrom::Start(c.len)).ok()?;
+                    let mut tail = Vec::with_capacity((len - c.len) as usize);
+                    Read::by_ref(&mut f).take(len - c.len).read_to_end(&mut tail).ok()?;
+                    if tail.len() as u64 == len - c.len {
+                        let base = Index::from_body(
+                            IndexBody {
+                                records: c.body.records.clone(),
+                                notes: c.body.notes.clone(),
+                                frames: c.body.frames,
+                                orphan_notes: c.body.orphan_notes,
+                                skipped: c.body.skipped,
+                                clean_end: c.body.clean_end,
+                            },
+                            c.len,
+                            c.mtime,
+                            false,
+                            false,
+                        );
+                        return Some(Arc::new(base.extend(&tail, len, mtime)));
+                    }
+                }
+            }
+            let idx_path = self.dir.join("index.ct");
+            if cached.is_none() {
+                if let Some(body) = read_cache(&idx_path, len, mtime) {
+                    return Some(Arc::new(Index::from_body(body, len, mtime, false, true)));
+                }
+            }
+            f.seek(SeekFrom::Start(0)).ok()?;
+            let mut buf = Vec::with_capacity(len as usize);
+            Read::by_ref(&mut f).take(len).read_to_end(&mut buf).ok()?;
+            let body = Index::build(&buf);
+            let _ = write_cache(&idx_path, &body, len, mtime); // consistent: read under the shared lock
+            Some(Arc::new(Index::from_body(body, len, mtime, false, false)))
+        })();
+        let _ = FileExt::unlock(&f);
+        out.unwrap_or_else(|| empty(meta.len()))
     }
 
     pub fn stats(&self) -> Stats {

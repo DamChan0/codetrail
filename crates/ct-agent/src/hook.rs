@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 const MAX_UNATTRIBUTED: usize = 200;
@@ -112,7 +113,7 @@ fn tool_target(ctx: &RepoCtx, v: &Value, cwd: &Path) -> Option<(String, PathBuf)
     }
     let f = tool_file(v)?;
     let rel = gitx::rel_path(ctx, &f, cwd)?;
-    let abs = ctx.root.join(&rel);
+    let abs = gitx::safe_join(&ctx.root, &rel)?;
     Some((rel, abs))
 }
 
@@ -194,54 +195,68 @@ fn post(ctx: &RepoCtx, v: &Value, cwd: &Path) -> Result<Option<String>, String> 
     Ok(Some(out.to_string()))
 }
 
+/// Internal budget: the installed hook timeout is 5s; record what we have and exit 0 after this.
+pub const STOP_BUDGET: Duration = Duration::from_millis(3000);
+
 fn stop(ctx: &RepoCtx, v: &Value) -> Result<(), String> {
+    let deadline = Instant::now() + STOP_BUDGET;
     cleanup_pending(ctx);
     let head = gitx::head(&ctx.root);
-    let mut paths: Vec<String> = Vec::new();
-    let split = |b: Vec<u8>| -> Vec<String> {
-        b.split(|c| *c == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect()
-    };
-    if !head.is_empty() {
-        if let Some(b) = gitx::git_out(&ctx.root, &["-c", "core.quotepath=off", "diff", "--name-only", "-z", "HEAD"]) {
-            paths.extend(split(b));
-        }
-    }
-    if let Some(b) = gitx::git_out(&ctx.root, &["ls-files", "-o", "--exclude-standard", "-z"]) {
-        paths.extend(split(b));
-    }
-    paths.sort();
-    paths.dedup();
+    let mut paths = gitx::status_paths(&ctx.root, deadline).unwrap_or_default();
+    paths.retain(|p| gitx::safe_join(&ctx.root, p).is_some());
     if paths.is_empty() {
         return Ok(());
     }
     paths.truncate(MAX_UNATTRIBUTED);
+    let existing: Vec<String> = paths.iter().filter(|p| gitx::safe_join(&ctx.root, p).is_some_and(|a| a.is_file())).cloned().collect();
+    let cur_blobs = gitx::hash_objects(&ctx.root, &existing, deadline);
+    let head_blobs = if head.is_empty() { Default::default() } else { gitx::head_blobs(&ctx.root, &paths, deadline) };
     let store = Store::open(&ctx.git_dir).map_err(|e| e.to_string())?;
     let session = v.get("session_id").and_then(Value::as_str).unwrap_or("").to_string();
+
+    // Coverage = a record from THIS session at THIS head with the same resulting blob.
+    let mut todo: Vec<(String, Option<String>, Option<(String, u64)>)> = Vec::new();
     for rel in paths {
-        let abs = ctx.root.join(&rel);
-        let exists = abs.is_file();
-        if !exists && !head.is_empty() && gitx::blob_at(&ctx.root, "HEAD", &rel).is_none() {
-            continue;
+        let cur = cur_blobs.get(&rel).cloned();
+        let on_disk = existing.contains(&rel);
+        if on_disk && cur.is_none() {
+            continue; // could not hash (newline in name / git failure): skip rather than guess
         }
-        let cur = if exists { gitx::hash_object(&ctx.root, &rel) } else { None };
-        let known = store.for_path(&rel);
-        // covered by an Edit record or already recorded as Unattributed with the same blob
-        if known.iter().any(|r| r.post_blob == cur) {
-            continue;
+        let pre = head_blobs.get(&rel).cloned();
+        if !on_disk && pre.is_none() {
+            continue; // untracked and gone
         }
-        let pre_blob = gitx::blob_at(&ctx.root, "HEAD", &rel);
-        let spans = if exists {
-            let post = gitx::read_text_limited(&abs);
-            let pre = match &pre_blob {
-                Some(_) => gitx::git_out(&ctx.root, &["show", &format!("HEAD:{rel}")]).filter(|b| b.len() <= gitx::MAX_DIFF_BYTES),
-                None => Some(Vec::new()),
-            };
-            match (pre, post) {
-                (Some(a), Some(b)) => gitx::spans_between(&a, &b),
-                _ => vec![],
+        let covered = store.for_path(&rel).iter().any(|r| r.session == session && r.head_at_edit == head && r.post_blob == cur);
+        if !covered {
+            todo.push((rel, cur, pre));
+        }
+    }
+    let want: Vec<String> = todo
+        .iter()
+        .filter_map(|(_, cur, pre)| match (cur, pre) {
+            (Some(_), Some((oid, sz))) if *sz as usize <= gitx::MAX_DIFF_BYTES => Some(oid.clone()),
+            _ => None,
+        })
+        .collect();
+    let contents = gitx::blob_contents(&ctx.root, &want, deadline);
+    for (rel, cur, pre) in todo {
+        if Instant::now() >= deadline {
+            log_error(ctx, "stop", "deadline reached; remaining files not recorded");
+            break;
+        }
+        let spans = match &cur {
+            Some(_) => {
+                let post = gitx::safe_join(&ctx.root, &rel).and_then(|a| gitx::read_text_limited(&a));
+                let pre_bytes = match &pre {
+                    Some((oid, _)) => contents.get(oid).cloned(),
+                    None => Some(Vec::new()),
+                };
+                match (pre_bytes, post) {
+                    (Some(a), Some(b)) => gitx::spans_between(&a, &b),
+                    _ => vec![],
+                }
             }
-        } else {
-            vec![]
+            None => vec![],
         };
         let ts = now_ms();
         let rec = Record {
@@ -254,7 +269,7 @@ fn stop(ctx: &RepoCtx, v: &Value) -> Result<(), String> {
             tool_use_id: String::new(),
             head_at_edit: head.clone(),
             path: rel,
-            pre_blob,
+            pre_blob: pre.map(|p| p.0),
             post_blob: cur,
             spans,
             reason: vec![],

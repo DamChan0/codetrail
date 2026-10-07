@@ -91,7 +91,14 @@ pub struct Section {
 pub struct Prompt {
     pub sections: Vec<Section>,
     pub question: String,
+    /// Secret-scan findings for the user question; non-empty => see `question_included`.
+    pub question_warnings: Vec<String>,
+    /// False when the question looked secret-bearing and `include_secrets` was not set; render()
+    /// then sends a placeholder instead of the question.
+    pub question_included: bool,
 }
+
+pub const QUESTION_WITHHELD: &str = "[question withheld: it looks like it contains a secret; re-run with explicit approval to send it]";
 
 impl Prompt {
     pub fn render(&self) -> String {
@@ -99,7 +106,8 @@ impl Prompt {
         for sec in self.sections.iter().filter(|x| x.included) {
             s.push_str(&format!("## {}\n{}\n\n", sec.title, sec.body.trim_end()));
         }
-        s.push_str(&format!("## Question\n{}\n", self.question));
+        let q = if self.question_included { self.question.as_str() } else { QUESTION_WITHHELD };
+        s.push_str(&format!("## Question\n{q}\n"));
         if s.len() > MAX_PROMPT_BYTES {
             let mut cut = MAX_PROMPT_BYTES;
             while !s.is_char_boundary(cut) {
@@ -111,7 +119,10 @@ impl Prompt {
         s
     }
     pub fn warnings(&self) -> Vec<String> {
-        self.sections.iter().flat_map(|s| s.warnings.iter().map(move |w| format!("{}: {w}", s.id))).collect()
+        let mut v: Vec<String> = self.sections.iter().flat_map(|s| s.warnings.iter().map(move |w| format!("{}: {w}", s.id))).collect();
+        v.extend(self.question_warnings.iter().map(|w| format!("question: {w}")));
+        v
+
     }
 }
 
@@ -220,10 +231,12 @@ pub fn build_prompt(repo: &RepoCtx, req: &AskRequest) -> Result<Prompt> {
     // resolve revision / content
     let (content, rev_label, commit, blob): (Vec<u8>, String, Option<String>, Option<String>) = match &r.at {
         RefAt::Worktree => {
-            let c = std::fs::read(root.join(&r.path)).map_err(|e| anyhow!("cannot read {}: {e}", r.path))?;
+            let abs = gitx::safe_join(root, &r.path).ok_or_else(|| anyhow!("{} is not a valid repo-relative path", r.path))?;
+            let c = std::fs::read(abs).map_err(|e| anyhow!("cannot read {}: {e}", r.path))?;
             (c, "worktree".into(), None, gitx::hash_object(root, &r.path))
         }
         RefAt::Commit(rev) => {
+            gitx::safe_join(root, &r.path).ok_or_else(|| anyhow!("{} is not a valid repo-relative path", r.path))?;
             let full = gitx::git_str(root, &["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")])
                 .ok_or_else(|| anyhow!("unknown revision '{rev}'"))?;
             let c = gitx::git_out(root, &["show", &format!("{full}:{}", r.path)])
@@ -349,10 +362,10 @@ pub fn build_prompt(repo: &RepoCtx, req: &AskRequest) -> Result<Prompt> {
             s.warnings = w;
         }
     }
-    Ok(Prompt {
-        sections,
-        question: req.question.clone().filter(|q| !q.trim().is_empty()).unwrap_or_else(|| DEFAULT_QUESTION.to_string()),
-    })
+    let question = req.question.clone().filter(|q| !q.trim().is_empty()).unwrap_or_else(|| DEFAULT_QUESTION.to_string());
+    let question_warnings = scan_secrets(&question);
+    let question_included = question_warnings.is_empty() || req.include_secrets;
+    Ok(Prompt { sections, question, question_warnings, question_included })
 }
 
 // ---------------------------------------------------------------- runners

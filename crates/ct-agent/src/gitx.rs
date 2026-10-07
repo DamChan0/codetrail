@@ -1,8 +1,11 @@
 //! Minimal git helpers (plain `git` subprocess; ct-agent stays decoupled from ct-core).
 
 use similar::{ChangeTag, TextDiff};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub const MAX_DIFF_BYTES: usize = 1 << 20;
 
@@ -130,4 +133,146 @@ pub fn spans_between(pre: &[u8], post: &[u8]) -> Vec<ct_store::Span> {
 
 pub fn whole_file_spans(post: &[u8]) -> Vec<ct_store::Span> {
     spans_between(b"", post)
+}
+
+/// Lexically validate a repo-relative path (no absolute, no `..`, no empty, no NUL) and join it to the
+/// root, rejecting results whose real location (symlinks resolved, deepest existing ancestor) is
+/// outside the repository. Use for EVERY file access derived from user / agent / git-listed paths.
+pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
+    if rel.is_empty() || rel.contains('\0') {
+        return None;
+    }
+    let p = Path::new(rel);
+    if !p.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir)) {
+        return None;
+    }
+    let joined = root.join(p);
+    let canon_root = root.canonicalize().ok()?;
+    let mut probe = joined.as_path();
+    loop {
+        match probe.canonicalize() {
+            Ok(c) => return c.starts_with(&canon_root).then_some(joined),
+            Err(_) => probe = probe.parent()?,
+        }
+    }
+}
+
+/// Run git with optional stdin; kills it at `deadline`. `None` on failure / timeout.
+pub fn git_io(root: &Path, args: &[&str], input: Option<Vec<u8>>, deadline: Instant) -> Option<Vec<u8>> {
+    let mut child = Command::new("git")
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(args)
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(inp) = input {
+        let mut si = child.stdin.take()?;
+        std::thread::spawn(move || {
+            let _ = si.write_all(&inp);
+        });
+    }
+    let mut so = child.stdout.take()?;
+    let rd = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = so.read_to_end(&mut v);
+        v
+    });
+    loop {
+        match child.try_wait().ok()? {
+            Some(st) => {
+                let out = rd.join().ok()?;
+                return st.success().then_some(out);
+            }
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+}
+
+/// `git status` entries (path, deleted-in-worktree-or-index flag unused) for tracked changes + untracked files.
+pub fn status_paths(root: &Path, deadline: Instant) -> Option<Vec<String>> {
+    let out = git_io(root, &["-c", "core.quotepath=off", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], None, deadline)?;
+    let mut v: Vec<String> = out
+        .split(|c| *c == 0)
+        .filter(|e| e.len() > 3)
+        .map(|e| String::from_utf8_lossy(&e[3..]).into_owned())
+        .collect();
+    v.sort();
+    v.dedup();
+    Some(v)
+}
+
+/// One `hash-object --stdin-paths` for all existing files. Paths with newlines are skipped.
+pub fn hash_objects(root: &Path, rels: &[String], deadline: Instant) -> HashMap<String, String> {
+    let ok: Vec<&String> = rels.iter().filter(|r| !r.contains('\n')).collect();
+    if ok.is_empty() {
+        return HashMap::new();
+    }
+    let input = ok.iter().map(|r| r.as_str()).collect::<Vec<_>>().join("\n") + "\n";
+    let Some(out) = git_io(root, &["hash-object", "--stdin-paths"], Some(input.into_bytes()), deadline) else {
+        return HashMap::new();
+    };
+    let lines: Vec<&str> = std::str::from_utf8(&out).unwrap_or("").lines().collect();
+    if lines.len() != ok.len() {
+        return HashMap::new();
+    }
+    ok.into_iter().zip(lines).map(|(p, h)| (p.clone(), h.to_string())).collect()
+}
+
+/// `HEAD:<path>` blob oid + size for each path via ONE `cat-file --batch-check`.
+pub fn head_blobs(root: &Path, rels: &[String], deadline: Instant) -> HashMap<String, (String, u64)> {
+    let ok: Vec<&String> = rels.iter().filter(|r| !r.contains('\n')).collect();
+    if ok.is_empty() {
+        return HashMap::new();
+    }
+    let input = ok.iter().map(|r| format!("HEAD:{r}")).collect::<Vec<_>>().join("\n") + "\n";
+    let Some(out) = git_io(root, &["cat-file", "--batch-check"], Some(input.into_bytes()), deadline) else {
+        return HashMap::new();
+    };
+    let mut m = HashMap::new();
+    for (p, line) in ok.iter().zip(std::str::from_utf8(&out).unwrap_or("").lines()) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() == 3 && f[1] == "blob" {
+            if let Ok(sz) = f[2].parse::<u64>() {
+                m.insert((*p).clone(), (f[0].to_string(), sz));
+            }
+        }
+    }
+    m
+}
+
+/// Contents of blobs via ONE `cat-file --batch`.
+pub fn blob_contents(root: &Path, oids: &[String], deadline: Instant) -> HashMap<String, Vec<u8>> {
+    if oids.is_empty() {
+        return HashMap::new();
+    }
+    let input = oids.join("\n") + "\n";
+    let Some(out) = git_io(root, &["cat-file", "--batch"], Some(input.into_bytes()), deadline) else {
+        return HashMap::new();
+    };
+    let mut m = HashMap::new();
+    let mut pos = 0;
+    while pos < out.len() {
+        let Some(nl) = out[pos..].iter().position(|c| *c == b'\n') else { break };
+        let hdr = String::from_utf8_lossy(&out[pos..pos + nl]).into_owned();
+        pos += nl + 1;
+        let f: Vec<&str> = hdr.split_whitespace().collect();
+        if f.len() != 3 {
+            continue; // "<oid> missing"
+        }
+        let Ok(sz) = f[2].parse::<usize>() else { break };
+        if pos + sz > out.len() {
+            break;
+        }
+        m.insert(f[0].to_string(), out[pos..pos + sz].to_vec());
+        pos += sz + 1;
+    }
+    m
 }

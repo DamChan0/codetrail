@@ -58,8 +58,17 @@ pub fn hook_command(bin: &str, event: &str) -> String {
     format!("{bin} hook claude {event}")
 }
 
+/// `None` only when the file does not exist; any other failure (permissions, non-UTF-8) aborts.
+fn read_existing(path: &Path) -> Result<Option<String>> {
+    match fs::read(path) {
+        Ok(b) => Ok(Some(String::from_utf8(b).with_context(|| format!("{} is not valid UTF-8; refusing to modify it", path.display()))?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow!("cannot read {}: {e}; refusing to modify it", path.display())),
+    }
+}
+
 fn write_with_backup(path: &Path, new: &str, dry: bool) -> Result<Action> {
-    let old = fs::read_to_string(path).ok();
+    let old = read_existing(path)?;
     if old.as_deref() == Some(new) {
         return Ok(Action { path: path.into(), change: Change::Unchanged, backup: None });
     }
@@ -146,11 +155,10 @@ pub fn install(o: &InstallOpts) -> Result<Vec<Action>> {
     let mut out = Vec::new();
     if o.claude {
         let p = o.home.join(".claude/settings.json");
-        let mut v = match fs::read_to_string(&p) {
-            Ok(s) if s.trim().is_empty() => Value::Object(Map::new()),
-            Ok(s) => serde_json::from_str::<Value>(&s)
+        let mut v = match read_existing(&p)? {
+            Some(s) if !s.trim().is_empty() => serde_json::from_str::<Value>(&s)
                 .with_context(|| format!("{} is not valid JSON; refusing to modify it", p.display()))?,
-            Err(_) => Value::Object(Map::new()),
+            _ => Value::Object(Map::new()),
         };
         let changed = merge_claude_settings(&mut v, &o.bin)?;
         if changed || !p.exists() {
@@ -167,7 +175,7 @@ pub fn install(o: &InstallOpts) -> Result<Vec<Action>> {
     }
     if o.codex {
         let p = o.home.join(".codex/AGENTS.md");
-        let existing = fs::read_to_string(&p).unwrap_or_default();
+        let existing = read_existing(&p)?.unwrap_or_default();
         out.push(write_with_backup(&p, &merge_codex_agents(&existing), o.dry_run)?);
     }
     if out.is_empty() {

@@ -288,3 +288,26 @@ fn occurrence_requires_enough_copies() {
     assert!(s.match_hunk("b.rs", &["dup".into()], &[]).is_empty());
     assert_eq!(s.match_hunk("b.rs", &["dup".into(), "x".into(), "dup".into()], &[]).len(), 1);
 }
+
+#[test]
+fn long_lived_store_sees_other_process_append() {
+    let d = tempfile::tempdir().unwrap();
+    let app = Store::open(d.path()).unwrap();
+    app.append(&rec("a.rs", 1, None, &["l"], 1)).unwrap();
+    assert_eq!(app.all().len(), 1);
+    // a different handle (= the hook process) appends; `app` must see it without reopening
+    let hook = Store::open(d.path()).unwrap();
+    let r = rec("b.rs", 2, None, &["m"], 1);
+    hook.append(&r).unwrap();
+    hook.append_note(r.id, Agent::Claude, "s", "why").unwrap();
+    assert_eq!(app.all().len(), 2);
+    assert_eq!(app.for_path("b.rs").len(), 1);
+    assert_eq!(decode_reason(&app.get(r.id).unwrap()), "why");
+    assert_eq!(app.stats().records, 2);
+    // incremental tail load must equal a full rescan
+    let fresh = Store::open(d.path()).unwrap();
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    fresh.export_json(&mut a).unwrap();
+    app.export_json(&mut b).unwrap();
+    assert_eq!(a, b);
+}

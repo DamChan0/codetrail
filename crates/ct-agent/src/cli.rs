@@ -192,7 +192,7 @@ fn cmd_record(a: &[String], out: &mut dyn Write) -> Result<i32> {
     // create an Edit record for a worktree file vs HEAD (agents without hooks: omp, Codex)
     let path = p.get("path").ok_or_else(|| anyhow!("usage: codetrail record <id> | codetrail record --path <file> [--agent A --session S]"))?;
     let rel = gitx::rel_path(&ctx, Path::new(path), &cwd).ok_or_else(|| anyhow!("{path} is outside the repository"))?;
-    let abs = ctx.root.join(&rel);
+    let abs = gitx::safe_join(&ctx.root, &rel).ok_or_else(|| anyhow!("{rel} resolves outside the repository"))?;
     let head = gitx::head(&ctx.root);
     let exists = abs.is_file();
     let post_blob = if exists { gitx::hash_object(&ctx.root, &rel) } else { None };

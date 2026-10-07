@@ -171,14 +171,14 @@ pub enum Msg {
     Opened(Result<Opened, String>),
     Log { token: u64, append: bool, res: Result<Vec<CommitMeta>, String> },
     Diff { res: Result<(DiffSet, CurCmp), String> },
-    FileDiff { path: String, res: Result<Box<Prepared>, String> },
+    FileDiff { path: String, gen: u64, res: Result<Box<Prepared>, String> },
     Hits(Vec<SearchHit>),
     SearchDone(Result<SearchStats, String>),
     Files(Result<(Arc<Vec<String>>, Arc<FileIndex>), String>),
     Blame { path: String, res: Result<Box<BlameData>, String> },
     History { path: String, line: u32, res: Result<Vec<CommitMeta>, String> },
     FileLoaded { path: String, res: Result<Loaded, String> },
-    Saved { path: String, res: Result<SaveOutcome, String> },
+    Saved { path: String, written: String, res: Result<SaveOutcome, String> },
     Disk { path: String, res: Disk },
     Prompt(Result<agent_ask::Prompt, String>),
     AskChunk(String),
@@ -386,6 +386,7 @@ pub struct App {
     pub diff_anchor: Option<usize>,
     pub diff_scroll_to: Option<usize>,
     pub diff_top_row: usize,
+    pub cmp_gen: u64,
     pub base_chip_rect: Option<egui::Rect>,
 
     pub rail: RailTab,
@@ -460,6 +461,7 @@ impl App {
             diff_anchor: None,
             diff_scroll_to: None,
             diff_top_row: 0,
+            cmp_gen: 0,
             base_chip_rect: None,
             rail: RailTab::Commits,
             centre: Centre::Diff,
@@ -543,7 +545,7 @@ impl App {
                 let head = repo.head().unwrap_or_default();
                 let refs = repo.refs().map_err(|e| e.to_string())?;
                 let head_name = refs.iter().find(|r| r.is_head).map(|r| r.name.clone()).unwrap_or_else(|| "(detached)".into());
-                let (store, store_note) = match Store::open(&repo.common_dir) {
+                let (store, store_note) = match Store::open(&store_dir(&repo.root, &repo.common_dir)) {
                     Ok(s) => (Some(Arc::new(s)), None),
                     Err(e) => (None, Some(e.to_string())),
                 };
@@ -630,6 +632,8 @@ impl App {
         let head = self.head.clone();
         let opts = self.diff_opts.clone();
         let timeout = self.git_timeout();
+        self.cmp_gen += 1;
+        self.jobs.cancel(JobKind::FileDiff);
         self.jobs.spawn(JobKind::Diff, move |c| {
             let repo = repo.with_timeout(timeout).with_cancel(c.cancel.clone());
             let res = (|| -> Result<(DiffSet, CurCmp), String> {
@@ -669,6 +673,7 @@ impl App {
         let store = self.store.clone();
         let tab = self.settings.tab_width;
         let timeout = self.git_timeout();
+        let gen = self.cmp_gen;
         self.jobs.spawn(JobKind::FileDiff, move |c| {
             let repo = repo.with_timeout(timeout).with_cancel(c.cancel.clone());
             let res = (|| -> Result<Box<Prepared>, String> {
@@ -680,7 +685,7 @@ impl App {
                     .collect();
                 Ok(Box::new(Prepared { model, why }))
             })();
-            c.finish(Msg::FileDiff { path, res });
+            c.finish(Msg::FileDiff { path, gen, res });
         });
     }
 
@@ -869,6 +874,7 @@ impl App {
             }
         }
         let abs = repo.root.join(path);
+        let root = repo.root.clone();
         self.editor = Some(EditorState {
             path: path.to_string(),
             abs: abs.clone(),
@@ -892,7 +898,7 @@ impl App {
         });
         let p = path.to_string();
         self.jobs.spawn(JobKind::Load, move |c| {
-            let res = editor::load(&abs).map_err(|e| format!("Cannot open {p}: {e}"));
+            let res = editor::load_in(&root, &abs).map_err(|e| format!("Cannot open {p}: {e}"));
             c.finish(Msg::FileLoaded { path: p, res });
         });
     }
@@ -900,15 +906,17 @@ impl App {
     pub fn reload_editor(&mut self) {
         let Some(e) = &mut self.editor else { return };
         let (abs, p) = (e.abs.clone(), e.path.clone());
+        let root = self.repo.as_ref().map(|r| r.root.clone()).unwrap_or_default();
         e.load = Loadable::Loading;
         e.conflict = None;
         self.jobs.spawn(JobKind::Load, move |c| {
-            let res = editor::load(&abs).map_err(|er| format!("Cannot open {p}: {er}"));
+            let res = editor::load_in(&root, &abs).map_err(|er| format!("Cannot open {p}: {er}"));
             c.finish(Msg::FileLoaded { path: p, res });
         });
     }
 
     pub fn save_editor(&mut self, force: bool) {
+        let root = self.repo.as_ref().map(|r| r.root.clone()).unwrap_or_default();
         let Some(e) = &mut self.editor else { return };
         if e.read_only.is_some() || e.saving || !matches!(e.load, Loadable::Ready(())) {
             return;
@@ -917,14 +925,14 @@ impl App {
         e.saving = true;
         let (abs, p, text, crlf) = (e.abs.clone(), e.path.clone(), e.text.clone(), e.crlf);
         self.jobs.spawn(JobKind::Save, move |c| {
-            let res = editor::save(&abs, &text, crlf, &stamp, force).map_err(|er| format!("Cannot save {p}: {er}"));
-            c.finish(Msg::Saved { path: p, res });
+            let res = editor::save_in(&root, &abs, &text, crlf, &stamp, force).map_err(|er| format!("Cannot save {p}: {er}"));
+            c.finish(Msg::Saved { path: p, written: text, res });
         });
     }
 
     pub fn check_editor_disk(&mut self) {
         let Some(e) = &mut self.editor else { return };
-        if e.checking || e.saving || !matches!(e.load, Loadable::Ready(())) || e.last_check.elapsed() < Duration::from_millis(1000) {
+        if e.checking || e.saving || e.read_only == Some(ReadOnly::Outside) || !matches!(e.load, Loadable::Ready(())) || e.last_check.elapsed() < Duration::from_millis(1000) {
             return;
         }
         let Some(stamp) = e.stamp.clone() else { return };
@@ -1113,8 +1121,8 @@ impl App {
                 }
                 Err(e) => self.diffset = Loadable::Failed(e),
             },
-            Msg::FileDiff { path, res } => {
-                if self.file_sel.as_deref() != Some(path.as_str()) {
+            Msg::FileDiff { path, gen, res } => {
+                if file_diff_is_stale(gen, self.cmp_gen, self.file_sel.as_deref(), &path) {
                     return;
                 }
                 self.prepared = match res {
@@ -1188,7 +1196,7 @@ impl App {
                     Err(er) => e.load = Loadable::Failed(er),
                 }
             }
-            Msg::Saved { path, res } => {
+            Msg::Saved { path, written, res } => {
                 let Some(e) = &mut self.editor else { return };
                 if e.path != path {
                     return;
@@ -1197,7 +1205,7 @@ impl App {
                 match res {
                     Ok(SaveOutcome::Saved(st)) => {
                         e.stamp = Some(st);
-                        e.saved_text = e.text.clone();
+                        e.saved_text = written;
                         e.conflict = None;
                         e.notice = Some((format!("Saved {path}"), Instant::now()));
                     }
@@ -1275,9 +1283,52 @@ pub fn large_diff(p: &Prepared) -> bool {
     p.model.lines.len() > LARGE_DIFF_LINES
 }
 
+/// Where records live: exactly the dir the hook/CLI use (`ct_agent::gitx::find_repo`), so linked
+/// worktrees share one store. Falls back to ct-core's common dir outside `find_repo`'s reach.
+fn store_dir(root: &std::path::Path, common_dir: &std::path::Path) -> PathBuf {
+    ct_agent::gitx::find_repo(root).map(|r| r.git_dir).unwrap_or_else(|| common_dir.to_path_buf())
+}
+
+/// A per-file diff result applies only to the comparison generation and file it was requested for.
+fn file_diff_is_stale(result_gen: u64, current_gen: u64, selected: Option<&str>, path: &str) -> bool {
+    result_gen != current_gen || selected != Some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let o = std::process::Command::new("git").current_dir(dir).args(args).output().unwrap();
+        assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    #[test]
+    fn store_dir_is_the_hooks_dir_for_linked_worktrees() {
+        let d = tempfile::tempdir().unwrap();
+        let main = d.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "i"]);
+        let wt = d.path().join("wt");
+        git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let hook_dir = ct_agent::gitx::find_repo(&wt).unwrap().git_dir;
+        let repo = Repo::open(&wt).unwrap();
+        assert_eq!(store_dir(&repo.root, &repo.common_dir), hook_dir);
+        assert_eq!(hook_dir, ct_agent::gitx::find_repo(&main).unwrap().git_dir);
+    }
+
+    #[test]
+    fn stale_file_diff_is_discarded_after_a_new_comparison() {
+        assert!(!file_diff_is_stale(3, 3, Some("a.rs"), "a.rs"));
+        assert!(file_diff_is_stale(2, 3, Some("a.rs"), "a.rs"), "older comparison");
+        assert!(file_diff_is_stale(3, 3, Some("b.rs"), "a.rs"), "other file selected");
+        assert!(file_diff_is_stale(3, 3, None, "a.rs"));
+        let mut j: Jobs<u32> = Jobs::new(|| {});
+        let old = j.spawn(JobKind::FileDiff, |_| {});
+        j.cancel(JobKind::FileDiff);
+        assert!(!j.is_current(old), "cancelled FileDiff job reads as stale");
+    }
 
     fn mb(_: &str, _: &str) -> ct_core::Result<String> {
         Ok("mbmbmbmb".into())

@@ -351,7 +351,7 @@ impl Repo {
         args.extend(tail);
         let out = self.run_s(&args)?;
         let (raws, nums) = parse_raw_numstat(&out)?;
-        let mut files = to_stats(raws, nums);
+        let mut files = to_stats(raws, nums, o.ignore_whitespace)?;
         if o.ignore_whitespace {
             // --raw compares blobs, so whitespace-only edits would still be listed.
             files.retain(|f| {

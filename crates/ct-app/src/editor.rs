@@ -19,10 +19,13 @@ pub struct FileStamp {
 pub enum ReadOnly {
     Binary,
     TooLarge(u64),
+    /// Resolves (symlink or `..`) outside the repository: never read or written.
+    Outside,
 }
 impl ReadOnly {
     pub fn reason(&self) -> String {
         match self {
+            ReadOnly::Outside => "This path resolves outside the repository: read-only, contents not shown.".into(),
             ReadOnly::Binary => "Binary or non-UTF-8 file: read-only, contents not shown.".into(),
             ReadOnly::TooLarge(n) => format!("{} is over the 1 MB edit limit: read-only, showing the first 1 MB.", crate::timefmt::human_bytes(*n)),
         }
@@ -45,6 +48,37 @@ fn hash_bytes(b: &[u8]) -> u64 {
 
 fn mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+/// True when `path` (after resolving symlinks and `..`) stays inside `root`.
+/// A not-yet-existing file is judged by its parent directory.
+pub fn contained(root: &Path, path: &Path) -> bool {
+    let Ok(root) = root.canonicalize() else { return false };
+    let resolved = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => match (path.parent().and_then(|p| p.canonicalize().ok()), path.file_name()) {
+            (Some(dir), Some(name)) => dir.join(name),
+            _ => return false,
+        },
+    };
+    resolved.starts_with(&root)
+}
+
+/// `load` after the containment check; an outside target is not opened at all.
+pub fn load_in(root: &Path, path: &Path) -> io::Result<Loaded> {
+    if !contained(root, path) {
+        let stamp = FileStamp { mtime: None, len: 0, hash: 0 };
+        return Ok(Loaded { text: String::new(), stamp, crlf: false, read_only: Some(ReadOnly::Outside) });
+    }
+    load(path)
+}
+
+/// `save` after the containment check (re-checked at write time: the link may have changed since open).
+pub fn save_in(root: &Path, path: &Path, text: &str, crlf: bool, loaded: &FileStamp, force: bool) -> io::Result<SaveOutcome> {
+    if !contained(root, path) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "path resolves outside the repository"));
+    }
+    save(path, text, crlf, loaded, force)
 }
 
 pub fn load(path: &Path) -> io::Result<Loaded> {
@@ -146,6 +180,26 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("a.txt");
         (d, p)
+    }
+
+    #[test]
+    fn symlink_and_dotdot_outside_root_are_not_opened() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let secret = d.path().join("secret.txt");
+        std::fs::write(&secret, "TOPSECRET").unwrap();
+        std::fs::write(root.join("ok.txt"), "fine").unwrap();
+        std::os::unix::fs::symlink(&secret, root.join("link.txt")).unwrap();
+        let l = load_in(&root, &root.join("link.txt")).unwrap();
+        assert_eq!(l.read_only, Some(ReadOnly::Outside));
+        assert!(l.text.is_empty());
+        let l = load_in(&root, &root.join("../secret.txt")).unwrap();
+        assert_eq!(l.read_only, Some(ReadOnly::Outside));
+        assert!(load_in(&root, &root.join("ok.txt")).unwrap().read_only.is_none());
+        let st = FileStamp { mtime: None, len: 0, hash: 0 };
+        assert!(save_in(&root, &root.join("link.txt"), "x", false, &st, true).is_err());
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "TOPSECRET");
     }
 
     #[test]

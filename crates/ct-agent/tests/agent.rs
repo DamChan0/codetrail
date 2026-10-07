@@ -438,3 +438,61 @@ fn runner_streams_times_out_and_cancels() {
     std::env::set_var("CODETRAIL_CODEX_BIN", "/nonexistent/codex-bin");
     assert!(ask::run_agent(AgentKind::Codex, "x", &opts(1), &mut |_| {}).is_err());
 }
+
+#[test]
+fn install_aborts_untouched_on_non_utf8_settings() {
+    let h = tempfile::tempdir().unwrap();
+    fs::create_dir_all(h.path().join(".claude")).unwrap();
+    let p = h.path().join(".claude/settings.json");
+    fs::write(&p, [0xff, 0xfe, b'{', b'}']).unwrap();
+    assert!(install::install(&opts(h.path(), false)).is_err());
+    assert_eq!(fs::read(&p).unwrap(), [0xff, 0xfe, b'{', b'}']);
+    assert_eq!(baks(&h.path().join(".claude")), 0);
+}
+
+#[test]
+fn stop_coverage_is_per_session() {
+    let d = repo();
+    let root = d.path().canonicalize().unwrap();
+    fs::write(root.join("f.txt"), "a\nb\nc\nd\ne\nBASH\n").unwrap(); // not via an Edit tool
+    fs::write(root.join("new.txt"), "x\n").unwrap();
+    let stop = |sid: &str| handle_hook("Stop", &ev("Stop", &root, json!({"session_id": sid})));
+    let n = || Store::open(&git_dir(&root)).unwrap().all().len();
+    stop("s1");
+    assert_eq!(n(), 2);
+    stop("s1");
+    assert_eq!(n(), 2, "same session/blob/head is covered");
+    stop("s2");
+    assert_eq!(n(), 4, "a new session's change to the same blob is not suppressed");
+}
+
+#[test]
+fn ask_rejects_path_escape() {
+    let (_d, root) = ask_fixture();
+    let h = tempfile::tempdir().unwrap();
+    fs::write(root.parent().unwrap().join("outside.txt"), "secret outside\n").unwrap();
+    for p in ["../outside.txt:1-1@worktree", "f.txt/../../outside.txt:1-1@worktree"] {
+        let o = cli(&root, h.path(), &["ask", p, "--print"]);
+        assert!(!o.status.success(), "{p}");
+        assert!(!s(&o.stdout).contains("secret outside"));
+    }
+    // symlink inside the repo pointing outside
+    std::os::unix::fs::symlink(root.parent().unwrap().join("outside.txt"), root.join("lnk.txt")).unwrap();
+    let o = cli(&root, h.path(), &["ask", "lnk.txt:1-1@worktree", "--print"]);
+    assert!(!o.status.success());
+    assert!(!s(&o.stdout).contains("secret outside"));
+    let o = cli(&root, h.path(), &["ask", "/etc/passwd:1-1@worktree", "--print"]);
+    assert!(!o.status.success());
+}
+
+#[test]
+fn ask_question_secret_is_withheld_unless_approved() {
+    let (_d, root) = ask_fixture();
+    let h = tempfile::tempdir().unwrap();
+    let q = "why is password = \"hunter2hunter2hunter2\" here?";
+    let o = cli(&root, h.path(), &["ask", "f.txt:3-4@worktree", "--print", "--question", q]);
+    assert!(!s(&o.stdout).contains("hunter2hunter2"), "{}", s(&o.stdout));
+    assert!(s(&o.stderr).contains("question"), "{}", s(&o.stderr));
+    let o = cli(&root, h.path(), &["ask", "f.txt:3-4@worktree", "--print", "--question", q, "--include-secrets"]);
+    assert!(s(&o.stdout).contains("hunter2hunter2"));
+}

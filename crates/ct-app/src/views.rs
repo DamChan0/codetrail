@@ -846,6 +846,16 @@ impl App {
                         });
                     }
                 });
+                if !p.question_warnings.is_empty() {
+                    ui.label(RichText::new("Your question").font(widgets::ui_font(&th)).color(th.fg()));
+                    for wn in &p.question_warnings {
+                        widgets::banner(ui, &th, Level::Warn, wn, None, false);
+                    }
+                    ui.checkbox(&mut p.question_included, RichText::new("Send my question anyway (it will be shared as typed)").font(widgets::ui_font(&th)).color(th.fg()));
+                    if !p.question_included {
+                        ui.label(RichText::new("Question withheld: a placeholder is sent instead.").font(widgets::small_font(&th)).color(th.muted()));
+                    }
+                }
                 if any_warn {
                     widgets::banner(ui, &th, Level::Warn, "A section that looks like it contains a secret is ticked. Untick it before sending.", None, false);
                 }

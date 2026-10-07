@@ -529,7 +529,7 @@ impl App {
                 let (add, del): (u32, u32) = set.files.iter().fold((0, 0), |a, f| (a.0 + f.add, a.1 + f.del));
                 ui.horizontal(|ui| {
                     ui.add_space(m.space[2]);
-                    ui.label(RichText::new(format!("{} files", set.files.len())).font(widgets::ui_font(&th)).color(th.fg()));
+                    ui.label(RichText::new(format!("{} {}", set.files.len(), if set.files.len() == 1 { "file" } else { "files" })).font(widgets::ui_font(&th)).color(th.fg()));
                     ui.label(RichText::new(format!("+{add}")).font(widgets::mono_font(&th)).color(th.c(th.p().diff.add.fg)));
                     ui.label(RichText::new(format!("−{del}")).font(widgets::mono_font(&th)).color(th.c(th.p().diff.del.fg)));
                 });
