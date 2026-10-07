@@ -1,0 +1,14 @@
+[package]
+name = "ct-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "codetrail"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+ct-core = { path = "../ct-core" }
+ct-store = { path = "../ct-store" }
+ct-agent = { path = "../ct-agent" }
