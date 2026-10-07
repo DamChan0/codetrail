@@ -104,11 +104,14 @@ pub struct Timings {
     pub term_grace: Duration,
     /// Event-loop poll interval.
     pub tick: Duration,
+    /// Pause between the artifact commit and the terminal state (test knob: widens the window in
+    /// which an `abort()` still wins over a Settled that was already seen).
+    pub finalize_delay: Duration,
 }
 
 impl Default for Timings {
     fn default() -> Self {
-        Timings { abort_grace: Duration::from_secs(5), term_grace: Duration::from_secs(3), tick: Duration::from_millis(25) }
+        Timings { abort_grace: Duration::from_secs(5), term_grace: Duration::from_secs(3), tick: Duration::from_millis(25), finalize_delay: Duration::ZERO }
     }
 }
 
@@ -135,6 +138,10 @@ struct Entry {
     stored: Stored,
     ctl: Option<Sender<Cmd>>,
     thread: Option<JoinHandle<()>>,
+    /// an `abort()` was accepted
+    abort_req: bool,
+    /// the terminal state is being written; `abort()` is refused from here on
+    finalising: bool,
 }
 
 struct State {
@@ -183,7 +190,7 @@ impl RunManager {
                 queue.push_back(s.id.clone());
             }
             order.push(s.id.clone());
-            runs.insert(s.id.clone(), Entry { stored: s, ctl: None, thread: None });
+            runs.insert(s.id.clone(), Entry { stored: s, ctl: None, thread: None, abort_req: false, finalising: false });
         }
         let inner = Arc::new(Inner {
             data,
@@ -222,7 +229,7 @@ impl RunManager {
             persist::save(&self.inner.data, &stored)?;
             st.order.push(id.clone());
             st.queue.push_back(id.clone());
-            st.runs.insert(id.clone(), Entry { stored: stored.clone(), ctl: None, thread: None });
+            st.runs.insert(id.clone(), Entry { stored: stored.clone(), ctl: None, thread: None, abort_req: false, finalising: false });
         }
         self.inner.emit_state(stored.info());
         pump(&self.inner);
@@ -244,7 +251,12 @@ impl RunManager {
                 Ok(())
             }
             "running" => {
+                if e.finalising {
+                    return Err(anyhow!("run {id} is already finishing"));
+                }
                 let ctl = e.ctl.clone().ok_or_else(|| anyhow!("run {id} is starting"))?;
+                // accepted: from here on this abort wins over any Settled that arrives later
+                e.abort_req = true;
                 drop(st);
                 let _ = ctl.send(Cmd::Abort);
                 Ok(())
@@ -312,8 +324,16 @@ impl RunManager {
         }
         let branch = s.branch.clone().ok_or_else(|| anyhow!("run {id} has no branch"))?;
         let root = &s.repo;
+        let head = s.head_sha.clone().ok_or_else(|| anyhow!("run {id} has no recorded head commit"))?;
         let tip = gitrun::out(root, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]).context("run branch is missing")?;
-        if tip == s.base_sha || gitrun::test(root, &["merge-base", "--is-ancestor", &tip, "HEAD"])? {
+        if tip != head {
+            return Err(anyhow!(
+                "branch {branch} moved after the run finished ({} -> {}); refusing to merge unreviewed commits",
+                &head[..12.min(head.len())],
+                &tip[..12.min(tip.len())]
+            ));
+        }
+        if head == s.base_sha || gitrun::test(root, &["merge-base", "--is-ancestor", &head, "HEAD"])? {
             return Ok(ApplyOutcome::NothingToApply);
         }
         if !gitrun::run(root, &["status", "--porcelain=v1", "-z", "--untracked-files=no"])?.is_empty() {
@@ -323,7 +343,8 @@ impl RunManager {
             return Err(anyhow!("current HEAD does not descend from the run's base {}", &s.base_sha[..12.min(s.base_sha.len())]));
         }
         let msg = format!("Merge codetrail run {id} ({branch})");
-        let o = gitrun::run_raw(root, &["merge", "--no-ff", "--no-edit", "-m", &msg, &branch], &[], None)?;
+        // merge the reviewed commit itself, not the (mutable) branch name
+        let o = gitrun::run_raw(root, &["merge", "--no-ff", "--no-edit", "-m", &msg, &head], &[], None)?;
         if o.code == 0 {
             return Ok(ApplyOutcome::Merged(gitrun::out(root, &["rev-parse", "HEAD"])?));
         }
@@ -497,6 +518,22 @@ fn pump(inner: &Arc<Inner>) {
 
 /// Final state transition: releases the concurrency slot and starts the next queued run.
 fn finish(inner: &Arc<Inner>, id: &str, state: RunState, extra: Option<Box<dyn FnOnce(&mut Stored)>>) {
+    // Terminal transitions are serialised with abort(): an abort that was accepted wins over
+    // whatever the agent reported; once finalising starts, abort() is refused.
+    let state = {
+        let mut st = inner.st.lock();
+        match st.runs.get_mut(id) {
+            Some(e) => {
+                e.finalising = true;
+                if e.abort_req {
+                    RunState::Aborted
+                } else {
+                    state
+                }
+            }
+            None => state,
+        }
+    };
     inner.update(id, |s| {
         s.set_state(&state);
         s.ended_ms = Some(ct_store::now_ms());
@@ -643,6 +680,9 @@ fn supervise(inner: &Arc<Inner>, id: &str, cmds: &Receiver<Cmd>) {
             inner.log_error(id, &format!("auto reasons: {e:#}"));
         }
     }
+    if !inner.timings.finalize_delay.is_zero() {
+        std::thread::sleep(inner.timings.finalize_delay);
+    }
     let state = if aborted {
         RunState::Aborted
     } else {
@@ -669,6 +709,47 @@ fn supervise(inner: &Arc<Inner>, id: &str, cmds: &Receiver<Cmd>) {
     );
 }
 
+/// Escalation timer for an accepted abort: after `abort_grace` SIGTERM the group, after a further
+/// `term_grace` SIGKILL it. Runs on its own thread, so it never waits on the session (whose
+/// `abort()` may block) or on the event loop. Dropping it cancels any pending escalation.
+struct Watchdog(Arc<std::sync::atomic::AtomicBool>);
+
+impl Watchdog {
+    fn start(pid: Option<u32>, start: Option<u64>, t: Timings) -> Self {
+        use std::sync::atomic::Ordering::SeqCst;
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c = cancel.clone();
+        if let Some(p) = pid {
+            let spawned = std::thread::Builder::new().name("run-abort-watchdog".into()).spawn(move || {
+                let wait = |d: Duration| -> bool {
+                    let end = Instant::now() + d;
+                    while Instant::now() < end {
+                        if c.load(SeqCst) || proc::everything_gone(p, start) {
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    true
+                };
+                if wait(t.abort_grace) {
+                    proc::signal_all(p, start, libc::SIGTERM);
+                    if wait(t.term_grace) {
+                        proc::signal_all(p, start, libc::SIGKILL);
+                    }
+                }
+            });
+            drop(spawned);
+        }
+        Watchdog(cancel)
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn event_loop(
     inner: &Arc<Inner>,
@@ -682,16 +763,16 @@ fn event_loop(
     aborted: &mut bool,
 ) -> End {
     let t = inner.timings;
-    // 0 running, 1 abort sent, 2 SIGTERM sent, 3 SIGKILL sent
-    let mut stage = 0u8;
-    let mut stage_at = Instant::now();
+    let mut abort_at: Option<Instant> = None;
+    let mut _watchdog: Option<Watchdog> = None;
     loop {
         while let Ok(c) = cmds.try_recv() {
             match c {
-                Cmd::Abort if stage == 0 => {
-                    stage = 1;
+                Cmd::Abort if abort_at.is_none() => {
                     *aborted = true;
-                    stage_at = Instant::now();
+                    abort_at = Some(Instant::now());
+                    // timer first: it must not depend on how long the session takes to answer
+                    _watchdog = Some(Watchdog::start(pid, pid_start, t));
                     let _ = sess.abort();
                 }
                 Cmd::Abort => {}
@@ -714,66 +795,46 @@ fn event_loop(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return End::Disconnected,
         }
-        if stage >= 1 {
-            let dead = pid.is_some_and(|p| !proc::is_alive(p, pid_start));
-            if dead {
+        if let Some(at) = abort_at {
+            if pid.is_some_and(|p| !proc::is_alive(p, pid_start)) {
                 return End::Killed;
             }
-            let waited = stage_at.elapsed();
-            match stage {
-                1 if waited >= t.abort_grace => {
-                    if let Some(p) = pid {
-                        proc::signal_group(p, libc::SIGTERM);
-                    }
-                    stage = 2;
-                    stage_at = Instant::now();
-                }
-                2 if waited >= t.term_grace => {
-                    if let Some(p) = pid {
-                        proc::signal_group(p, libc::SIGKILL);
-                    }
-                    stage = 3;
-                    stage_at = Instant::now();
-                }
-                3 if waited >= Duration::from_secs(2) || pid.is_none() => return End::Killed,
-                _ => {}
+            if at.elapsed() >= t.abort_grace + t.term_grace + Duration::from_secs(2) {
+                return End::Killed;
             }
         }
     }
 }
 
-/// SIGTERM → grace → SIGKILL of the session's group; only if the leader still runs.
+/// SIGTERM → grace → SIGKILL of the session's group and any survivors of a dead leader.
 fn stop_process(pid: Option<u32>, start: Option<u64>, t: Timings) {
     if let Some(p) = pid {
-        if proc::is_alive(p, start) {
-            proc::terminate(p, start, t.term_grace, Duration::from_secs(2));
-        }
+        proc::terminate(p, start, t.term_grace, Duration::from_secs(2));
     }
 }
 
 /// After the session ended: nothing the agent started (dev servers, shells) may outlive the run.
 fn cleanup_group(pid: Option<u32>, start: Option<u64>) {
-    let Some(p) = pid else { return };
-    if proc::is_alive(p, start) {
+    if let Some(p) = pid {
         proc::terminate(p, start, Duration::from_millis(500), Duration::from_secs(2));
-    } else {
-        proc::signal_group(p, libc::SIGKILL);
     }
 }
 
-/// A run left `running` by a previous process: kill whatever is still alive, mark Interrupted and
-/// keep the agent's uncommitted work as an artifact commit (isolated runs only).
+/// A run left `running` by a previous process: kill whatever is still alive — including group
+/// members that outlived a dead leader — mark Interrupted and keep the agent's uncommitted work as
+/// an artifact commit (isolated runs only). Artifacts are committed only after the group is gone.
 fn reconcile_orphan(data: &Path, s: &mut Stored, t: Timings) {
+    let mut group_gone = true;
     if let Some(p) = s.pid {
-        if proc::is_alive(p, s.pid_start) {
-            proc::terminate(p, s.pid_start, t.term_grace, Duration::from_secs(2));
-        }
+        group_gone = proc::terminate(p, s.pid_start, t.term_grace, Duration::from_secs(2));
     }
     s.set_state(&RunState::Interrupted);
     s.ended_ms = Some(ct_store::now_ms());
-    s.pid = None;
-    s.pid_start = None;
-    if let (true, Some(wt)) = (s.isolate, s.worktree.clone()) {
+    if group_gone {
+        s.pid = None;
+        s.pid_start = None;
+    }
+    if let (true, true, Some(wt)) = (group_gone, s.isolate, s.worktree.clone()) {
         if wt.is_dir() && artifact::check_worktree_path(data, &wt).is_ok() {
             if let Ok(head) = artifact::commit_worktree(&wt, &s.id) {
                 if let Ok(ch) = artifact::changes(&s.repo, &s.base_sha, &head) {

@@ -9,6 +9,20 @@ use anyhow::{anyhow, Result};
 
 const TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Variables git (and the hooks / filters it runs) may see. Everything else — provider tokens in
+/// particular — is dropped.
+const PASS_THROUGH: &[&str] = &["PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TMPDIR", "TZ", "XDG_CONFIG_HOME"];
+
+/// Absolute git binary: a cleaned environment must not depend on PATH wrappers that need extra
+/// variables.
+static GIT_BIN: std::sync::LazyLock<std::path::PathBuf> = std::sync::LazyLock::new(|| {
+    ["/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git", "/bin/git"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists())
+        .unwrap_or_else(|| "git".into())
+});
+
 pub struct Out {
     pub code: i32,
     pub stdout: Vec<u8>,
@@ -17,10 +31,14 @@ pub struct Out {
 
 /// Runs git and returns its output whatever the exit code (spawn / timeout failures are errors).
 pub fn run_raw(cwd: &Path, args: &[&str], env: &[(&str, &str)], stdin: Option<&[u8]>) -> Result<Out> {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(cwd)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let mut cmd = Command::new(&*GIT_BIN);
+    cmd.current_dir(cwd).args(args).env_clear();
+    for (k, v) in std::env::vars_os() {
+        if k.to_str().is_some_and(|k| PASS_THROUGH.contains(&k) || k.starts_with("LC_")) {
+            cmd.env(k, v);
+        }
+    }
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_EDITOR", "true")
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())

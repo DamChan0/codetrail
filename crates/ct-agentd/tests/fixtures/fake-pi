@@ -7,6 +7,8 @@
 #   NOREPLY          do not answer the prompt command (hang)
 #   IGNORE_TERM      ignore SIGTERM and stdin close (needs SIGKILL)
 #   PIDFILE:<path>   write own pid
+#   NOABORT          never answer (or react to) abort
+#   REPEAT:<n>:<raw> write the raw stdout line n times
 import json, os, signal, sys, time
 sc = []
 try:
@@ -31,6 +33,10 @@ def play():
     for l in sc:
         if l.startswith("OUT:"): emit(l[4:])
         elif l.startswith("ERR:"): sys.stderr.write(l[4:] + "\n"); sys.stderr.flush()
+        elif l.startswith("REPEAT:"):
+            n, raw = l[7:].split(":", 1)
+            blob = (raw + "\n").encode("utf-8") * int(n)
+            out.write(blob); out.flush()
         elif l.startswith("SLEEP:"): time.sleep(float(l[6:]))
         elif l.startswith("EXIT:"): os._exit(int(l[5:]))
 # "interleaved stderr" noise at startup must never be parsed as protocol
@@ -49,6 +55,8 @@ for raw in sys.stdin.buffer:
         respond(t, i, {"models": [{"id":"m1","name":"Model One","provider":"p","reasoning":True,"contextWindow":1000}]})
     elif t == "set_model" and cmd.get("modelId") == "bad":
         respond(t, i, ok=False, err="Model not found")
+    elif t == "abort" and "NOABORT" in sc:
+        pass
     elif t == "abort":
         respond(t, i) if i else None
         emit(json.dumps({"type":"agent_end","messages":[{"role":"assistant","stopReason":"aborted"}]}))

@@ -16,20 +16,141 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ChildStdin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::collections::VecDeque;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// agent_end is followed by auto-retry / compaction-retry within this window; only after it
-/// has passed quietly is the run reported as settled (unless pi sends `agent_settled`).
-const SETTLE_DEBOUNCE: Duration = Duration::from_millis(400);
+/// Quiet period after `agent_end` before the run is reported as settled.
+///
+/// Limitation: pi 0.74.2 emits no `agent_settled` event, only a per-run `agent_end`, and pi may start
+/// an automatic retry (`auto_retry_start`, then another `agent_start`) right after an `agent_end`.
+/// Without a settle signal the run is therefore reported as settled only once no retry/compaction/new
+/// run has begun for this long. A pi that sends `agent_settled` bypasses the wait. A retry that
+/// starts later than this window would be reported as a second run of an already-settled prompt.
+const SETTLE_QUIET_PERIOD: Duration = Duration::from_millis(400);
+
+/// Capacity of the consumer-facing event queue (`AgentSession::events`).
+const EVENT_QUEUE: usize = 1024;
+/// Capacity of the reader -> dispatcher queue. When full the reader blocks and pi's pipe backs up.
+const MSG_QUEUE: usize = 1024;
+/// Stderr lines kept while the consumer lags; older lines are dropped (and counted).
+const STDERR_RING: usize = 200;
+/// How often a lagging consumer's queue is retried for coalesced text / stderr.
+const OUTBOX_RETRY: Duration = Duration::from_millis(20);
 
 enum Msg {
-    Out(Vec<u8>),
-    OutEof,
+    Event(Value),
+    /// A line that is not a JSON object, or a response without an id (already masked/truncated).
+    Note(String),
     Err(Vec<u8>),
+    OutEof,
     ErrEof,
     Oversize(&'static str, usize),
+}
+
+/// Consumer-facing side of the pipeline. Bounded: terminal/tool events block (nothing is lost, pi is
+/// back-pressured through the pipe), text deltas are coalesced while the queue is full, stderr lines
+/// live in a ring.
+struct Outbox {
+    tx: SyncSender<AgentEvent>,
+    delta: String,
+    errs: VecDeque<String>,
+    dropped: usize,
+    dead: bool,
+}
+
+impl Outbox {
+    fn new(tx: SyncSender<AgentEvent>) -> Self {
+        Outbox { tx, delta: String::new(), errs: VecDeque::new(), dropped: 0, dead: false }
+    }
+
+    fn lagging(&self) -> bool {
+        !self.dead && (!self.delta.is_empty() || !self.errs.is_empty() || self.dropped > 0)
+    }
+
+    fn text(&mut self, t: &str) {
+        if self.dead {
+            return;
+        }
+        self.delta.push_str(t);
+        self.pump();
+    }
+
+    fn stderr(&mut self, line: String) {
+        if self.dead {
+            return;
+        }
+        if self.errs.len() >= STDERR_RING {
+            self.errs.pop_front();
+            self.dropped += 1;
+        }
+        self.errs.push_back(line);
+        self.pump();
+    }
+
+    /// Non-blocking: hand over as much pending text/stderr as the queue accepts.
+    fn pump(&mut self) {
+        if self.dead {
+            return;
+        }
+        if !self.delta.is_empty() {
+            match self.tx.try_send(AgentEvent::TextDelta(std::mem::take(&mut self.delta))) {
+                Ok(()) => {}
+                Err(TrySendError::Full(AgentEvent::TextDelta(t))) => {
+                    self.delta = t;
+                    return;
+                }
+                Err(_) => return self.kill(),
+            }
+        }
+        if self.dropped > 0 {
+            let note = AgentEvent::Stderr(format!("[{} stderr lines dropped]", self.dropped));
+            match self.tx.try_send(note) {
+                Ok(()) => self.dropped = 0,
+                Err(TrySendError::Full(_)) => return,
+                Err(_) => return self.kill(),
+            }
+        }
+        while let Some(e) = self.errs.pop_front() {
+            match self.tx.try_send(AgentEvent::Stderr(e)) {
+                Ok(()) => {}
+                Err(TrySendError::Full(AgentEvent::Stderr(e))) => {
+                    self.errs.push_front(e);
+                    return;
+                }
+                Err(_) => return self.kill(),
+            }
+        }
+    }
+
+    fn kill(&mut self) {
+        self.dead = true;
+        self.delta.clear();
+        self.errs.clear();
+    }
+
+    /// Blocking send of everything pending, then `ev`. Returns when the consumer took it or is gone.
+    fn send(&mut self, ev: AgentEvent) {
+        if self.dead {
+            return;
+        }
+        let mut batch: Vec<AgentEvent> = Vec::new();
+        if !self.delta.is_empty() {
+            batch.push(AgentEvent::TextDelta(std::mem::take(&mut self.delta)));
+        }
+        if self.dropped > 0 {
+            batch.push(AgentEvent::Stderr(format!("[{} stderr lines dropped]", self.dropped)));
+            self.dropped = 0;
+        }
+        batch.extend(self.errs.drain(..).map(AgentEvent::Stderr));
+        batch.push(ev);
+        for e in batch {
+            if self.tx.send(e).is_err() {
+                return self.kill();
+            }
+        }
+    }
 }
 
 /// Maps pi events to [`AgentEvent`]s. Pure state machine; time is passed in.
@@ -142,7 +263,7 @@ impl Mapper {
                 self.last_end = Some(result.clone());
                 if !self.saw_settled_event {
                     let ev = AgentEvent::Settled { ok: result.0, error: result.1 };
-                    self.pending_settle = Some((now + SETTLE_DEBOUNCE, ev));
+                    self.pending_settle = Some((now + SETTLE_QUIET_PERIOD, ev));
                 }
             }
             "agent_settled" => {
@@ -274,7 +395,7 @@ impl Inner {
 
 struct Conn {
     inner: Arc<Inner>,
-    events: Receiver<AgentEvent>,
+    events: Option<Receiver<AgentEvent>>,
     dispatcher: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -305,12 +426,46 @@ fn open(cfg: &Config, extra_args: Vec<OsString>, cwd: Option<PathBuf>, env_allow
     let sp = proc::spawn(Spec { program: program.clone(), args, cwd, env })
         .map_err(|e| Error::Other(format!("cannot start {}: {e}", program.display())))?;
 
-    let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+    let pending: Arc<Mutex<HashMap<String, Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let (msg_tx, msg_rx) = mpsc::sync_channel::<Msg>(MSG_QUEUE);
     let tx = msg_tx.clone();
     let mut stdout = sp.stdout;
+    let route = pending.clone();
     std::thread::Builder::new().name("ct-pi-stdout".into()).spawn(move || {
         let t2 = tx.clone();
-        read_lf_lines(&mut stdout, |l| drop(tx.send(Msg::Out(l))), |n| drop(t2.send(Msg::Oversize("stdout", n))));
+        read_lf_lines(
+            &mut stdout,
+            |l| {
+                if l.is_empty() {
+                    return;
+                }
+                // responses are routed here, not in the dispatcher: a consumer that issues a request
+                // from its event loop must get the answer even while the event queue is full
+                let msg = match serde_json::from_slice::<Value>(&l) {
+                    Ok(v) if v.is_object() => {
+                        if v.get("type").and_then(Value::as_str) == Some("response") {
+                            match v.get("id").and_then(Value::as_str) {
+                                Some(id) => {
+                                    if let Some(w) = route.lock().remove(id) {
+                                        let _ = w.send(v);
+                                    }
+                                    return;
+                                }
+                                None => {
+                                    let e = v.get("error").and_then(Value::as_str).unwrap_or("response without id");
+                                    Msg::Note(format!("pi: {}", mask_secrets(&truncate(e, 500))))
+                                }
+                            }
+                        } else {
+                            Msg::Event(v)
+                        }
+                    }
+                    _ => Msg::Note(format!("unparsable pi output: {}", lossy_masked(&l[..l.len().min(300)]))),
+                };
+                let _ = tx.send(msg);
+            },
+            |n| drop(t2.send(Msg::Oversize("stdout", n))),
+        );
         let _ = t2.send(Msg::OutEof);
     })?;
     let tx = msg_tx.clone();
@@ -322,7 +477,6 @@ fn open(cfg: &Config, extra_args: Vec<OsString>, cwd: Option<PathBuf>, env_allow
     })?;
     drop(msg_tx);
 
-    let pending: Arc<Mutex<HashMap<String, Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
     let running = Arc::new(AtomicBool::new(false));
     let inner = Arc::new(Inner {
         host: sp.host.clone(),
@@ -336,38 +490,47 @@ fn open(cfg: &Config, extra_args: Vec<OsString>, cwd: Option<PathBuf>, env_allow
         grace_close: cfg.grace_close,
         grace_term: cfg.grace_term,
     });
-    let (ev_tx, ev_rx) = mpsc::channel::<AgentEvent>();
+    let (ev_tx, ev_rx) = mpsc::sync_channel::<AgentEvent>(EVENT_QUEUE);
     let host = sp.host;
     let disp_inner = inner.clone();
     let dispatcher = std::thread::Builder::new().name("ct-pi-dispatch".into()).spawn(move || {
         dispatch(msg_rx, ev_tx, pending, running, host, disp_inner);
     })?;
-    Ok(Conn { inner, events: ev_rx, dispatcher: Some(dispatcher) })
+    Ok(Conn { inner, events: Some(ev_rx), dispatcher: Some(dispatcher) })
 }
 
 fn dispatch(
     rx: Receiver<Msg>,
-    ev: Sender<AgentEvent>,
+    ev: SyncSender<AgentEvent>,
     pending: Arc<Mutex<HashMap<String, Sender<Value>>>>,
     running: Arc<AtomicBool>,
     host: Host,
     inner: Arc<Inner>,
 ) {
     let mut m = Mapper::new();
+    let mut out = Outbox::new(ev);
     let (mut out_eof, mut err_eof) = (false, false);
-    let emit = |evs: Vec<AgentEvent>, m: &Mapper| {
+    fn emit(out: &mut Outbox, running: &AtomicBool, m: &Mapper, evs: Vec<AgentEvent>) {
         running.store(m.running(), Ordering::SeqCst);
         for e in evs {
-            let _ = ev.send(e);
+            match e {
+                AgentEvent::TextDelta(t) => out.text(&t),
+                other => out.send(other),
+            }
         }
-    };
+    }
     while !(out_eof && err_eof) {
-        let msg = match m.deadline() {
-            Some(d) => match rx.recv_timeout(d.saturating_duration_since(Instant::now())) {
+        let mut wait: Option<Duration> = m.deadline().map(|d| d.saturating_duration_since(Instant::now()));
+        if out.lagging() {
+            wait = Some(wait.map_or(OUTBOX_RETRY, |w| w.min(OUTBOX_RETRY)));
+        }
+        let msg = match wait {
+            Some(w) => match rx.recv_timeout(w) {
                 Ok(x) => Some(x),
                 Err(RecvTimeoutError::Timeout) => {
+                    out.pump();
                     let evs = m.tick(Instant::now());
-                    emit(evs, &m);
+                    emit(&mut out, &running, &m, evs);
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => None,
@@ -376,54 +539,22 @@ fn dispatch(
         };
         let Some(msg) = msg else { break };
         match msg {
-            Msg::Out(line) => {
-                if line.is_empty() {
-                    continue;
-                }
-                match serde_json::from_slice::<Value>(&line) {
-                    Ok(v) if v.is_object() => {
-                        if v.get("type").and_then(Value::as_str) == Some("response") {
-                            match v.get("id").and_then(Value::as_str) {
-                                Some(id) => {
-                                    if let Some(tx) = pending.lock().remove(id) {
-                                        let _ = tx.send(v);
-                                    }
-                                }
-                                None => {
-                                    let e = v.get("error").and_then(Value::as_str).unwrap_or("response without id");
-                                    let _ = ev.send(AgentEvent::Stderr(format!("pi: {}", mask_secrets(&truncate(e, 500)))));
-                                }
-                            }
-                        } else if v.get("type").and_then(Value::as_str) == Some("extension_ui_request") {
-                            // no UI here: dismiss dialogs so pi never blocks on us
-                            let is_dialog = matches!(
-                                v.get("method").and_then(Value::as_str),
-                                Some("select" | "confirm" | "input" | "editor")
-                            );
-                            if let (true, Some(id)) = (is_dialog, v.get("id").and_then(Value::as_str)) {
-                                let _ = inner
-                                    .write_line(&json!({"type": "extension_ui_response", "id": id, "cancelled": true}));
-                            }
-                        } else {
-                            let evs = m.on_event(&v, Instant::now());
-                            emit(evs, &m);
-                        }
+            Msg::Event(v) => {
+                if v.get("type").and_then(Value::as_str) == Some("extension_ui_request") {
+                    // no UI here: dismiss dialogs so pi never blocks on us
+                    let is_dialog =
+                        matches!(v.get("method").and_then(Value::as_str), Some("select" | "confirm" | "input" | "editor"));
+                    if let (true, Some(id)) = (is_dialog, v.get("id").and_then(Value::as_str)) {
+                        let _ = inner.write_line(&json!({"type": "extension_ui_response", "id": id, "cancelled": true}));
                     }
-                    _ => {
-                        let _ = ev.send(AgentEvent::Stderr(format!(
-                            "unparsable pi output: {}",
-                            lossy_masked(&line[..line.len().min(300)])
-                        )));
-                    }
+                } else {
+                    let evs = m.on_event(&v, Instant::now());
+                    emit(&mut out, &running, &m, evs);
                 }
             }
-            Msg::Err(line) => {
-                let text = lossy_masked(&line[..line.len().min(4000)]);
-                let _ = ev.send(AgentEvent::Stderr(text));
-            }
-            Msg::Oversize(which, n) => {
-                let _ = ev.send(AgentEvent::Stderr(format!("dropped an oversized pi {which} line ({n} bytes)")));
-            }
+            Msg::Note(t) => out.stderr(t),
+            Msg::Err(line) => out.stderr(lossy_masked(&line[..line.len().min(4000)])),
+            Msg::Oversize(which, n) => out.stderr(format!("dropped an oversized pi {which} line ({n} bytes)")),
             Msg::OutEof => out_eof = true,
             Msg::ErrEof => err_eof = true,
         }
@@ -431,11 +562,13 @@ fn dispatch(
     let code = host.wait_exit(Duration::from_secs(10)).unwrap_or(None);
     pending.lock().clear();
     let evs = m.on_exit(code);
-    emit(evs, &m);
+    emit(&mut out, &running, &m, evs);
 }
 
 impl Conn {
     fn close(mut self) {
+        // releases a dispatcher blocked on a full event queue
+        self.events.take();
         self.inner.shutdown();
         if let Some(h) = self.dispatcher.take() {
             let _ = h.join();
@@ -449,6 +582,7 @@ impl Drop for Conn {
             // dropped without close(): shut down off-thread, never block the caller
             let inner = self.inner.clone();
             let d = self.dispatcher.take();
+            self.events.take();
             let _ = std::thread::Builder::new().name("ct-pi-reaper".into()).spawn(move || {
                 inner.shutdown();
                 if let Some(h) = d {
@@ -517,8 +651,12 @@ impl AgentSession for PiSession {
     fn follow_up(&mut self, text: &str) -> Result<()> {
         self.conn()?.inner.request(json!({"type": "follow_up", "message": text})).map(|_| ())
     }
+    /// Fire-and-forget: the command is written and the call returns. pi's response (if any) carries an
+    /// id nobody waits on and is dropped by the reader; a hung pi cannot delay the caller's escalation.
     fn abort(&mut self) -> Result<()> {
-        self.conn()?.inner.request(json!({"type": "abort"})).map(|_| ())
+        let inner = &self.conn()?.inner;
+        let id = format!("ct-abort-{}", inner.next_id.fetch_add(1, Ordering::Relaxed));
+        inner.write_line(&json!({"type": "abort", "id": id}))
     }
     fn set_model(&mut self, m: &ModelSel) -> Result<()> {
         let c = self.conn()?;
@@ -541,7 +679,7 @@ impl AgentSession for PiSession {
         Ok(())
     }
     fn events(&self) -> &Receiver<AgentEvent> {
-        &self.conn.as_ref().expect("events() on a closed session").events
+        self.conn.as_ref().and_then(|c| c.events.as_ref()).expect("events() on a closed session")
     }
     fn close(mut self: Box<Self>) {
         if let Some(c) = self.conn.take() {
@@ -618,7 +756,7 @@ mod tests {
         assert_eq!(evs[4], AgentEvent::Usage { input: 13, output: 5, cost: Some(0.5) });
         assert_eq!(evs.len(), 5, "settle is debounced");
         assert!(m.tick(t0).is_empty());
-        assert_eq!(m.tick(t0 + SETTLE_DEBOUNCE), vec![AgentEvent::Settled { ok: true, error: None }]);
+        assert_eq!(m.tick(t0 + SETTLE_QUIET_PERIOD), vec![AgentEvent::Settled { ok: true, error: None }]);
     }
 
     #[test]
@@ -626,9 +764,9 @@ mod tests {
         let mut m = Mapper::new();
         let t0 = Instant::now();
         feed(&mut m, &[r#"{"type":"agent_start"}"#, r#"{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error","errorMessage":"overloaded"}]}"#, r#"{"type":"auto_retry_start","attempt":1}"#], t0);
-        assert!(m.tick(t0 + SETTLE_DEBOUNCE * 2).is_empty());
+        assert!(m.tick(t0 + SETTLE_QUIET_PERIOD * 2).is_empty());
         feed(&mut m, &[r#"{"type":"agent_start"}"#, r#"{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error","errorMessage":"overloaded sk-abcdefghijklmnop12345"}]}"#], t0);
-        let evs = m.tick(t0 + SETTLE_DEBOUNCE);
+        let evs = m.tick(t0 + SETTLE_QUIET_PERIOD);
         match &evs[..] {
             [AgentEvent::Settled { ok: false, error: Some(e) }] => assert!(e.contains("overloaded") && !e.contains("abcdefghijklmnop")),
             x => panic!("{x:?}"),
@@ -641,7 +779,44 @@ mod tests {
         let t0 = Instant::now();
         let evs = feed(&mut m, &[r#"{"type":"agent_start"}"#, r#"{"type":"agent_end","messages":[]}"#, r#"{"type":"agent_settled"}"#], t0);
         assert_eq!(evs.last(), Some(&AgentEvent::Settled { ok: true, error: None }));
-        assert!(m.tick(t0 + SETTLE_DEBOUNCE * 2).is_empty());
+        assert!(m.tick(t0 + SETTLE_QUIET_PERIOD * 2).is_empty());
+    }
+
+    #[test]
+    fn outbox_stays_bounded_coalesces_text_and_never_drops_terminal_events() {
+        let (tx, rx) = mpsc::sync_channel(8);
+        let mut o = Outbox::new(tx);
+        // consumer is stalled: none of this may block, and the queue holds at most its capacity
+        for i in 0..200_000 {
+            o.text("xy");
+            if i % 1000 == 0 {
+                o.stderr(format!("e{i}"));
+            }
+        }
+        for i in 0..1000 {
+            o.stderr(format!("noise{i}"));
+        }
+        assert!(o.errs.len() <= STDERR_RING && o.dropped > 0);
+        let t = std::thread::spawn(move || {
+            o.send(AgentEvent::Settled { ok: true, error: None });
+            o
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let mut text = 0;
+        let mut last = None;
+        while let Ok(e) = rx.recv_timeout(Duration::from_secs(2)) {
+            if let AgentEvent::TextDelta(s) = &e {
+                text += s.len();
+            }
+            let done = matches!(e, AgentEvent::Settled { .. });
+            last = Some(e);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(text, 400_000);
+        assert_eq!(last, Some(AgentEvent::Settled { ok: true, error: None }));
+        let _ = t.join();
     }
 
     #[test]

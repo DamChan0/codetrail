@@ -25,28 +25,47 @@ use std::time::Duration;
 pub(crate) const PI_PROVIDERS: [(&str, &str); 2] = [("openai-codex", "ChatGPT (OpenAI Codex)"), ("github-copilot", "GitHub Copilot")];
 
 pub(crate) const LOGIN_HELPER: &str = include_str!("../assets/login-helper.mjs");
+const AUTH_TOOL: &str = include_str!("../assets/auth-tool.mjs");
 
 #[derive(Deserialize)]
-struct AuthEntry {
+struct ToolStatus {
+    #[serde(default)]
+    providers: BTreeMap<String, ToolProvider>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ToolProvider {
     #[serde(rename = "type")]
     ty: Option<String>,
 }
 
-/// provider id -> auth type. Token fields are skipped by serde and never stored.
-fn auth_providers(path: &Path) -> std::result::Result<BTreeMap<String, Option<String>>, String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(format!("cannot read auth.json: {e}")),
-    };
-    if text.trim().is_empty() {
-        return Ok(BTreeMap::new());
+/// Runs `auth-tool.mjs <args>` with the app-private node. Its stdout is token-free by construction;
+/// only that output is parsed here, auth.json itself is never opened by this process.
+fn auth_tool(cfg: &Config, args: &[&str]) -> std::result::Result<ToolStatus, String> {
+    let node = cfg.node_bin();
+    if !node.exists() {
+        return Err("agent runtime is not installed; run runtime_setup first".into());
     }
-    let map: BTreeMap<String, AuthEntry> = serde_json::from_str(&text).map_err(|_| "auth.json is not valid".to_string())?;
-    Ok(map.into_iter().map(|(k, v)| (k, v.ty)).collect())
+    let script = cfg.agent_dir().join("auth-tool.mjs");
+    if std::fs::read_to_string(&script).map_or(true, |s| s != AUTH_TOOL) {
+        std::fs::write(&script, AUTH_TOOL).map_err(|_| "cannot write auth tool".to_string())?;
+    }
+    let mut argv: Vec<OsString> = vec![script.into_os_string()];
+    argv.extend(args.iter().map(OsString::from));
+    let spec = Spec { program: node, args: argv, cwd: Some(cfg.agent_dir()), env: proc::whitelist_env(&[], &[]) };
+    let cap = proc::run_capture(spec, cfg.status_timeout).map_err(|_| "cannot run auth tool".to_string())?;
+    if cap.timed_out || cap.code != Some(0) {
+        return Err("auth tool failed".into());
+    }
+    let st: ToolStatus = serde_json::from_slice(&cap.stdout).map_err(|_| "unexpected auth tool output".to_string())?;
+    match st.error {
+        Some(e) => Err(mask_secrets(&truncate(&e, 200))),
+        None => Ok(st),
+    }
 }
 
-/// Credentials must be owner-only; tighten silently when found looser.
+/// Credentials must be owner-only; tighten silently when found looser (metadata only).
 fn ensure_private(path: &Path) {
     if let Ok(md) = std::fs::metadata(path) {
         if md.permissions().mode() & 0o077 != 0 {
@@ -55,19 +74,31 @@ fn ensure_private(path: &Path) {
     }
 }
 
-fn pi_state(cfg: &Config, id: &str) -> AccountState {
-    if cfg.is_disabled(id) {
-        return AccountState::Unavailable { reason: "disabled by config (accounts.disabled)".into() };
-    }
+/// provider id -> state for the pi-backed accounts, from one tool call.
+fn pi_states(cfg: &Config) -> BTreeMap<&'static str, AccountState> {
+    let mut m = BTreeMap::new();
     let p = cfg.auth_json();
-    ensure_private(&p);
-    match auth_providers(&p) {
-        Ok(m) => match m.get(id) {
-            Some(ty) => AccountState::LoggedIn { method: ty.clone().unwrap_or_else(|| "oauth".into()) },
-            None => AccountState::LoggedOut,
-        },
-        Err(e) => AccountState::Unavailable { reason: e },
+    let detected = if !p.exists() {
+        Ok(BTreeMap::new())
+    } else {
+        ensure_private(&p);
+        auth_tool(cfg, &["status", &p.to_string_lossy()]).map(|s| s.providers)
+    };
+    for (id, _) in PI_PROVIDERS {
+        let st = if cfg.is_disabled(id) {
+            AccountState::Unavailable { reason: "disabled by config (accounts.disabled)".into() }
+        } else {
+            match &detected {
+                Ok(map) => match map.get(id) {
+                    Some(e) => AccountState::LoggedIn { method: e.ty.clone().unwrap_or_else(|| "oauth".into()) },
+                    None => AccountState::LoggedOut,
+                },
+                Err(e) => AccountState::Unavailable { reason: e.clone() },
+            }
+        };
+        m.insert(id, st);
     }
+    m
 }
 
 fn status_spec(program: &Path, args: &[&str], backend_vars: &[&str]) -> Spec {
@@ -133,9 +164,10 @@ fn codex_state(cfg: &Config) -> AccountState {
 }
 
 pub(crate) fn accounts(cfg: &Config) -> Vec<Account> {
+    let mut states = pi_states(cfg);
     let mut v: Vec<Account> = PI_PROVIDERS
         .iter()
-        .map(|(id, label)| Account { id: (*id).into(), label: (*label).into(), state: pi_state(cfg, id), login: LoginKind::InApp })
+        .map(|(id, label)| Account { id: (*id).into(), label: (*label).into(), state: states.remove(id).unwrap_or(AccountState::LoggedOut), login: LoginKind::InApp })
         .collect();
     v.push(Account { id: "claude".into(), label: "Claude (Anthropic)".into(), state: claude_state(cfg), login: LoginKind::ExternalCli { command: "claude auth login".into() } });
     v.push(Account { id: "codex".into(), label: "Codex (OpenAI CLI)".into(), state: codex_state(cfg), login: LoginKind::ExternalCli { command: "codex login".into() } });
@@ -258,42 +290,20 @@ pub(crate) fn login_start(cfg: &Config, id: &str) -> Result<LoginHandle> {
     Ok(LoginHandle::new(rx, LoginCtl { stdin: Mutex::new(Some(sp.stdin)), host: sp.host, grace_term: cfg.grace_term }))
 }
 
-/// Removes only `id`'s entry from auth.json (atomic rewrite, 0600). Other providers keep their
-/// entries verbatim; token values stay opaque `serde_json::Value`s that are written straight back.
+/// Removes only `id`'s entry from auth.json. Done by `auth-tool.mjs` (atomic rewrite, 0600, other
+/// entries verbatim): this process never reads the file's contents.
 pub(crate) fn logout(cfg: &Config, id: &str) -> Result<()> {
     if !PI_PROVIDERS.iter().any(|(p, _)| *p == id) {
         return Err(match id {
             "claude" => Error::Other("claude logout is external: run `claude auth logout`".into()),
-            "codex" => Error::Other("codex logout is external: run `codex logout`".into()),
+            "codex" => Error::Other("codex logout is external: run `codex login`".into()),
             _ => Error::Other(format!("unknown account: {id}")),
         });
     }
-    let path = cfg.auth_json();
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(Error::Other(format!("cannot read auth.json: {e}"))),
-    };
-    let mut map: serde_json::Map<String, Value> =
-        serde_json::from_str(&text).map_err(|_| Error::Other("auth.json is not valid; not modifying it".into()))?;
-    if map.remove(id).is_none() {
+    if !cfg.auth_json().exists() {
         return Ok(());
     }
-    let tmp = path.with_extension("json.tmp");
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .map_err(|e| Error::Other(format!("cannot write auth.json: {e}")))?;
-        f.write_all(serde_json::to_string_pretty(&map).unwrap_or_default().as_bytes())
-            .and_then(|_| f.sync_all())
-            .map_err(|e| Error::Other(format!("cannot write auth.json: {e}")))?;
-    }
-    std::fs::rename(&tmp, &path).map_err(|e| Error::Other(format!("cannot replace auth.json: {e}")))?;
+    auth_tool(cfg, &["logout", &cfg.auth_json().to_string_lossy(), id]).map_err(Error::Other)?;
     crate::models::invalidate(cfg);
     Ok(())
 }

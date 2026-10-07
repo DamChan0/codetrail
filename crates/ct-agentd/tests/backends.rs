@@ -16,7 +16,12 @@ impl Env {
     fn new(scenario: &str) -> Env {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("scenario"), scenario).unwrap();
-        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        // auth.json handling runs in node (the Rust side never reads tokens): give the runtime dir a node
+        let bin = dir.path().join("data/agent/node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        if let Some(node) = std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("node")).find(|c| c.exists())) {
+            std::os::unix::fs::symlink(node, bin.join("node")).unwrap();
+        }
         let mut cfg = Config::new(dir.path().join("data"));
         cfg.pi_path = Some(fixture("fake-pi"));
         cfg.claude_bin = fixture("fake-claude");
@@ -156,7 +161,66 @@ fn pi_drains_stdout_without_a_reader() {
     std::thread::sleep(Duration::from_millis(1500));
     let evs = until_settled(s.as_ref(), 20);
     s.close();
-    assert_eq!(evs.iter().filter(|e| matches!(e, AgentEvent::TextDelta(_))).count(), 20000);
+    let chars: usize = evs.iter().map(|e| if let AgentEvent::TextDelta(t) = e { t.len() } else { 0 }).sum();
+    assert_eq!(chars, 20000 * 32, "text coalesced while nobody reads, none lost");
+}
+
+#[test]
+fn pi_abort_is_fire_and_forget_even_if_pi_never_answers() {
+    let mut env = Env::new("NOABORT\nOUT:{\"type\":\"agent_start\"}");
+    env.cfg.rpc_timeout = Duration::from_secs(30);
+    let mut s = with::start_session(&env.cfg, BackendKind::Pi, env.opts(false)).unwrap();
+    s.prompt("go").unwrap();
+    let t = Instant::now();
+    s.abort().unwrap();
+    assert!(t.elapsed() < Duration::from_millis(100), "abort blocked for {:?}", t.elapsed());
+    s.close();
+}
+
+#[test]
+fn pi_slow_consumer_gets_all_text_and_the_terminal_event() {
+    let mut sc = String::from("OUT:{\"type\":\"agent_start\"}\n");
+    sc.push_str("REPEAT:200000:{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"abcd\"}}\n");
+    sc.push_str("ERR:late stderr\nOUT:{\"type\":\"agent_end\",\"messages\":[]}");
+    let env = Env::new(&sc);
+    let mut s = with::start_session(&env.cfg, BackendKind::Pi, env.opts(false)).unwrap();
+    s.prompt("go").unwrap();
+    let mut chars = 0usize;
+    let mut events = 0usize;
+    let mut settled = false;
+    let end = Instant::now() + Duration::from_secs(60);
+    while let Ok(e) = s.events().recv_timeout(end.saturating_duration_since(Instant::now())) {
+        events += 1;
+        if events % 50 == 0 {
+            std::thread::sleep(Duration::from_millis(2)); // slow UI
+        }
+        match e {
+            AgentEvent::TextDelta(t) => chars += t.len(),
+            AgentEvent::Settled { ok, .. } => {
+                settled = true;
+                assert!(ok);
+                break;
+            }
+            _ => {}
+        }
+    }
+    s.close();
+    assert_eq!(chars, 200_000 * 4, "no text lost");
+    assert!(settled, "terminal event lost");
+    assert!(events < 200_000, "deltas were coalesced under lag ({events} events)");
+}
+
+#[test]
+fn pi_close_with_unread_events_does_not_hang() {
+    let mut sc = String::from("OUT:{\"type\":\"agent_start\"}\n");
+    sc.push_str("REPEAT:50000:{\"type\":\"tool_execution_start\",\"toolCallId\":\"c\",\"toolName\":\"bash\",\"args\":{}}\n");
+    let env = Env::new(&sc);
+    let mut s = with::start_session(&env.cfg, BackendKind::Pi, env.opts(false)).unwrap();
+    s.prompt("go").unwrap();
+    std::thread::sleep(Duration::from_millis(500)); // queue full, dispatcher blocked
+    let t = Instant::now();
+    s.close();
+    assert!(t.elapsed() < Duration::from_secs(8), "{:?}", t.elapsed());
 }
 
 #[test]
@@ -354,6 +418,19 @@ fn auth_state_reads_keys_only_and_logout_removes_only_that_provider() {
     // idempotent; external accounts cannot be logged out here
     with::logout(&env.cfg, "openai-codex").unwrap();
     assert!(with::logout(&env.cfg, "claude").is_err());
+}
+
+#[test]
+fn sentinel_tokens_never_reach_rust_values_or_errors() {
+    let env = Env::new("");
+    write_auth(&env, AUTH, 0o600);
+    let mut seen = format!("{:?}", with::accounts(&env.cfg));
+    with::logout(&env.cfg, "github-copilot").unwrap();
+    // corrupt file containing a sentinel: the error/reason text must not echo content
+    write_auth(&env, "{ SECRET-ACCESS-AAAA", 0o600);
+    seen.push_str(&format!("{:?}", with::accounts(&env.cfg)));
+    seen.push_str(&format!("{:?}", with::logout(&env.cfg, "openai-codex")));
+    assert!(!seen.contains("SECRET"), "{seen}");
 }
 
 #[test]

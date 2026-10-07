@@ -39,6 +39,15 @@ pub(crate) struct Spec {
     pub env: Vec<(String, String)>,
 }
 
+/// Variables forwarded to every child (besides `LC_*`, backend-specific vars and caller `env_allow`).
+///
+/// PLAN §10.6 names PATH/HOME/LANG as the core; the rest is deliberately wider and each group is needed:
+/// * `HTTP(S)_PROXY`/`ALL_PROXY`/`NO_PROXY` (+ lowercase), `SSL_CERT_*`, `NODE_EXTRA_CA_CERTS`: agents
+///   must reach their API behind corporate proxies / private CAs. Proxy URLs can embed credentials;
+///   they are the user's own network config and are accepted knowingly (decision t013).
+/// * `XDG_*`: relocate where claude/codex keep their login state, so they stay logged in.
+/// * `USER`, `LOGNAME`, `SHELL`, `TERM`, `TMPDIR`, `TZ`, `LANGUAGE`: tool basics (shell tool, temp files).
+/// No provider API keys or tokens are forwarded unless the caller lists them in `env_allow`.
 const PASS_THROUGH: &[&str] = &[
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TMPDIR", "TZ", "XDG_CONFIG_HOME",
     "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "HTTP_PROXY", "HTTPS_PROXY",

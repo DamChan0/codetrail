@@ -72,7 +72,7 @@ enum Beh {
     /// Edits files, then settles. `gate`: wait until set (or the run is aborted).
     Edit { files: Vec<(String, String)>, intro: String, outro: String, ok: bool, gate: Option<Arc<AtomicBool>> },
     /// A real child process (own process group) that never produces events.
-    Hang { ignore_abort: bool },
+    Hang { ignore_abort: bool, block_abort: bool },
 }
 
 fn edit(files: &[(&str, &str)], intro: &str, outro: &str) -> Beh {
@@ -166,8 +166,11 @@ impl AgentSession for Fake {
         Ok(())
     }
     fn abort(&mut self) -> ct_agentd::Result<()> {
+        if let Beh::Hang { block_abort: true, .. } = self.beh {
+            std::thread::sleep(Duration::from_secs(4));
+        }
         match self.beh {
-            Beh::Hang { ignore_abort: true } => {}
+            Beh::Hang { ignore_abort: true, .. } => {}
             _ => self.stop.store(true, Ordering::SeqCst),
         }
         Ok(())
@@ -188,7 +191,7 @@ impl AgentSession for Fake {
 
 // ------------------------------------------------------------------ run helpers
 
-const FAST: Timings = Timings { abort_grace: Duration::from_millis(300), term_grace: Duration::from_millis(300), tick: Duration::from_millis(10) };
+const FAST: Timings = Timings { abort_grace: Duration::from_millis(300), term_grace: Duration::from_millis(300), tick: Duration::from_millis(10), finalize_delay: Duration::ZERO };
 
 fn mgr(e: &Env, max: usize, f: Arc<Fac>) -> RunManager {
     RunManager::open_with(&e.data, max, f, FAST).unwrap()
@@ -346,7 +349,7 @@ fn subscribers_receive_state_and_events() {
 #[test]
 fn abort_is_staged_and_kills_a_child_that_ignores_abort() {
     let e = env();
-    let m = mgr(&e, 1, Fac::new(|_| Some(Beh::Hang { ignore_abort: true })));
+    let m = mgr(&e, 1, Fac::new(|_| Some(Beh::Hang { ignore_abort: true, block_abort: false })));
     let id = m.submit(spec(&e, "hang", true)).unwrap();
     let running = wait_for(&m, &id, "pid recorded", |i| i.state == RunState::Running && i.worktree.is_some());
     // pid is persisted (and visible in run.json)
@@ -836,7 +839,7 @@ fn non_isolated_run_without_changes_creates_no_ref() {
 #[test]
 fn shutdown_all_aborts_running_runs_and_keeps_queue() {
     let e = env();
-    let m = mgr(&e, 1, Fac::new(|_| Some(Beh::Hang { ignore_abort: false })));
+    let m = mgr(&e, 1, Fac::new(|_| Some(Beh::Hang { ignore_abort: false, block_abort: false })));
     let a = m.submit(spec(&e, "one", true)).unwrap();
     let b = m.submit(spec(&e, "two", true)).unwrap();
     wait_for(&m, &a, "running", |i| i.state == RunState::Running);
@@ -887,13 +890,13 @@ fn live(backend: BackendKind) {
     let m = RunManager::open(&e.data, 2).unwrap(); // REAL default SessionFactory
     let prompt = "Create a file hello.txt containing exactly: hi. Do nothing else.";
     let id = m.submit(RunSpec { model: sel.clone(), ..spec(&e, prompt, true) }).unwrap();
-    let end = Instant::now() + Duration::from_secs(170);
+    let end = Instant::now() + Duration::from_secs(std::env::var("CT_LIVE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(170));
     let info = loop {
         let i = m.get(&id).unwrap();
         if !i.state.is_active() {
             break i;
         }
-        assert!(Instant::now() < end, "live run timed out: {:?}", i.state);
+        assert!(Instant::now() < end, "live run timed out: {:?}\nlog:\n{}", i.state, fs::read_to_string(m.events_log(&id)).unwrap_or_default());
         std::thread::sleep(Duration::from_millis(200));
     };
     let log = fs::read_to_string(m.events_log(&id)).unwrap_or_default();
@@ -911,13 +914,13 @@ fn live(backend: BackendKind) {
     let blob = git(&e.repo, &["rev-parse", &format!("{head}:hello.txt")]);
     let hit = store.match_hunk("hello.txt", &["hi".into()], &[blob]);
     assert_eq!(best_confidence(&hit), Confidence::High);
-    eprintln!("reason: {}", decode_reason(&recs[0]));
+    eprintln!("reason: {}\nlog:\n{log}", decode_reason(&recs[0]));
     let ApplyOutcome::Merged(_) = m.apply(&id).unwrap() else { panic!("apply") };
-    assert_eq!(fs::read_to_string(e.repo.join("hello.txt")).unwrap().trim(), "hi");
+    assert_eq!(fs::read_to_string(e.repo.join("hello.txt")).unwrap().trim().trim_end_matches('.'), "hi"); // models sometimes add the sentence period
 
     // second run: discard cleans up
     let id2 = m.submit(RunSpec { model: sel, ..spec(&e, prompt, true) }).unwrap();
-    let end = Instant::now() + Duration::from_secs(170);
+    let end = Instant::now() + Duration::from_secs(std::env::var("CT_LIVE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(170));
     let i2 = loop {
         let i = m.get(&id2).unwrap();
         if !i.state.is_active() {
@@ -946,4 +949,152 @@ fn live_codex() {
 #[ignore = "needs CT_LIVE=1 and a logged-in claude"]
 fn live_claude() {
     live(BackendKind::Claude);
+}
+
+// ------------------------------------------------------------------ review fixes (t012)
+
+#[test]
+fn git_children_get_a_cleaned_env_and_worktree_add_runs_no_hooks() {
+    let e = env();
+    let out = e.data.parent().unwrap().join("hookenv.txt");
+    let wt_hook = e.data.parent().unwrap().join("checkout-ran");
+    for (name, body) in [
+        ("post-merge", format!("#!/bin/sh\nenv > '{}'\n", out.display())),
+        ("post-checkout", format!("#!/bin/sh\ntouch '{}'\n", wt_hook.display())),
+    ] {
+        let p = e.repo.join(".git/hooks").join(name);
+        fs::write(&p, body).unwrap();
+        fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    std::env::set_var("CT_RUNS_SENTINEL_TOKEN", "sk-live-sentinel-value");
+    let m = mgr(&e, 1, Fac::new(|_| Some(edit(&[("n.txt", "n\n")], "i", "o"))));
+    let id = finished_edit_run(&e, &m, &[]);
+    assert!(!wt_hook.exists(), "post-checkout hook ran during worktree add");
+    assert!(matches!(m.apply(&id).unwrap(), ApplyOutcome::Merged(_)));
+    std::env::remove_var("CT_RUNS_SENTINEL_TOKEN");
+    let dumped = fs::read_to_string(&out).expect("post-merge hook (user hook semantics) must still run on apply");
+    assert!(!dumped.contains("CT_RUNS_SENTINEL_TOKEN") && !dumped.contains("sentinel-value"), "secret leaked to hook:\n{dumped}");
+    assert!(dumped.contains("PATH=") && dumped.contains("HOME="), "{dumped}");
+}
+
+#[test]
+fn abort_escalation_does_not_wait_for_a_blocking_session_abort() {
+    let e = env();
+    let m = mgr(&e, 1, Fac::new(|_| Some(Beh::Hang { ignore_abort: true, block_abort: true })));
+    let id = m.submit(spec(&e, "hang", true)).unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        let v: Value = serde_json::from_slice(&fs::read(e.data.join("runs").join(&id).join("run.json")).unwrap()).unwrap();
+        if let Some(p) = v["pid"].as_u64() {
+            break p as u32;
+        }
+        assert!(Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let t = Instant::now();
+    m.abort(&id).unwrap();
+    // session.abort() blocks for 4s; abort_grace + term_grace is 0.6s
+    while !pid_gone(pid) {
+        assert!(t.elapsed() < Duration::from_millis(2500), "escalation waited for the session ({:?})", t.elapsed());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(done(&m, &id).state, RunState::Aborted);
+}
+
+#[test]
+fn reconcile_kills_grandchildren_that_outlive_a_dead_leader() {
+    let e = env();
+    drop(mgr(&e, 1, Fac::new(|_| None)));
+    let flag = e.data.parent().unwrap().join("leader-go");
+    let gpid_file = e.data.parent().unwrap().join("gpid");
+    // leader: starts a TERM-ignoring grandchild, waits for the flag, exits
+    let script = format!(
+        "trap '' TERM; (sleep 600 & echo $! > '{}'; wait) & while [ ! -e '{}' ]; do sleep 0.02; done",
+        gpid_file.display(),
+        flag.display()
+    );
+    let mut leader = Command::new("sh").args(["-c", &script]).process_group(0).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let lpid = leader.id();
+    let lstart = ct_runs::process_start_time(lpid).unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    let gpid: u32 = loop {
+        if let Ok(s) = fs::read_to_string(&gpid_file) {
+            if let Ok(p) = s.trim().parse() {
+                break p;
+            }
+        }
+        assert!(Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    fs::write(&flag, "go").unwrap();
+    leader.wait().unwrap(); // leader dead + reaped, grandchild survives in its group
+    assert!(ct_runs::process_start_time(lpid).is_none());
+    assert!(!pid_gone(gpid), "grandchild must survive the leader for this test to mean anything");
+
+    let base = git(&e.repo, &["rev-parse", "HEAD"]);
+    let id = "18c00000-0000000d";
+    let rec = json!({"id": id, "repo": e.repo, "prompt": "p", "backend": "pi", "provider": null, "model_id": "fake", "thinking": null,
+        "base_ref": "HEAD", "isolate": false, "base_sha": base, "branch": null, "worktree": null, "state": "running",
+        "state_msg": null, "submitted_ms": 1, "started_ms": 1, "ended_ms": null, "files_changed": 0,
+        "pid": lpid, "pid_start": lstart, "head_sha": null});
+    let d = e.data.join("runs").join(id);
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("run.json"), serde_json::to_vec(&rec).unwrap()).unwrap();
+    let m = mgr(&e, 1, Fac::new(|_| None));
+    assert_eq!(m.get(id).unwrap().state, RunState::Interrupted);
+    let end = Instant::now() + Duration::from_secs(3);
+    while !pid_gone(gpid) {
+        assert!(Instant::now() < end, "grandchild of a dead leader survived reconcile");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let v: Value = serde_json::from_slice(&fs::read(d.join("run.json")).unwrap()).unwrap();
+    assert!(v["pid"].is_null(), "pid info cleared only after the group is gone");
+}
+
+#[test]
+fn accepted_abort_wins_over_a_settled_that_was_already_seen() {
+    let e = env();
+    let t = Timings { finalize_delay: Duration::from_millis(600), ..FAST };
+    let m = RunManager::open_with(&e.data, 1, Fac::new(|_| Some(edit(&[("a.txt", "a\n")], "i", "o"))), t).unwrap();
+    let rx = m.subscribe();
+    let id = m.submit(spec(&e, "p", true)).unwrap();
+    // wait until the supervisor has consumed Settled (it is now committing / finalising)
+    loop {
+        match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+            RunUpdate::Event(_, AgentEvent::Settled { .. }) => break,
+            _ => {}
+        }
+    }
+    m.abort(&id).expect("abort is still acceptable before the terminal state is written");
+    assert_eq!(done(&m, &id).state, RunState::Aborted);
+    // once finalised, abort is refused and the state stays
+    assert!(m.abort(&id).is_err());
+    assert_eq!(m.get(&id).unwrap().state, RunState::Aborted);
+
+    // and without an abort the same flow ends Succeeded
+    let id2 = m.submit(spec(&e, "p2", true)).unwrap();
+    assert_eq!(done(&m, &id2).state, RunState::Succeeded);
+}
+
+#[test]
+fn apply_merges_only_the_reviewed_head_and_refuses_a_moved_branch() {
+    let e = env();
+    let m = mgr(&e, 1, Fac::new(|_| Some(edit(&[("n.txt", "n\n")], "i", "o"))));
+    let id = finished_edit_run(&e, &m, &[]);
+    let info = m.get(&id).unwrap();
+    let (wt, branch) = (info.worktree.clone().unwrap(), info.branch.clone().unwrap());
+    let (_, reviewed) = m.comparison(&id).unwrap();
+    // something lands on the run branch after review
+    fs::write(wt.join("sneaky.txt"), "x\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "after review"]);
+    let moved = git(&e.repo, &["rev-parse", &format!("refs/heads/{branch}")]);
+    assert_ne!(moved, reviewed);
+    let head = git(&e.repo, &["rev-parse", "HEAD"]);
+    let err = m.apply(&id).unwrap_err().to_string();
+    assert!(err.contains("moved"), "{err}");
+    assert_eq!(git(&e.repo, &["rev-parse", "HEAD"]), head);
+    assert!(!e.repo.join("sneaky.txt").exists() && !e.repo.join("n.txt").exists());
+    // comparison keeps showing the reviewed head
+    assert_eq!(m.comparison(&id).unwrap().1, reviewed);
 }

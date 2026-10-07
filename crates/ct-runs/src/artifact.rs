@@ -100,9 +100,16 @@ pub fn create_worktree(data: &Path, repo_root: &Path, id: &str, branch: &str, ba
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     check_worktree_path(data, &wt)?;
     let wt_s = wt.to_string_lossy().into_owned();
-    let res = gitrun::run(repo_root, &["worktree", "add", "-q", "-b", branch, &wt_s, base_sha]);
-    if let Err(e) = res {
-        let _ = remove_worktree(data, repo_root, &wt, Some(branch));
+    let ref_name = format!("refs/heads/{branch}");
+    let preexisting = gitrun::test(repo_root, &["show-ref", "--verify", "--quiet", &ref_name])?;
+    let mut args: Vec<&str> = NO_HOOKS.to_vec();
+    args.extend(["worktree", "add", "-q", "-b", branch, &wt_s, base_sha]);
+    if let Err(e) = gitrun::run(repo_root, &args) {
+        let _ = remove_worktree(data, repo_root, &wt, None);
+        if !preexisting {
+            // only a ref this call created, and only while it still points at the base
+            let _ = gitrun::run(repo_root, &["update-ref", "-d", &ref_name, base_sha]);
+        }
         return Err(e.context("git worktree add"));
     }
     Ok(wt)
@@ -228,4 +235,38 @@ pub fn changes(repo_root: &Path, base: &str, head: &str) -> Result<Vec<Change>> 
         out.push(Change { path: String::from_utf8_lossy(path).into_owned(), pre_blob: oid(f[2]), post_blob: oid(f[3]) });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn g(dir: &Path, args: &[&str]) -> String {
+        let env = [("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")];
+        String::from_utf8_lossy(&gitrun::run_env(dir, args, &env).unwrap()).trim().to_string()
+    }
+
+    #[test]
+    fn failed_create_never_deletes_a_preexisting_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        let data = tmp.path().canonicalize().unwrap().join("data");
+        fs::create_dir_all(&repo).unwrap();
+        g(&repo, &["init", "-q", "-b", "main"]);
+        g(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let base = g(&repo, &["rev-parse", "HEAD"]);
+        g(&repo, &["commit", "-q", "--allow-empty", "-m", "second"]);
+        g(&repo, &["branch", "ct/mine", "HEAD"]); // user's own branch that happens to match the name
+        let tip = g(&repo, &["rev-parse", "ct/mine"]);
+        assert_ne!(tip, base);
+        let err = create_worktree(&data, &repo, "18c00000-00000001", "ct/mine", &base);
+        assert!(err.is_err());
+        assert_eq!(g(&repo, &["rev-parse", "refs/heads/ct/mine"]), tip, "pre-existing branch was touched");
+        assert!(!worktree_path(&data, &repo, "18c00000-00000001").exists());
+        // a fresh name works and is removable
+        let wt = create_worktree(&data, &repo, "18c00000-00000002", "ct/fresh", &base).unwrap();
+        assert!(wt.exists());
+        remove_worktree(&data, &repo, &wt, Some("ct/fresh")).unwrap();
+        assert!(!wt.exists());
+    }
 }
