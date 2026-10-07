@@ -238,3 +238,79 @@ pub struct DiffLine { /* 기존 */ pub no_newline_at_eof: bool }
 - 측정 표준: 고정 fixture 2종 — F1(중간): `loudness-lab`급 실 repo, F2(대형): 합성 repo 생성 스크립트(커밋 20k, 파일 10k, 총 ≈200MB, 긴 줄(1만자) 파일 포함). cold(`echo 3 > drop_caches` 불가 시 첫 실행)/warm 구분, 각 시나리오 20회 p50/p95 보고, 예산은 **p95 기준**.
 - 자동 E2E 실패 시나리오 표(전부 테스트로): stale job 결과 폐기 / 검색 취소 / store 손상 프레임 복구 / 동시 append 2프로세스 / 편집 중 외부 변경 충돌 감지 / 원자 저장(임시+rename) / Ask AI 타임아웃·취소 / 설정·테마 파일 파손 시 기본값 롤백 / root commit·merge commit·shallow·worktree·서브모듈·rename·binary·no-newline / 한글·공백 경로.
 - IME는 실기 확인 불가 시 "미검증"으로 보고.
+
+---
+
+# §10 v3 — 차별점 재정의: "아주 가벼운 데스크탑 + 백그라운드 AI agent(pi 기반) + 구독 로그인/모델 선택"
+
+## 10.1 조사로 확인한 사실 (이 세션에서 직접 확인)
+- pi = `@earendil-works/pi-coding-agent` (npm, bin `pi`, 구 `@mariozechner/*`/`badlogic/pi-mono`). RPC: `pi --mode rpc` JSONL(LF 구분, stdin 명령/stdout 응답+이벤트). 명령: prompt, steer, follow_up, abort, get_state, set_model, cycle_model, get_available_models, set_thinking_level, new_session 등. 이벤트: agent_start/turn_*/message_update(text_delta)/tool_execution_start·update·end/agent_end/**agent_settled**(완료 판단은 이것). 문서: github.com/badlogic/pi-mono packages/coding-agent/docs/{rpc,rpc-commands,json,providers}.md
+- 로컬 스모크(/tmp/pitest): `pi --mode rpc --no-session` 기동 OK, get_state/get_available_models 응답 OK. **미로그인 상태에서 models=[]**. pi 프로세스 1개 유휴 RSS ≈ 147MB(Node) — "가볍다"는 주장은 도구 세트/프롬프트가 작다는 뜻이지 프로세스가 작다는 뜻 아님. 백그라운드 agent 수만큼 곱해짐 → 동시 실행 상한(기본 3) 필요.
+- 런타임: pi는 Node ≥22.19 필요(`engines`). 이 머신 node 22.17 → 앱 전용 디렉터리에 npm `node@22` 패키지(22.23.3 확인)로 격리 설치해 사용(전역 node 변경 없음).
+- 인증: RPC에 login 명령 없음. 구독 로그인은 `pi-ai login <provider>`(OAuth providers 확인: anthropic / github-copilot / openai-codex) 또는 pi TUI `/login`. 자격증명은 `<agent-dir>/auth.json`(`PI_CODING_AGENT_DIR`로 위치 지정), pi가 자동 refresh.
+- **Anthropic 약관(code.claude.com/docs/en/legal-and-compliance)**: 서드파티 개발자는 Claude.ai 로그인 제공 금지, Free/Pro/Max 자격증명으로 사용자 대신 라우팅 금지, **Claude.ai 자격증명/세션 토큰 수집·저장·중개 금지**, 로그인은 Anthropic 자체 플로우로 완료. 예외: 사용자가 *수정되지 않은 Claude Code 바이너리*에 자기 구독으로 로그인하는 것은 허용.
+
+## 10.2 결정 (사용자 요구와의 차이 명시)
+1. **Claude 구독**: pi의 anthropic OAuth를 앱에서 노출하지 **않는다**(약관 위반 소지). 대신 백엔드 `claude`(공식 바이너리, 사용자가 `claude auth login`으로 직접 로그인한 상태)를 agent 백엔드로 지원 — 앱은 `claude auth status`만 읽고 토큰을 만지지 않음. 모델은 `claude --model`로 선택(alias/풀네임). Claude를 pi 안에서 쓰려면 API 키(Console)만 허용: `auth.json`에 키 입력 UI.
+2. **ChatGPT 구독**: pi의 `openai-codex` OAuth(pi 자체 플로우, 앱은 URL 열기·붙여넣기 코드 전달만, 토큰 파일은 앱이 읽지 않음) 또는 백엔드 `codex`(공식 CLI). GitHub Copilot도 pi 플로우로 자연 지원.
+3. 백엔드 추상화 `AgentBackend { Pi, Claude, Codex }` — 공통: 시작/프롬프트/중단/스트림/모델 목록·선택. Pi가 1차(전 기능: 모델 목록, thinking level, steer, 이벤트 상세), Claude/Codex는 `-p`/`exec` 스트림 JSON 기반 최소 기능(프롬프트·중단·모델 선택).
+4. 백그라운드 실행: agent run = 독립 프로세스 + 기본 **격리 git worktree**(`~/.local/share/codetrail/worktrees/<repo-id>/<run-id>`, 브랜치 `ct/<slug>`). 사용자의 작업트리는 건드리지 않음. 옵션으로 "현재 작업트리에서 실행". 완료 시 데스크탑 알림 + Runs 목록 배지. 결과 보기 = 기존 diff 뷰어의 Comparison(base..run 브랜치). **Apply** = 작업트리가 깨끗할 때만 `git merge --no-ff ct/<slug>`(충돌 시 abort 후 안내), Discard = worktree+브랜치 삭제(확인 필수).
+5. AI 이유 추적 통합: 앱이 실행한 pi run은 hook 없이 `tool_execution_end`(edit/write)에서 Edit 레코드를 직접 기록하고 **reason = 사용자 프롬프트(+assistant 최종 요약 1~3문장)** 로 자동 채움 → Why 패널에서 별도 `note` 없이 바로 보임. 레코드의 agent=Pi, session=run-id.
+6. 질문(Ask AI)은 같은 백엔드·모델 선택을 사용(선택 상태 공유), 읽기 전용 모드(`--no-tools` 또는 read-only 도구만)로 실행.
+
+## 10.3 수용 기준 (AC7~AC10)
+- AC7 agent 런타임: `codetrail agent setup`(및 GUI 첫 실행 안내)이 앱 전용 dir(`~/.local/share/codetrail/agent/`)에 node@22 + pi를 설치, 버전 고정(lockfile), 재실행 멱등. 이미 PATH에 호환 `pi`가 있으면 재사용 옵션.
+- AC8 로그인/모델: 설정 > Accounts 패널에 provider별 상태(Logged in/out, 구독/키). ChatGPT(openai-codex), GitHub Copilot: 앱에서 로그인 시작→브라우저 열기→(리다이렉트 안 닿으면) 코드 붙여넣기→완료 상태 반영, 로그아웃. Claude: 공식 `claude` 로그인 상태 표시 + "터미널에서 `claude auth login` 실행" 안내 버튼(앱이 토큰을 다루지 않음을 UI에 명시). API 키 입력(마스킹, 0600 저장 위치=pi auth.json, 앱 설정 파일엔 저장 안 함). 모델 선택 드롭다운은 get_available_models 결과(로그인된 provider만) + thinking level 선택, 선택값 영속.
+- AC9 백그라운드 agent: Runs 패널(실행/대기/완료/실패/중단), 새 run 생성(프롬프트+모델+base 브랜치+격리 여부), 실시간 스트림(텍스트, tool 호출 요약), Abort, steer/follow-up, 동시 실행 상한 설정, 앱을 닫으면 실행 중 run 처리 정책(기본: 종료 전 확인, 종료 시 abort+상태 저장). 완료 알림.
+- AC10 결과 연동: run 완료 → 해당 브랜치 diff를 base 비교로 즉시 열기, Why 패널에 자동 reason, Apply/Discard 동작.
+- NFR: 앱 자체 유휴 RSS ≤150MB 유지(agent 프로세스 제외), run 0개일 때 pi 프로세스 0개(지연 기동). pi 자식 프로세스는 앱 종료·크래시 시 고아로 남지 않음(프로세스 그룹/`PR_SET_PDEATHSIG`).
+
+## 10.4 보안
+- 앱은 OAuth 토큰/API 키를 로그·설정·클립보드·크래시 리포트에 쓰지 않는다(auth.json은 pi 전용, 권한 0600 확인 후 경고). 로그인 로그/stderr는 토큰 패턴 마스킹.
+- agent run 프롬프트 전송 전 미리보기는 Ask AI(읽기 전용)에만 필수, Run은 "무엇이 전송되는지"(프롬프트+컨텍스트 파일 목록) 요약 표시.
+- worktree 밖 경로 쓰기 금지는 pi의 sandbox가 아니라 cwd 격리일 뿐임을 UI에 명시(pi는 bash 도구로 임의 명령 실행 가능 — 위험 고지, run 생성 화면에 상시 배너).
+
+## 10.5 검증 (추가)
+- 실제 pi 프로세스 스모크: 미로그인 상태 get_available_models=[] 처리 UI, 로그인 필요 안내.
+- 로그인된 provider가 없는 환경이므로 **LLM 호출 E2E는 가짜 pi(스크립트 모의 RPC 서버, 이벤트 시퀀스 재생)로 자동 테스트**하고, 실제 구독 로그인·실모델 호출은 사용자가 로그인한 뒤 수동 검증 항목으로 명시(미검증 보고).
+- run 생명주기 테스트: worktree 생성/정리, 동시 상한 큐잉, abort, 프로세스 고아 없음, 앱 재시작 시 상태 복구, Apply 충돌 abort, Discard 안전장치.
+
+## 10.6 독립 리뷰(codex) 반영 — §10.2/10.3과 충돌 시 이 절이 우선
+- 인증 경계 정정: 앱은 "토큰 파일을 읽지 않는다"만 보장, OAuth 코드 붙여넣기 중계는 수행(=자격증명이 앱 프로세스 메모리를 거침을 UI·README에 명시). **API 키 입력 UI는 제거**(환경변수/pi 자체 설정 사용). 코드 중계는 openai-codex/github-copilot에만. Claude는 외부 로그인만(상태 조회 `claude auth status`). provider별 약관 근거와 kill switch(`config.toml: accounts.disabled=["…"]`) 문서화.
+- 백엔드 추상화: **공통 최소 계약 + capability matrix**. `Capabilities{ list_models, steer, follow_up, abort, thinking_level, streaming_tools, persistent_session }`; Pi 전부, Claude/Codex는 prompt/abort/model 선택/스트림만(나머지 UI 비활성). 
+- worktree는 "VCS 작업 격리"이지 보안 격리가 아님(agent는 홈·자격증명·네트워크 접근 가능) — UI/README 문구 고정. 실행 시 자식 프로세스 env는 화이트리스트(PATH, HOME, LANG, 해당 backend 필요 변수)만 전달(다른 provider 토큰 env 제거).
+- 결과 모델: run 시작 시 **base SHA 고정**. agent 종료(settled) 시 앱이 worktree 변경을 `git add -A && git commit`(author `codetrail-run <run-id>`)로 run 브랜치에 아티팩트화(agent가 이미 커밋했어도 추가 변경만 커밋). diff는 `base_sha..run_branch`. Apply = 작업트리 clean + 현재 브랜치 HEAD가 base의 후손일 때 `git merge --no-ff`, 충돌 시 `merge --abort`. 검토(diff) 전 Apply 불가는 아님 — 단 확인 다이얼로그에 변경 파일 수 표시.
+- 프로세스: Linux 우선. 자식은 `setsid`로 새 세션/프로세스 그룹, 종료는 abort 명령 → 5s → SIGTERM(그룹) → 3s → SIGKILL(그룹). `PR_SET_PDEATHSIG(SIGKILL)` 병행. run 상태 파일에 pid+starttime(/proc/<pid>/stat) 저장, 앱 재시작 시 reconcile(살아있으면 재attach 불가 → 종료 후 `interrupted`로 표기).
+- reason 자동 기록: tool 이벤트가 아니라 **settled 후 worktree diff(base..run 커밋)가 파일/hunk의 진실**. 각 변경 파일마다 Edit 레코드 1건(post_blob=커밋의 blob → High 연결), reason = "run 프롬프트(앞 1000자) + assistant 최종 요약(앞 500자)", 파일에 대한 edit/write tool 이벤트가 있으면 해당 tool-call 직전 assistant 텍스트 조각을 `intent`로 덧붙임. 비밀 패턴은 ct-agent의 secret scan으로 마스킹 후 저장.
+- 테스트: backend별 fake executable(스크립트) 계약 테스트(정상/깨진 JSON/인터리브 stderr/크래시/타임아웃/지연 출력), 고정 버전 호환성(pi 0.74.2 확인 기준) 메타 테스트, **실로그인 canary는 opt-in(`CT_LIVE=1`)**: 이 머신에서 `claude`(claude.ai 로그인)와 `codex`(ChatGPT 로그인) 확인됨 → 1-토큰급 프롬프트로 실제 호출 1회씩 수동 검증하고 결과 보고. pi는 미로그인이므로 pi 실호출은 사용자 로그인 후 검증 항목.
+
+## 10.7 슬라이스 / 파일 소유 / 계약
+- **D (crate `ct-agentd`, w1)**: 런타임 설치(node@22+pi 격리, 락/버전 고정), pi RPC 클라이언트(LF-only JSONL 프레이머, id 상관, backpressure), Claude/Codex 어댑터(공식 CLI 스트림 JSON 파싱), 모델 목록, 계정 상태, 로그인 플로우(openai-codex/github-copilot 중계, 로그아웃), fake pi/claude/codex 계약 테스트. 소유: `crates/ct-agentd/**`.
+- **E (crate `ct-runs`, w2)**: run 레코드 영속(앱 데이터 dir, 재시작 복구), 큐/동시 상한, worktree 생성·정리, 프로세스 supervisor, 완료 시 아티팩트 커밋, Apply/Discard, ct-store 자동 레코드 기록(§10.6). 소유: `crates/ct-runs/**`. ct-agentd의 `AgentSession` 계약만 사용(스텁 위에서 시작).
+- **F (ct-app, w3)**: Accounts 패널, 모델/thinking 선택, Runs 패널·새 run 다이얼로그·라이브 스트림·알림, Ask AI를 선택된 백엔드/모델로 라우팅, 레이아웃 미니멀 유지. 소유: `crates/ct-app/**`.
+- 계약(공개 API — D가 첫 단계에 `crates/ct-agentd/src/lib.rs`를 컴파일되는 시그니처로 제공):
+```rust
+pub enum BackendKind { Pi, Claude, Codex }
+pub struct Capabilities { pub list_models: bool, pub steer: bool, pub follow_up: bool, pub abort: bool, pub thinking_level: bool, pub streaming_tools: bool, pub persistent_session: bool }
+pub fn capabilities(b: BackendKind) -> Capabilities;
+pub struct ModelInfo { pub backend: BackendKind, pub provider: String, pub id: String, pub name: String, pub reasoning: bool, pub context_window: u32 }
+pub struct ModelSel { pub backend: BackendKind, pub provider: Option<String>, pub id: String, pub thinking: Option<String> }
+pub fn list_models(b: BackendKind) -> Result<Vec<ModelInfo>>;   // pi: 로그인된 provider만; claude/codex: 내장 별칭 목록
+pub struct SessionOpts { pub cwd: PathBuf, pub model: Option<ModelSel>, pub read_only: bool, pub env_allow: Vec<String>, pub system_note: Option<String> }
+pub enum AgentEvent { Started, TextDelta(String), ToolStart{ id: String, name: String, summary: String }, ToolEnd{ id: String, name: String, ok: bool, path: Option<String> }, Usage{ input: u64, output: u64, cost: Option<f64> }, Settled{ ok: bool, error: Option<String> }, Stderr(String), Exited(Option<i32>) }
+pub trait AgentSession: Send { fn pid(&self) -> Option<u32>; fn prompt(&mut self, text: &str) -> Result<()>; fn steer(&mut self, text: &str) -> Result<()>; /*Unsupported err if !cap*/ fn follow_up(&mut self, text: &str) -> Result<()>; fn abort(&mut self) -> Result<()>; fn set_model(&mut self, m: &ModelSel) -> Result<()>; fn events(&self) -> &std::sync::mpsc::Receiver<AgentEvent>; fn close(self: Box<Self>); }
+pub fn start_session(b: BackendKind, o: SessionOpts) -> Result<Box<dyn AgentSession>>;
+pub enum AccountState { LoggedIn{ method: String }, LoggedOut, Unavailable{ reason: String } }
+pub struct Account { pub id: String /*"openai-codex","github-copilot","claude","codex"*/, pub label: String, pub state: AccountState, pub login: LoginKind /*InApp|ExternalCli{ command: String }|None*/ }
+pub fn accounts() -> Vec<Account>;
+pub enum LoginEvent { OpenUrl(String), NeedCode{ prompt: String }, Progress(String), Done, Failed(String) }
+pub struct LoginHandle { pub events: Receiver<LoginEvent>, /* submit_code(&self,&str), cancel(&self) */ }
+pub fn login_start(account_id: &str) -> Result<LoginHandle>; pub fn logout(account_id: &str) -> Result<()>;
+pub struct RuntimeStatus { pub installed: bool, pub node: Option<String>, pub pi: Option<String> }
+pub fn runtime_status() -> RuntimeStatus; pub fn runtime_setup(progress: &dyn Fn(&str)) -> Result<()>;
+// ct-runs
+pub struct RunSpec { pub repo: PathBuf, pub prompt: String, pub model: ModelSel, pub base_ref: String, pub isolate: bool }
+pub enum RunState { Queued, Running, Succeeded, Failed(String), Aborted, Interrupted }
+pub struct RunInfo { pub id: String, pub spec: RunSpec, pub base_sha: String, pub branch: Option<String>, pub worktree: Option<PathBuf>, pub state: RunState, pub started_ms: i64, pub ended_ms: Option<i64>, pub files_changed: u32 }
+pub struct RunManager; impl RunManager { pub fn open(data_dir: &Path, max_concurrent: usize) -> Result<Self>; pub fn submit(&self, spec: RunSpec) -> Result<String>; pub fn abort(&self, id:&str)->Result<()>; pub fn steer(&self,id:&str,text:&str)->Result<()>; pub fn list(&self)->Vec<RunInfo>; pub fn subscribe(&self)->Receiver<RunUpdate /*State(RunInfo)|Event(id,AgentEvent)*/>; pub fn apply(&self,id:&str)->Result<ApplyOutcome>; pub fn discard(&self,id:&str)->Result<()>; pub fn comparison(&self,id:&str)->Result<(String /*base_sha*/, String /*head_sha*/)>; }
+```

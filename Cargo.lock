@@ -486,6 +486,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ct-agentd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "ct-app"
 version = "0.1.0"
 dependencies = [
@@ -516,6 +523,13 @@ dependencies = [
  "rayon",
  "tempfile",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "ct-runs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]
