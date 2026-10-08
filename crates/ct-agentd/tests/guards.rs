@@ -53,6 +53,20 @@ fn threads_of_self() -> usize {
     std::fs::read_dir("/proc/self/task").unwrap().count()
 }
 
+/// Thread count once threads of previously finished tests have wound down.
+fn settled_threads() -> usize {
+    let mut last = threads_of_self();
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(50));
+        let now = threads_of_self();
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+    last
+}
+
 #[test]
 fn child_env_is_minimal_and_carries_depth_guard() {
     let _g = SERIAL.lock();
@@ -91,7 +105,7 @@ fn child_env_is_minimal_and_carries_depth_guard() {
 #[test]
 fn ceiling_kills_the_process_group_and_idle_has_no_threads() {
     let _g = SERIAL.lock();
-    let before = threads_of_self();
+    let before = settled_threads();
     let mut env = Env::new("OUT:{\"type\":\"system\",\"subtype\":\"init\"}\nSLEEP:60");
     env.cfg.ask_ceiling = Duration::from_millis(500);
     let mut s = with::start_session(&env.cfg, BackendKind::Claude, env.opts(false)).unwrap();
@@ -104,8 +118,7 @@ fn ceiling_kills_the_process_group_and_idle_has_no_threads() {
     assert!(evs.iter().any(|e| matches!(e, AgentEvent::Settled { ok: false, .. })), "{evs:?}");
     assert!(!alive(pid));
     s.close();
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(threads_of_self() <= before + 1, "threads leaked: {} -> {}", before, threads_of_self());
+    assert!(settled_threads() <= before + 1, "threads leaked: {} -> {}", before, threads_of_self());
 }
 
 #[test]

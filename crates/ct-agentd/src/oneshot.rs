@@ -321,6 +321,8 @@ struct Cur {
     host: Host,
     aborted: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
+    /// A terminal `Settled` was emitted (the process is only finishing up).
+    settled: Arc<AtomicBool>,
     dispatcher: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -395,8 +397,22 @@ impl AgentSession for OneShotSession {
     }
 
     fn prompt(&mut self, text: &str) -> Result<()> {
-        if self.running() {
-            return Err(Error::Other(format!("a {} prompt is already running", self.name())));
+        // A run that has already reported Settled is only waiting for its process to exit: let it finish
+        // (its dispatcher ends right after Exited) instead of rejecting a follow-up prompt.
+        let wait = {
+            let mut g = self.cur.lock();
+            match g.as_mut() {
+                Some(c) if !c.finished.load(Ordering::SeqCst) => {
+                    if !c.settled.load(Ordering::SeqCst) {
+                        return Err(Error::Other(format!("a {} prompt is already running", self.name())));
+                    }
+                    c.dispatcher.take()
+                }
+                _ => None,
+            }
+        };
+        if let Some(h) = wait {
+            let _ = h.join();
         }
         let (program, backend_vars): (_, &[&str]) = match self.kind {
             BackendKind::Claude => (self.cfg.claude_bin.clone(), &["CLAUDE_CONFIG_DIR"]),
@@ -433,7 +449,8 @@ impl AgentSession for OneShotSession {
         let aborted = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
         let host = sp.host;
-        let (ev, ab, fin, h2) = (self.tx.clone(), aborted.clone(), finished.clone(), host.clone());
+        let settled = Arc::new(AtomicBool::new(false));
+        let (ev, ab, fin, st, h2) = (self.tx.clone(), aborted.clone(), finished.clone(), settled.clone(), host.clone());
         let kind = self.kind;
         let name = self.name();
         let dispatcher = std::thread::Builder::new().name("ct-cli-dispatch".into()).spawn(move || {
@@ -449,6 +466,9 @@ impl AgentSession for OneShotSession {
                     Msg::Out(l) => match serde_json::from_slice::<Value>(&l) {
                         Ok(v) if v.is_object() => {
                             for e in proto.on_line(&v) {
+                                if matches!(e, AgentEvent::Settled { .. }) {
+                                    st.store(true, Ordering::SeqCst);
+                                }
                                 let _ = ev.send(e);
                             }
                         }
@@ -473,6 +493,9 @@ impl AgentSession for OneShotSession {
                 }
             }
             let code = h2.wait_exit(std::time::Duration::from_secs(10)).unwrap_or(None);
+            // The run is over for the caller once its terminal events can be observed: clear the running
+            // state FIRST, so a consumer reacting to Settled/Exited can prompt again immediately.
+            fin.store(true, Ordering::SeqCst);
             if !proto.settled() {
                 let error = if ab.load(Ordering::SeqCst) {
                     "aborted".to_string()
@@ -487,7 +510,6 @@ impl AgentSession for OneShotSession {
                 let _ = ev.send(AgentEvent::Settled { ok: false, error: Some(error) });
             }
             let _ = ev.send(AgentEvent::Exited(code));
-            fin.store(true, Ordering::SeqCst);
         })?;
 
         let mut g = self.cur.lock();
@@ -496,7 +518,7 @@ impl AgentSession for OneShotSession {
                 let _ = h.join();
             }
         }
-        *g = Some(Cur { host, aborted, finished, dispatcher: Some(dispatcher) });
+        *g = Some(Cur { host, aborted, finished, settled, dispatcher: Some(dispatcher) });
         Ok(())
     }
 

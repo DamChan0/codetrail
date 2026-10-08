@@ -335,6 +335,43 @@ fn codex_contract_models_and_args() {
 }
 
 #[test]
+fn oneshot_accepts_a_prompt_right_after_settled_or_exited() {
+    for (kind, n) in [(BackendKind::Claude, 200), (BackendKind::Codex, 100)] {
+        let env = Env::new("");
+        let mut s = with::start_session(&env.cfg, kind, env.opts(false)).unwrap();
+        for i in 0..n {
+            // react to Settled by prompting at once (the process may still be exiting)
+            s.prompt("go").unwrap_or_else(|e| panic!("{kind:?} iteration {i}: {e}"));
+            let end = Instant::now() + Duration::from_secs(10);
+            loop {
+                let e = s.events().recv_timeout(end.saturating_duration_since(Instant::now())).expect("Settled");
+                if matches!(e, AgentEvent::Settled { ok: true, .. }) {
+                    break;
+                }
+            }
+            if i % 2 == 0 {
+                // and the other way: wait for Exited too
+                loop {
+                    if matches!(s.events().recv_timeout(Duration::from_secs(10)).unwrap(), AgentEvent::Exited(_)) {
+                        break;
+                    }
+                }
+            } else {
+                // leave Exited unread: it must not be mistaken for the next run's events
+                s.prompt("again").unwrap_or_else(|e| panic!("{kind:?} iteration {i} (after Settled): {e}"));
+                let mut exits = 0;
+                while exits < 2 {
+                    if matches!(s.events().recv_timeout(Duration::from_secs(10)).unwrap(), AgentEvent::Exited(_)) {
+                        exits += 1;
+                    }
+                }
+            }
+        }
+        s.close();
+    }
+}
+
+#[test]
 fn unsupported_operations_are_errors() {
     let env = Env::new("");
     let mut s = with::start_session(&env.cfg, BackendKind::Codex, env.opts(false)).unwrap();
