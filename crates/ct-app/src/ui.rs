@@ -394,14 +394,20 @@ impl App {
             ui.add_space(m.space[2]);
             let mut i = match self.rail {
                 RailTab::Commits => 0,
-                RailTab::Search => 1,
-                RailTab::Files => 2,
-                RailTab::Runs => 3,
+                RailTab::Current => 1,
+                RailTab::Search => 2,
+                RailTab::Files => 3,
+                RailTab::Runs => 4,
             };
             let badge = self.ag.runs.badge();
             let runs_label = if badge > 0 { format!("Runs {badge}") } else { "Runs".to_string() };
-            if widgets::segmented_gated(ui, &th, &["Commits", "Search", "Files", &runs_label], &[], &mut i, 8.0) {
-                self.rail = [RailTab::Commits, RailTab::Search, RailTab::Files, RailTab::Runs][i];
+            let dirty = self.wt.summary.as_ref().map_or(0, |s| s.files);
+            let cur_label = if dirty > 0 { format!("Current {dirty}") } else { "Current".to_string() };
+            if widgets::segmented_gated(ui, &th, &["Commits", &cur_label, "Search", "Files", &runs_label], &[], &mut i, 5.0) {
+                self.rail = [RailTab::Commits, RailTab::Current, RailTab::Search, RailTab::Files, RailTab::Runs][i];
+                if self.rail == RailTab::Current && dirty > 0 && !matches!(self.target, Some(TargetSel::Worktree)) {
+                    self.select_worktree();
+                }
                 if self.rail == RailTab::Search {
                     self.search.focus = true;
                 }
@@ -415,6 +421,7 @@ impl App {
         ui.add_space(m.space[1]);
         match self.rail {
             RailTab::Commits => self.commits_panel(ui),
+            RailTab::Current => self.current_panel(ui),
             RailTab::Search => self.search_panel(ui),
             RailTab::Files => self.files_panel(ui),
             RailTab::Runs => self.runs_panel(ui),
@@ -439,22 +446,6 @@ impl App {
             }
         });
         ui.add_space(m.space[1]);
-        // Working tree row.
-        let wt_sel = matches!(self.target, Some(TargetSel::Worktree));
-        let (resp, rect) = widgets::list_row(ui, &th, 44.0, wt_sel);
-        let top = egui::Rect::from_min_max(rect.min + vec2(0.0, 4.0), pos2(rect.max.x, rect.min.y + 22.0));
-        let bot = egui::Rect::from_min_max(pos2(rect.min.x, rect.min.y + 22.0), pos2(rect.max.x, rect.max.y - 2.0));
-        widgets::paint_text_fit(ui, top, "Working tree changes", widgets::ui_font(&th), th.fg());
-        let (sum, col) = match &self.wt.summary {
-            Some(s) if s.dirty() => (format!("{}{}{}", s.text(), if s.untracked > 0 { format!(" · {} new", s.untracked) } else { String::new() }, if self.wt.paused { " · paused" } else { "" }), th.warn()),
-            Some(s) => (format!("{}{}", s.text(), if self.wt.paused { " · paused" } else { "" }), th.muted()),
-            None => ("checking…".to_string(), th.muted()),
-        };
-        widgets::paint_text_fit(ui, bot, &sum, widgets::small_font(&th), col);
-        if resp.clicked() {
-            self.select_worktree();
-        }
-
         let total = ui.max_rect().height();
         let nfiles = self.diffset.ready().map_or(0, |s| s.files.len());
         let files_h = crate::railsplit::files_height(self.settings.files_split, nfiles, total);
@@ -941,7 +932,7 @@ impl App {
                 if opt(ui, "Previous selection", self.prev_sha.as_deref().map(crate::timefmt::short).unwrap_or("none"), cur_mode == Some(BaseMode::Previous)) && self.prev_sha.is_some() {
                     apply = Some(Ok(BaseMode::Previous));
                 }
-                if opt(ui, "Working tree", "uncommitted", cur_mode == Some(BaseMode::WorkingTree)) {
+                if opt(ui, "Current changes", "uncommitted", cur_mode == Some(BaseMode::WorkingTree)) {
                     apply = Some(Ok(BaseMode::WorkingTree));
                 }
                 ui.separator();

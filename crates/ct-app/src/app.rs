@@ -68,7 +68,7 @@ impl BaseMode {
             BaseMode::Ref(r) => r.clone(),
             BaseMode::MergeBase(r) => format!("merge-base({r})"),
             BaseMode::Previous => "previous selection".into(),
-            BaseMode::WorkingTree => "working tree".into(),
+            BaseMode::WorkingTree => "current changes".into(),
         }
     }
 }
@@ -80,6 +80,7 @@ pub struct CmpInput<'a> {
     pub target: &'a TargetSel,
     pub prev: Option<&'a str>,
     pub head: &'a str,
+    pub view: crate::worktree::WtView,
 }
 
 /// UI base mode -> ct-core `Comparison`. `merge_base` is injected so this stays unit-testable.
@@ -88,7 +89,14 @@ pub fn build_comparison(i: &CmpInput, merge_base: &dyn Fn(&str, &str) -> ct_core
         return Comparison::range(a, b);
     }
     let sha = match i.target {
-        TargetSel::Worktree => return Comparison::commit_vs_worktree(i.head),
+        TargetSel::Worktree => {
+            use crate::worktree::WtView;
+            return match i.view {
+                WtView::All => Comparison::commit_vs_worktree(i.head),
+                WtView::Staged => Comparison::commit_vs_index(i.head),
+                WtView::Unstaged | WtView::Untracked => Ok(Comparison::index_vs_worktree()),
+            };
+        }
         TargetSel::Commit(s) => s.as_str(),
     };
     match i.base {
@@ -209,6 +217,7 @@ pub enum Msg {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RailTab {
     Commits,
+    Current,
     Search,
     Files,
     Runs,
@@ -360,6 +369,7 @@ pub struct Smoke {
 }
 
 pub struct App {
+    pub wt_view: crate::worktree::WtView,
     pub files_filter: String,
     pub res: crate::resmon::ResState,
     pub wt: crate::wtapp::WtState,
@@ -443,6 +453,7 @@ impl App {
         let jobs = Jobs::new(move || rc.request_repaint());
         let mut app = App {
             pj: Default::default(),
+            wt_view: Default::default(),
             files_filter: String::new(),
             res: Default::default(),
             wt: Default::default(),
@@ -633,7 +644,20 @@ impl App {
             self.prev_sha = Some(old.clone());
         }
         self.target = Some(TargetSel::Worktree);
+        self.wt_view = crate::worktree::WtView::All;
         self.after_target_change();
+    }
+
+    /// Current tab: show one file of a group (staged / unstaged / untracked).
+    pub fn select_wt_file(&mut self, view: crate::worktree::WtView, path: &str) {
+        if let Some(TargetSel::Commit(old)) = &self.target {
+            self.prev_sha = Some(old.clone());
+        }
+        self.target = Some(TargetSel::Worktree);
+        self.wt_view = view;
+        self.clear_selection();
+        self.file_sel = Some(path.to_string());
+        self.request_diff();
     }
 
     fn after_target_change(&mut self) {
@@ -666,6 +690,7 @@ impl App {
         let parent_n = self.parent_n;
         let prev = self.prev_sha.clone();
         let head = self.head.clone();
+        let view = if matches!(target, TargetSel::Worktree) { self.wt_view } else { Default::default() };
         let opts = self.diff_opts.clone();
         let timeout = self.git_timeout();
         self.cmp_gen += 1;
@@ -676,10 +701,14 @@ impl App {
         self.jobs.spawn(JobKind::Diff, move |c| {
             let repo = repo.with_timeout(timeout).with_cancel(c.cancel.clone());
             let res = (|| -> Result<(DiffSet, CurCmp), String> {
-                let input = CmpInput { base: &base, range: range.as_ref().map(|(a, b)| (a.as_str(), b.as_str())), parent_n, target: &target, prev: prev.as_deref(), head: &head };
+                let input = CmpInput { base: &base, range: range.as_ref().map(|(a, b)| (a.as_str(), b.as_str())), parent_n, target: &target, prev: prev.as_deref(), head: &head, view };
                 let cmp = build_comparison(&input, &|a, b| repo.merge_base(a, b)).map_err(|e| e.to_string())?;
                 let mut set = repo.diff(&cmp, &opts).map_err(|e| e.to_string())?;
-                if crate::worktree::is_worktree(&cmp) {
+                use crate::worktree::WtView;
+                if view == WtView::Untracked {
+                    set.files.clear();
+                }
+                if crate::worktree::is_worktree(&cmp) && view != WtView::Unstaged {
                     crate::worktree::add_untracked(&repo, &mut set)?;
                 }
                 let at_of = |t: &Treeish| -> Option<RefAt> {
@@ -1141,6 +1170,7 @@ impl App {
                     let dirty = o.dirty.as_ref().is_some_and(|s| s.dirty());
                     self.wt.summary = o.dirty;
                     if dirty && self.target.is_none() {
+                        self.rail = RailTab::Current;
                         self.select_worktree();
                     }
                     self.request_log(false);
@@ -1400,7 +1430,7 @@ mod tests {
         Ok("mbmbmbmb".into())
     }
     fn cmp(base: BaseMode, target: TargetSel, range: Option<(&str, &str)>, prev: Option<&str>, n: u8) -> Comparison {
-        let i = CmpInput { base: &base, range, parent_n: n, target: &target, prev, head: "HEADSHA" };
+        let i = CmpInput { base: &base, range, parent_n: n, target: &target, prev, head: "HEADSHA", view: Default::default() };
         build_comparison(&i, &mb).unwrap()
     }
     fn commit(s: &str) -> TargetSel {
@@ -1431,7 +1461,7 @@ mod tests {
 
     #[test]
     fn merge_base_error_propagates() {
-        let i = CmpInput { base: &BaseMode::MergeBase("zz".into()), range: None, parent_n: 1, target: &commit("c1"), prev: None, head: "H" };
+        let i = CmpInput { base: &BaseMode::MergeBase("zz".into()), range: None, parent_n: 1, target: &commit("c1"), prev: None, head: "H", view: Default::default() };
         let e = build_comparison(&i, &|_, _| Err(ct_core::Error::Invalid("no merge base".into())));
         assert!(e.is_err());
     }
@@ -1441,7 +1471,7 @@ mod tests {
         assert_eq!(BaseMode::Parent.label(1, false), "parent");
         assert_eq!(BaseMode::Parent.label(2, true), "parent 2");
         assert_eq!(BaseMode::MergeBase("main".into()).label(1, false), "merge-base(main)");
-        assert_eq!(BaseMode::WorkingTree.label(1, false), "working tree");
+        assert_eq!(BaseMode::WorkingTree.label(1, false), "current changes");
     }
 
     #[test]

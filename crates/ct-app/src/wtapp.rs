@@ -105,7 +105,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::agents_fake::FakeAgents;
-    use crate::app::Loadable;
+    use crate::app::{Loadable, RailTab};
     use std::path::Path;
     use std::sync::Arc;
 
@@ -316,5 +316,104 @@ mod tests {
         assert!(delay <= Duration::from_secs(15) && delay >= Duration::from_millis(50));
         assert_eq!(app.wt.token, token + 1, "focus regained triggers one immediate status poll");
         assert!(app.res.last.is_some());
+    }
+
+    /// staged edit + unstaged edit of the same file, a staged rename, a staged deletion,
+    /// an unstaged deletion, an untracked file.
+    fn mixed_repo() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        git(p, &["init", "-q"]);
+        for f in ["both", "old_name", "gone_staged", "gone_unstaged", "plain"] {
+            std::fs::write(p.join(f), format!("{f}\n1\n2\n3\n4\n5\n6\n7\n8\n")).unwrap();
+        }
+        git(p, &["add", "."]);
+        git(p, &["commit", "-q", "-m", "init"]);
+        std::fs::write(p.join("both"), "both\n1\n2\n3\n4\n5\n6\n7\n8\nstaged\n").unwrap();
+        git(p, &["add", "both"]);
+        std::fs::write(p.join("both"), "both\n1\n2\n3\n4\n5\n6\n7\n8\nstaged\nunstaged\n").unwrap();
+        git(p, &["mv", "old_name", "new_name"]);
+        git(p, &["rm", "-q", "gone_staged"]);
+        std::fs::remove_file(p.join("gone_unstaged")).unwrap();
+        std::fs::write(p.join("fresh.txt"), "x\n").unwrap();
+        d
+    }
+
+    fn names(l: &[ct_core::FileStat]) -> Vec<(String, char)> {
+        l.iter().map(|f| (f.path.clone(), f.status.letter())).collect()
+    }
+
+    #[test]
+    fn groups_split_staged_unstaged_untracked_with_rename_and_delete() {
+        let d = mixed_repo();
+        let r = ct_core::Repo::open(d.path()).unwrap();
+        let s = crate::worktree::summary(&r, &r.head().unwrap(), None, None).unwrap();
+        let g = &s.groups;
+        assert_eq!(names(&g.staged), [("both".into(), 'M'), ("gone_staged".into(), 'D'), ("new_name".into(), 'R')]);
+        assert_eq!(g.staged.iter().find(|f| f.path == "new_name").unwrap().old_path.as_deref(), Some("old_name"));
+        assert_eq!(names(&g.unstaged), [("both".into(), 'M'), ("gone_unstaged".into(), 'D')]);
+        assert_eq!(names(&g.untracked), [("fresh.txt".into(), 'A')]);
+        assert_eq!(g.staged.iter().find(|f| f.path == "both").unwrap().add, 1, "staged counts are index vs HEAD");
+        assert_eq!(g.unstaged.iter().find(|f| f.path == "both").unwrap().add, 1, "unstaged counts are worktree vs index");
+        assert_eq!(s.files, 5, "badge counts unique files: both, new_name, gone_staged, gone_unstaged, fresh.txt");
+    }
+
+    #[test]
+    fn group_selection_shows_the_matching_side_of_the_index() {
+        let d = mixed_repo();
+        let mut app = app_for(d.path());
+        pump_until(&mut app, "loaded", |a| a.diffset.ready().is_some() && a.wt.summary.is_some());
+        assert_eq!((app.rail, app.target.clone(), app.wt_view), (RailTab::Current, Some(TargetSel::Worktree), crate::worktree::WtView::All));
+        let added = |a: &App| a.prepared.ready().map(|p| p.model.file.hunks.iter().flat_map(|h| h.lines.iter()).filter(|l| l.kind == ct_core::LineKind::Add).map(|l| l.text.clone()).collect::<Vec<_>>());
+        app.select_wt_file(crate::worktree::WtView::Staged, "both");
+        pump_until(&mut app, "staged diff", |a| added(a).is_some());
+        assert_eq!(added(&app).unwrap(), ["staged"]);
+        app.select_wt_file(crate::worktree::WtView::Unstaged, "both");
+        pump_until(&mut app, "unstaged diff", |a| added(a) == Some(vec!["unstaged".to_string()]));
+        app.select_wt_file(crate::worktree::WtView::Untracked, "fresh.txt");
+        pump_until(&mut app, "untracked diff", |a| added(a) == Some(vec!["x".to_string()]));
+        assert_eq!(files(&app), ["fresh.txt"], "untracked view lists only untracked files");
+        app.select_worktree();
+        pump_until(&mut app, "combined", |a| files(a).len() == 5);
+        assert_eq!(app.wt_view, crate::worktree::WtView::All);
+    }
+
+    #[test]
+    fn dirty_opens_on_current_tab_clean_opens_on_commits_head() {
+        let d = repo(true);
+        let mut app = app_for(d.path());
+        pump_until(&mut app, "loaded", |a| a.diffset.ready().is_some());
+        assert_eq!(app.rail, RailTab::Current);
+        assert_eq!(app.wt.summary.as_ref().unwrap().files, 3, "badge number");
+        let d = repo(false);
+        let mut app = app_for(d.path());
+        pump_until(&mut app, "loaded", |a| a.target.is_some() && !a.commits.is_empty());
+        assert_eq!(app.rail, RailTab::Commits);
+        assert_eq!(app.target, Some(TargetSel::Commit(app.commits[0].sha.clone())));
+        assert!(!app.wt.summary.as_ref().unwrap().dirty(), "clean: badge hidden, empty state");
+    }
+
+    #[test]
+    fn polling_never_changes_the_users_tab_or_selection() {
+        let d = repo(true);
+        let mut app = app_for(d.path());
+        pump_until(&mut app, "loaded", |a| a.diffset.ready().is_some() && !a.commits.is_empty());
+        app.rail = RailTab::Commits;
+        let sha = app.commits[0].sha.clone();
+        app.select_commit(&sha);
+        pump_until(&mut app, "commit diff", |a| a.diffset.ready().is_some());
+        std::fs::write(d.path().join("another.txt"), "z\n").unwrap();
+        app.request_status();
+        pump_until(&mut app, "badge updated", |a| a.wt.summary.as_ref().unwrap().files == 4);
+        assert_eq!(app.rail, RailTab::Commits);
+        assert_eq!(app.target, Some(TargetSel::Commit(sha)));
+        // And the other way: turning clean while on Current keeps the tab.
+        app.rail = RailTab::Current;
+        git(d.path(), &["add", "."]);
+        git(d.path(), &["commit", "-qm", "all"]);
+        app.head = ct_core::Repo::open(d.path()).unwrap().head().unwrap();
+        app.request_status();
+        pump_until(&mut app, "clean", |a| !a.wt.summary.as_ref().unwrap().dirty());
+        assert_eq!(app.rail, RailTab::Current);
     }
 }

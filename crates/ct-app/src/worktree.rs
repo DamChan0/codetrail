@@ -8,6 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Largest untracked file whose lines are listed; bigger ones are shown as added without a body.
@@ -21,6 +22,120 @@ pub struct Summary {
     pub untracked: usize,
     /// Changes whenever the set of changes or any changed file's size/mtime changes.
     pub sig: u64,
+    pub groups: Arc<Groups>,
+}
+
+/// Which side of the index a Current-tab file belongs to. A file changed both in the index and
+/// in the working tree is listed in both `staged` and `unstaged`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Groups {
+    pub staged: Vec<FileStat>,
+    pub unstaged: Vec<FileStat>,
+    pub untracked: Vec<FileStat>,
+}
+
+/// What the center pane shows while the working tree is the target.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum WtView {
+    /// HEAD vs working tree (staged + unstaged + untracked).
+    #[default]
+    All,
+    /// HEAD vs index.
+    Staged,
+    /// Index vs working tree.
+    Unstaged,
+    /// Untracked files, shown as added.
+    Untracked,
+}
+
+/// One `git status --porcelain=v2` record. `x`/`y` are the index / worktree status letters
+/// (`.` = unchanged); untracked entries use `?` for both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub path: String,
+    pub orig: Option<String>,
+    pub x: char,
+    pub y: char,
+}
+
+pub fn parse_status_v2(out: &[u8]) -> Vec<Entry> {
+    let mut it = out.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned());
+    let mut v = Vec::new();
+    while let Some(rec) = it.next() {
+        let mut ch = rec.chars();
+        match ch.next() {
+            Some('?') => v.push(Entry { path: rec[2..].to_string(), orig: None, x: '?', y: '?' }),
+            Some('1') => {
+                let f: Vec<&str> = rec.splitn(9, ' ').collect();
+                if f.len() == 9 {
+                    let xy: Vec<char> = f[1].chars().collect();
+                    v.push(Entry { path: f[8].to_string(), orig: None, x: xy[0], y: xy[1] });
+                }
+            }
+            Some('2') => {
+                let f: Vec<&str> = rec.splitn(10, ' ').collect();
+                let orig = it.next();
+                if f.len() == 10 {
+                    let xy: Vec<char> = f[1].chars().collect();
+                    v.push(Entry { path: f[9].to_string(), orig, x: xy[0], y: xy[1] });
+                }
+            }
+            Some('u') => {
+                let f: Vec<&str> = rec.splitn(11, ' ').collect();
+                if f.len() == 11 {
+                    v.push(Entry { path: f[10].to_string(), orig: None, x: '.', y: 'M' });
+                }
+            }
+            _ => {}
+        }
+    }
+    v
+}
+
+fn status_of(c: char) -> Status {
+    match c {
+        'A' => Status::Added,
+        'D' => Status::Deleted,
+        'R' => Status::Renamed,
+        'C' => Status::Copied,
+        'T' => Status::TypeChanged,
+        _ => Status::Modified,
+    }
+}
+
+/// Membership from the status records, counts from the matching numstat diff (0/0 if unknown).
+pub fn group(root: &Path, entries: &[Entry], staged: &DiffSet, unstaged: &DiffSet) -> Groups {
+    let stat = |set: &DiffSet, e: &Entry, st: char| {
+        set.files.iter().find(|f| f.path == e.path).cloned().unwrap_or_else(|| FileStat {
+            path: e.path.clone(),
+            old_path: e.orig.clone().filter(|_| st == 'R' || st == 'C'),
+            status: status_of(st),
+            similarity: None,
+            add: 0,
+            del: 0,
+            binary: false,
+            kind: FileKind::Text,
+            old_mode: None,
+            new_mode: None,
+        })
+    };
+    let mut g = Groups::default();
+    for e in entries {
+        if e.x == '?' {
+            g.untracked.push(untracked_stat(root, &e.path));
+            continue;
+        }
+        if e.x != '.' {
+            g.staged.push(stat(staged, e, e.x));
+        }
+        if e.y != '.' {
+            g.unstaged.push(stat(unstaged, e, e.y));
+        }
+    }
+    for l in [&mut g.staged, &mut g.unstaged, &mut g.untracked] {
+        l.sort_by(|a, b| a.path.cmp(&b.path));
+    }
+    g
 }
 
 impl Summary {
@@ -59,20 +174,21 @@ pub fn untracked(root: &Path) -> Result<Vec<String>, String> {
     Ok(out.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect())
 }
 
-/// Cheap change signature: one `git status` plus size/mtime of every listed file. No diff work.
-fn status_sig(root: &Path, head: &str, cancel: Option<&AtomicBool>) -> Result<u64, String> {
-    let out = git(root, &["status", "--porcelain=v1", "-z", "-uall", "--no-renames"], cancel)?;
+/// One `git status --porcelain=v2` call: the entries plus a change signature (entries and the
+/// size/mtime of every listed file). No diff work.
+fn status(root: &Path, head: &str, cancel: Option<&AtomicBool>) -> Result<(u64, Vec<Entry>), String> {
+    let out = git(root, &["status", "--porcelain=v2", "-z", "-uall"], cancel)?;
+    let entries = parse_status_v2(&out);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     head.hash(&mut h);
-    for e in out.split(|b| *b == 0).filter(|s| s.len() > 3) {
-        e.hash(&mut h);
-        let path = String::from_utf8_lossy(&e[3..]).into_owned();
-        if let Ok(m) = std::fs::metadata(root.join(&path)) {
+    for e in &entries {
+        (&e.path, e.x, e.y).hash(&mut h);
+        if let Ok(m) = std::fs::metadata(root.join(&e.path)) {
             m.len().hash(&mut h);
             m.modified().ok().hash(&mut h);
         }
     }
-    Ok(h.finish())
+    Ok((h.finish(), entries))
 }
 
 fn read_untracked(root: &Path, rel: &str) -> (FileKind, Vec<String>, bool, bool) {
@@ -98,25 +214,18 @@ fn read_untracked(root: &Path, rel: &str) -> (FileKind, Vec<String>, bool, bool)
     (FileKind::Text, lines, no_nl, true)
 }
 
+pub fn untracked_stat(root: &Path, rel: &str) -> FileStat {
+    let (kind, lines, _, _) = read_untracked(root, rel);
+    FileStat { path: rel.to_string(), old_path: None, status: Status::Added, similarity: None, add: lines.len() as u32, del: 0, binary: kind == FileKind::Binary, kind, old_mode: None, new_mode: Some(0o100644) }
+}
+
 /// Appends untracked files (as `Added`) to a worktree diff set.
 pub fn add_untracked(repo: &Repo, set: &mut DiffSet) -> Result<(), String> {
     for rel in untracked(&repo.root)? {
         if set.files.iter().any(|f| f.path == rel) {
             continue;
         }
-        let (kind, lines, _, _) = read_untracked(&repo.root, &rel);
-        set.files.push(FileStat {
-            path: rel,
-            old_path: None,
-            status: Status::Added,
-            similarity: None,
-            add: lines.len() as u32,
-            del: 0,
-            binary: kind == FileKind::Binary,
-            kind,
-            old_mode: None,
-            new_mode: Some(0o100644),
-        });
+        set.files.push(untracked_stat(&repo.root, &rel));
     }
     set.files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(())
@@ -157,16 +266,17 @@ fn untracked_file(root: &Path, rel: &str) -> DiffFile {
 /// Live summary of everything uncommitted: staged + unstaged vs HEAD, plus untracked files.
 /// The numstat/diff work only runs when the cheap signature differs from `prev`.
 pub fn summary(repo: &Repo, head: &str, prev: Option<&Summary>, cancel: Option<&AtomicBool>) -> Result<Summary, String> {
-    let sig = status_sig(&repo.root, head, cancel)?;
+    let (sig, entries) = status(&repo.root, head, cancel)?;
     if let Some(p) = prev.filter(|p| p.sig == sig) {
         return Ok(p.clone());
     }
-    let mut set = if head.is_empty() {
-        DiffSet::default()
+    let diff = |cmp: Comparison| repo.diff(&cmp, &DiffOpts::default()).map_err(|e| e.to_string());
+    let (mut set, staged) = if head.is_empty() {
+        (DiffSet::default(), DiffSet::default())
     } else {
-        let cmp = Comparison::commit_vs_worktree(head).map_err(|e| e.to_string())?;
-        repo.diff(&cmp, &DiffOpts::default()).map_err(|e| e.to_string())?
+        (diff(Comparison::commit_vs_worktree(head).map_err(|e| e.to_string())?)?, diff(Comparison::commit_vs_index(head).map_err(|e| e.to_string())?)?)
     };
+    let unstaged = diff(Comparison::index_vs_worktree())?;
     let tracked = set.files.len();
     add_untracked(repo, &mut set)?;
     Ok(Summary {
@@ -175,6 +285,7 @@ pub fn summary(repo: &Repo, head: &str, prev: Option<&Summary>, cancel: Option<&
         del: set.files.iter().map(|f| f.del).sum(),
         untracked: set.files.len() - tracked,
         sig,
+        groups: Arc::new(group(&repo.root, &entries, &staged, &unstaged)),
     })
 }
 

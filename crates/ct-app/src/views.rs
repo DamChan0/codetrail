@@ -65,6 +65,10 @@ impl App {
             });
             return;
         }
+        if self.rail == RailTab::Current && self.centre == Centre::Diff && self.wt.summary.as_ref().is_some_and(|s| !s.dirty()) {
+            widgets::empty_state(ui, &th, "No local changes", "Everything is committed. Use Review last commit, or pick a commit in Commits.");
+            return;
+        }
         if self.centre == Centre::Run {
             self.run_ui(ui);
             return;
@@ -920,7 +924,8 @@ impl App {
                     self.ag_ensure_models();
                 }
                 // Opens on "Working tree changes" by itself when the repo is dirty.
-                "worktree" => {}
+                "worktree" | "current-dirty" => {}
+                "current-clean" => self.rail = RailTab::Current,
                 // Static sample: amber app RAM (>70% of 150 MB) and runs subtotal.
                 "resources" => {
                     self.res.sample = Some(crate::resmon::Sample { app_rss_kb: 118 * 1024, child_rss_kb: 41 * 1024, children: 2, cpu_pct: 0.4, ticks: 0 });
