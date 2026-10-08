@@ -12,6 +12,7 @@ mod fsutil;
 mod highlight;
 mod jobs;
 mod projectapp;
+mod railsplit;
 mod resmon;
 mod proc;
 mod projects;

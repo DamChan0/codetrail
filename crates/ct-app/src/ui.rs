@@ -455,8 +455,24 @@ impl App {
             self.select_worktree();
         }
 
-        let files_h = if self.cur.is_some() { 220.0 } else { 120.0 };
-        egui::TopBottomPanel::bottom("rail_files").resizable(true).default_height(files_h).height_range(96.0..=420.0).frame(egui::Frame::new().fill(th.bg()).stroke(egui::Stroke::new(1.0, th.border()))).show_inside(ui, |ui| self.changed_files_ui(ui));
+        let total = ui.max_rect().height();
+        let nfiles = self.diffset.ready().map_or(0, |s| s.files.len());
+        let files_h = crate::railsplit::files_height(self.settings.files_split, nfiles, total);
+        let panel = egui::TopBottomPanel::bottom("rail_files").resizable(false).exact_height(files_h).frame(egui::Frame::new().fill(th.bg()).stroke(egui::Stroke::new(1.0, th.border()))).show_inside(ui, |ui| self.changed_files_ui(ui));
+        // Splitter on the panel's top edge: drag to resize, double-click to reset.
+        let top = panel.response.rect.top();
+        let grab = Rect::from_min_max(pos2(panel.response.rect.left(), top - 4.0), pos2(panel.response.rect.right(), top + 4.0));
+        let sp = ui.interact(grab, egui::Id::new("rail_files_split"), egui::Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::ResizeVertical).on_hover_text("Drag to resize · double-click to reset");
+        if sp.hovered() || sp.dragged() {
+            ui.painter().line_segment([pos2(grab.left(), top), pos2(grab.right(), top)], egui::Stroke::new(2.0, th.accent()));
+        }
+        if sp.double_clicked() {
+            self.settings.files_split = None;
+            self.settings_dirty_at = Some(Instant::now());
+        } else if sp.dragged() {
+            self.settings.files_split = Some(crate::railsplit::frac_for(files_h - sp.drag_delta().y, total));
+            self.settings_dirty_at = Some(Instant::now());
+        }
 
         // Commit list.
         let row_h = th.m().commit_row_height;
@@ -570,10 +586,28 @@ impl App {
                 let mut pick: Option<String> = None;
                 let row_h = 28.0;
                 let sel = self.file_sel.clone();
-                ScrollArea::vertical().id_salt("files_changed").auto_shrink([false, false]).show_rows(ui, row_h, set.files.len(), |ui, range| {
+                let mut flt = std::mem::take(&mut self.files_filter);
+                if set.files.len() > crate::railsplit::FILTER_MIN_FILES {
+                    ui.horizontal(|ui| {
+                        ui.add_space(m.space[2]);
+                        let w = ui.available_width() - m.space[2];
+                        let r = ui.add_sized([w, m.control_height_compact], egui::TextEdit::singleline(&mut flt).hint_text("Filter files").desired_width(w).margin(vec2(8.0, 4.0)));
+                        if r.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
+                            flt.clear();
+                        }
+                    });
+                } else {
+                    flt.clear();
+                }
+                let needle = flt.to_lowercase();
+                let shown: Vec<usize> = (0..set.files.len()).filter(|i| needle.is_empty() || set.files[*i].path.to_lowercase().contains(&needle)).collect();
+                if shown.is_empty() {
+                    widgets::empty_state(ui, &th, "No matching files", "Clear the filter to see all changes.");
+                }
+                ScrollArea::vertical().id_salt("files_changed").auto_shrink([false, false]).show_rows(ui, row_h, shown.len(), |ui, range| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     for i in range {
-                        let f = &set.files[i];
+                        let f = &set.files[shown[i]];
                         let (resp, rect) = widgets::list_row(ui, &th, row_h, sel.as_deref() == Some(f.path.as_str()));
                         let (letter, col) = status_style(&th, f.status);
                         let lr = Rect::from_min_size(pos2(rect.min.x, rect.min.y), vec2(14.0, row_h));
@@ -587,6 +621,7 @@ impl App {
                         resp.on_hover_text(&f.path);
                     }
                 });
+                self.files_filter = flt;
                 if let Some(p) = pick {
                     self.centre = Centre::Diff;
                     self.open_file_diff(&p);

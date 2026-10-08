@@ -360,6 +360,7 @@ pub struct Smoke {
 }
 
 pub struct App {
+    pub files_filter: String,
     pub res: crate::resmon::ResState,
     pub wt: crate::wtapp::WtState,
     pub pj: crate::projectapp::ProjectState,
@@ -442,6 +443,7 @@ impl App {
         let jobs = Jobs::new(move || rc.request_repaint());
         let mut app = App {
             pj: Default::default(),
+            files_filter: String::new(),
             res: Default::default(),
             wt: Default::default(),
             ag: crate::agentapp::AgentState::new(svc),

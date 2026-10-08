@@ -36,6 +36,8 @@ pub struct Settings {
     pub ask_timeout_secs: u64,
     pub git_timeout_secs: u64,
     pub rail_width: f32,
+    /// Share of the rail height given to the changed-files list; `None` = default rule.
+    pub files_split: Option<f32>,
     pub inspector_width: f32,
     /// Recently opened projects, most recent first (at most 12).
     pub recent: Vec<RecentProject>,
@@ -54,6 +56,7 @@ impl Default for Settings {
             ask_timeout_secs: 180,
             git_timeout_secs: 30,
             rail_width: 340.0,
+            files_split: None,
             inspector_width: 360.0,
             recent: Vec::new(),
         }
@@ -71,6 +74,7 @@ impl Settings {
         self.code_font_size = self.code_font_size.clamp(9.0, 28.0);
         self.tab_width = self.tab_width.clamp(1, 16);
         self.rail_width = self.rail_width.clamp(240.0, 640.0);
+        self.files_split = self.files_split.map(crate::railsplit::clamp);
         self.inspector_width = self.inspector_width.clamp(260.0, 640.0);
         self.ask_timeout_secs = self.ask_timeout_secs.clamp(5, 3600);
         self.git_timeout_secs = self.git_timeout_secs.clamp(1, 600);
@@ -155,5 +159,22 @@ mod tests {
         assert!(b.is_none());
         assert_eq!(l.recent.len(), 1);
         assert_eq!(l.recent[0].opened_ms, 5);
+    }
+
+    #[test]
+    fn files_split_round_trips_clamps_and_defaults_to_none() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        assert_eq!(Settings::default().files_split, None);
+        let mut s = Settings::default();
+        s.files_split = Some(0.6);
+        s.save(&p).unwrap();
+        assert_eq!(Settings::load(&p).0.files_split, Some(0.6));
+        s.files_split = Some(0.99);
+        s.save(&p).unwrap();
+        assert_eq!(Settings::load(&p).0.files_split, Some(crate::railsplit::MAX_FRAC));
+        s.files_split = None;
+        s.save(&p).unwrap();
+        assert_eq!(Settings::load(&p).0.files_split, None);
     }
 }

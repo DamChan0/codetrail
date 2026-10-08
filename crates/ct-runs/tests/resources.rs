@@ -183,6 +183,14 @@ fn sleeper() -> Arc<Fac> {
     Arc::new(Fac { script: "sleep 600 & wait".into() })
 }
 
+fn wait_until(what: &str, f: impl Fn() -> bool) {
+    let end = Instant::now() + Duration::from_secs(10);
+    while !f() {
+        assert!(Instant::now() < end, "timeout waiting for: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn wait_for(m: &RunManager, id: &str, what: &str, secs: u64, pred: impl Fn(&RunInfo) -> bool) -> RunInfo {
     let end = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -268,13 +276,16 @@ fn sampler_thread_exists_only_while_runs_are_active() {
     let e = env();
     let _audit = Audit { root: e.tmp.clone(), marker: "never-matches-zzz".into() };
     let m = RunManager::open_with(&e.data, 2, sleeper(), T).unwrap();
-    assert_eq!(sampler_threads(), 0, "idle manager must own no sampler");
+    // a sampler of the previous test may still be on its way out: poll, don't assume
+    wait_until("no sampler for an idle manager", || sampler_threads() == 0);
     let a = m.submit(spec(&e)).unwrap();
     let b = m.submit(spec(&e)).unwrap();
-    std::thread::sleep(Duration::from_millis(400));
+    // both runs have a sample (session start + first tick are asynchronous)
+    wait_until("a sample of both runs", || {
+        let r = m.resources();
+        r.len() == 2 && r.iter().all(|(_, r)| r.procs >= 2 && r.rss_kb > 0)
+    });
     assert_eq!(sampler_threads(), 1, "exactly one sampler for two runs");
-    assert_eq!(m.resources().len(), 2);
-    assert!(m.resources().iter().all(|(_, r)| r.procs >= 2 && r.rss_kb > 0));
     m.abort(&a).unwrap();
     m.abort(&b).unwrap();
     wait_for(&m, &a, "a done", 10, |i| !i.state.is_active());
@@ -289,8 +300,7 @@ fn sampler_thread_exists_only_while_runs_are_active() {
     assert_eq!(sampler_threads(), 0);
     // and it comes back for the next run
     let c = m.submit(spec(&e)).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(sampler_threads(), 1);
+    wait_until("sampler restarts", || sampler_threads() == 1);
     m.abort(&c).unwrap();
     wait_for(&m, &c, "c done", 10, |i| !i.state.is_active());
     let end = Instant::now() + Duration::from_secs(2);

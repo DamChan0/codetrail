@@ -180,6 +180,8 @@ struct Inner {
     max_total_rss_mb: std::sync::atomic::AtomicU64,
     /// latest sample per running run
     res: Mutex<HashMap<String, Resource>>,
+    /// signalled (with `st`) when a run finishes so the sampler can exit without waiting a tick
+    sampler_wake: parking_lot::Condvar,
 }
 
 #[derive(Clone)]
@@ -220,6 +222,7 @@ impl RunManager {
             limits: Mutex::new(Limits::default()),
             max_total_rss_mb: std::sync::atomic::AtomicU64::new(resources::DEFAULT_MAX_TOTAL_RSS_MB),
             res: Mutex::new(HashMap::new()),
+            sampler_wake: parking_lot::Condvar::new(),
         });
         pump(&inner);
         Ok(RunManager { inner })
@@ -612,6 +615,7 @@ fn finish(inner: &Arc<Inner>, id: &str, state: RunState, extra: Option<Box<dyn F
             e.ctl = None;
         }
         st.running = st.running.saturating_sub(1);
+        inner.sampler_wake.notify_all();
     }
     inner.res.lock().remove(id);
     pump(inner);
@@ -877,7 +881,13 @@ fn sampler(inner: Arc<Inner>) {
     let mut tracks: HashMap<String, resources::Track> = HashMap::new();
     let mut last = Instant::now();
     loop {
-        std::thread::sleep(inner.timings.sample_interval);
+        {
+            // wakes early when the last run finishes, so the thread is gone promptly
+            let mut st = inner.st.lock();
+            if st.running > 0 {
+                inner.sampler_wake.wait_for(&mut st, inner.timings.sample_interval);
+            }
+        }
         let dt = last.elapsed().as_secs_f64();
         last = Instant::now();
         let live: Vec<(String, u32, Option<u64>, i64)> = {
