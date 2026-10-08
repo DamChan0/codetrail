@@ -20,6 +20,7 @@ pub enum JobKind {
     Search,
     Files,
     Blame,
+    TimeTravel,
     History,
     Records,
     Ask,

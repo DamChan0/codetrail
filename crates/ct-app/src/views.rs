@@ -4,6 +4,7 @@ use crate::app::*;
 use crate::diffmodel::{cols, DiffModel, SplitRow, UnifiedRow};
 use crate::editor::ReadOnly;
 use crate::highlight::{self, Span};
+use crate::settings::ViewMode;
 use crate::selection::{code_ref_for_lines, code_ref_for_rows, RowSel};
 use crate::theme::Theme;
 use crate::widgets::{self, Btn, BtnKind, Icon, Level};
@@ -99,23 +100,29 @@ impl App {
                     }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let mut i = match self.centre {
-                        Centre::Diff | Centre::Run => 0,
-                        Centre::Blame => 1,
-                        Centre::Editor => 2,
+                    // Shows the stored preference, not the (possibly fallback) effective mode.
+                    let mut i = match self.settings.view_mode {
+                        _ if self.tt.is_some() => 1,
+                        ViewMode::Diff => 0,
+                        ViewMode::Blame => 1,
+                        ViewMode::Edit => 2,
                     };
                     if widgets::segmented(ui, &th, &["Diff", "Blame", "Edit"], &mut i) {
-                        let path = self.file_sel.clone().or_else(|| self.editor.as_ref().map(|e| e.path.clone())).or_else(|| Some(self.blame.path.clone()).filter(|p| !p.is_empty()));
-                        match (i, path) {
-                            (0, _) => self.centre = Centre::Diff,
-                            (1, Some(p)) => self.open_blame(&p, None),
-                            (2, Some(p)) => self.open_editor(&p, None),
-                            _ => self.flash("Pick a file first (Ctrl+P)."),
-                        }
+                        self.set_view_pref([ViewMode::Diff, ViewMode::Blame, ViewMode::Edit][i]);
+                    }
+                    if let Some(note) = self.view_note {
+                        widgets::badge(ui, &th, note, th.muted());
                     }
                 });
             });
         });
+        if self.tt.is_some() {
+            self.tt_banner(ui);
+            if self.tt.as_ref().is_some_and(|t| t.missing) {
+                self.tt_missing_ui(ui);
+                return;
+            }
+        }
         match self.centre {
             Centre::Diff | Centre::Run => self.diff_ui(ui),
             Centre::Blame => self.blame_ui(ui),
@@ -336,7 +343,7 @@ impl App {
                 }
                 return;
             }
-            Loadable::Ready(d) => d,
+            Loadable::Ready(d) => d.clone(),
         };
         if data.lines.is_empty() {
             widgets::empty_state(ui, &th, "Empty file", "There are no lines to blame.");
@@ -348,7 +355,10 @@ impl App {
         let gutter = 260.0;
         let n = data.lines.len();
         let mut area = ScrollArea::both().id_salt("blame_scroll").auto_shrink([false, false]);
-        if let Some(l) = self.blame.scroll_to.take() {
+        if let Some(y) = self.blame.apply_y.take() {
+            area = area.vertical_scroll_offset(y);
+            self.blame.scroll_to = None;
+        } else if let Some(l) = self.blame.scroll_to.take() {
             area = area.vertical_scroll_offset((l.saturating_sub(1) as f32 * row_h - row_h * 3.0).max(0.0));
         }
         let max_cols = data.lines.iter().map(|l| cols(&l.text)).max().unwrap_or(1);
@@ -357,7 +367,8 @@ impl App {
         let mut click: Option<usize> = None;
         let sel = self.blame.selected.map(|(a, b)| (a.min(b), a.max(b)));
         let mut prev_sha_row: Option<usize> = None;
-        area.show_rows(ui, row_h, n, |ui, range| {
+        let mut gutter_click: Option<usize> = None;
+        let out = area.show_rows(ui, row_h, n, |ui, range| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for i in range {
                 let l = &data.lines[i];
@@ -391,10 +402,28 @@ impl App {
                 let g = ui.fonts(|f| f.layout_job(job));
                 p.galley(pos2(rect.min.x + gutter + 50.0, rect.center().y - g.size().y / 2.0), g, th.fg());
                 if resp.clicked() {
+                    if resp.interact_pointer_pos().is_some_and(|pp| pp.x < rect.min.x + gutter) {
+                        gutter_click = Some(i);
+                    }
                     click = Some(i);
                 }
             }
         });
+        self.blame.scroll_y = out.state.offset.y;
+        if self.tt.is_some() {
+            // Marker for the tracked lines along the scrollbar side.
+            if let Some((a, b)) = sel {
+                let r = out.inner_rect;
+                let h = r.height();
+                let y0 = r.min.y + a as f32 / n as f32 * h;
+                let hh = ((b - a + 1) as f32 / n as f32 * h).max(3.0);
+                ui.painter().rect_filled(Rect::from_min_size(pos2(r.max.x - 4.0, y0), vec2(3.0, hh)), 1.0, th.accent());
+            }
+            if let Some(i) = gutter_click {
+                self.tt_from_blame_line(i);
+                return;
+            }
+        }
         if let Some(i) = click {
             let shift = ui.input(|i| i.modifiers.shift);
             let a = match (shift, self.blame.selected) {
@@ -668,7 +697,9 @@ impl App {
         };
         let line = sel.code_ref.start;
         let path = sel.code_ref.path.clone();
-        if self.blame.path != path || self.blame.data.ready().is_none() {
+        let tt = self.tt.is_some();
+        let hist_path = self.history.path.clone();
+        if !tt && (self.blame.path != path || self.blame.data.ready().is_none()) {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
@@ -677,7 +708,7 @@ impl App {
                 }
             });
         }
-        let info = self.blame.data.ready().filter(|_| self.blame.path == path).and_then(|d| d.lines.iter().find(|l| l.line_no == line)).cloned();
+        let info = self.blame.data.ready().filter(|_| !tt && self.blame.path == path).and_then(|d| d.lines.iter().find(|l| l.line_no == line)).cloned();
         let now = crate::timefmt::now();
         if let Some(l) = info {
             ui.add_space(12.0);
@@ -703,14 +734,16 @@ impl App {
                     }
                 });
             }
-        } else if matches!(self.blame.data, Loadable::Loading) {
+        } else if !tt && matches!(self.blame.data, Loadable::Loading) {
             widgets::skeleton(ui, &th, 2, 24.0);
         }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add_space(12.0);
-            if Btn::new("Follow this line's history").icon(Icon::Commit).show(ui, &th).clicked() {
-                self.request_history(&path, line);
+            if tt {
+                ui.label(RichText::new("↑/↓ step through history · Esc back").font(widgets::small_font(&th)).color(th.muted()));
+            } else if Btn::new("Follow this line's history").icon(Icon::Commit).show(ui, &th).clicked() {
+                self.request_history(&path, line, sel.code_ref.end.max(line));
             }
         });
         ui.separator();
@@ -722,23 +755,36 @@ impl App {
             }
             Loadable::Ready(v) if v.is_empty() => widgets::empty_state(ui, &th, "No history", "No commit touched this line."),
             Loadable::Ready(v) => {
-                let mut jump = None;
-                ScrollArea::vertical().id_salt("history_scroll").auto_shrink([false, false]).show_rows(ui, 44.0, v.len(), |ui, range| {
+                let (active, scroll) = self.tt.as_mut().map_or((None, false), |t| (Some(t.sha.clone()), std::mem::take(&mut t.list_scroll)));
+                let mut pick = None;
+                let mut area = ScrollArea::vertical().id_salt("history_scroll").auto_shrink([false, false]);
+                if scroll {
+                    if let Some(i) = v.iter().position(|r| Some(&r.commit.sha) == active.as_ref()) {
+                        area = area.vertical_scroll_offset((i as f32 * 44.0 - 44.0 * 2.0).max(0.0));
+                    }
+                }
+                area.show_rows(ui, 44.0, v.len(), |ui, range| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     for i in range {
-                        let c = &v[i];
-                        let (resp, rect) = widgets::list_row(ui, &th, 44.0, false);
-                        let l1 = Rect::from_min_max(pos2(rect.min.x, rect.min.y + 4.0), pos2(rect.max.x, rect.min.y + 24.0));
-                        let l2 = Rect::from_min_max(pos2(rect.min.x, rect.min.y + 24.0), pos2(rect.max.x, rect.max.y - 4.0));
-                        widgets::paint_text_fit(ui, l1, &c.subject, widgets::ui_font(&th), th.fg());
-                        widgets::paint_text_fit(ui, l2, &format!("{}  ·  {}  ·  {}", crate::timefmt::short(&c.sha), c.author, crate::timefmt::rel(now, c.time)), widgets::small_font(&th), th.muted());
+                        let r = &v[i];
+                        let c = &r.commit;
+                        let is_active = active.as_ref() == Some(&c.sha);
+                        let (resp, rect) = widgets::list_row(ui, &th, 44.0, is_active);
+                        if is_active {
+                            ui.painter().rect_filled(Rect::from_min_size(rect.min, vec2(3.0, 44.0)), 0.0, th.accent());
+                        }
+                        let l1 = Rect::from_min_max(pos2(rect.min.x + 4.0, rect.min.y + 4.0), pos2(rect.max.x, rect.min.y + 24.0));
+                        let l2 = Rect::from_min_max(pos2(rect.min.x + 4.0, rect.min.y + 24.0), pos2(rect.max.x, rect.max.y - 4.0));
+                        widgets::paint_text_fit(ui, l1, &c.subject, widgets::ui_font(&th), if is_active { th.accent() } else { th.fg() });
+                        let renamed = if r.path != hist_path { format!("  ·  {}", r.path) } else { String::new() };
+                        widgets::paint_text_fit(ui, l2, &format!("{}  ·  {}  ·  {}{}", crate::timefmt::short(&c.sha), c.author, crate::timefmt::rel(now, c.time), renamed), widgets::small_font(&th), th.muted());
                         if resp.clicked() {
-                            jump = Some(c.sha.clone());
+                            pick = Some(i);
                         }
                     }
                 });
-                if let Some(s) = jump {
-                    self.jump_to_commit(&s);
+                if let Some(i) = pick {
+                    self.tt_pick(i);
                 }
             }
         }
@@ -926,6 +972,11 @@ impl App {
                 // Opens on "Working tree changes" by itself when the repo is dirty.
                 "worktree" | "current-dirty" => {}
                 "current-clean" => self.rail = RailTab::Current,
+                "history-time-travel" => {
+                    self.insp_open = true;
+                    self.insp = InspTab::Blame;
+                }
+                "mode-sticky" => self.settings.view_mode = ViewMode::Blame,
                 // Static sample: amber app RAM (>70% of 150 MB) and runs subtotal.
                 "resources" => {
                     self.res.sample = Some(crate::resmon::Sample { app_rss_kb: 118 * 1024, child_rss_kb: 41 * 1024, children: 2, cpu_pct: 0.4, ticks: 0 });
@@ -996,6 +1047,29 @@ impl App {
             self.ag_select_run("r1");
         }
         let mut settled = ag_ready && browser_ready && ready && (scene != "search" || self.search.ran.is_some());
+        // Fixture scenes (see docs): g.txt line 5 has a multi-commit history across a rename.
+        if scene == "history-time-travel" && ready {
+            if self.tt.is_none() && self.blame.path.is_empty() {
+                self.open_blame("g.txt", Some(5));
+                settled = false;
+            } else if self.tt.is_none() && self.blame.data.ready().is_some() && self.selection.is_none() {
+                let at = RefAt::Commit(self.head.clone());
+                let text = self.blame.data.ready().and_then(|d| d.lines.get(4)).map(|l| l.text.clone()).unwrap_or_default();
+                self.blame.selected = Some((4, 4));
+                self.set_selection(code_ref_for_lines("g.txt", 5, 5, &at), SelSource::Blame, text);
+                self.request_history("g.txt", 5, 5);
+                settled = false;
+            } else if self.tt.is_none() && self.history.data.ready().is_some() {
+                self.tt_pick(1);
+                settled = false;
+            } else if self.tt.is_none() {
+                settled = false;
+            }
+        }
+        if scene == "mode-sticky" && ready && self.file_sel.as_deref() != Some("other.txt") {
+            self.open_file_diff("other.txt");
+            settled = false;
+        }
         if scene == "why" && ready {
             if let Loadable::Ready(p) = &self.prepared {
                 if self.selection.is_none() {

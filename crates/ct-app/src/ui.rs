@@ -54,6 +54,7 @@ impl eframe::App for App {
         self.debounce(ctx);
         self.wt_tick(ctx);
         self.res_tick(ctx);
+        self.tt_keys(ctx);
         if self.editor.is_some() && self.centre == Centre::Editor {
             self.check_editor_disk();
             widgets::repaint_if_focused(ctx, Duration::from_millis(1000));
@@ -185,11 +186,11 @@ impl App {
                 self.search.focus = true;
             }
             Cmd::BaseMenu => self.base_pop.open = !self.base_pop.open,
-            Cmd::ToggleEdit => match self.centre {
-                Centre::Editor => self.centre = Centre::Diff,
+            Cmd::ToggleEdit => match self.settings.view_mode {
+                crate::settings::ViewMode::Edit => self.set_view_pref(crate::settings::ViewMode::Diff),
                 _ => {
-                    if let Some(p) = self.file_sel.clone().or_else(|| self.editor.as_ref().map(|e| e.path.clone())) {
-                        self.open_editor(&p, None);
+                    if self.file_sel.is_some() || self.editor.is_some() {
+                        self.set_view_pref(crate::settings::ViewMode::Edit);
                     } else {
                         self.flash("Pick a file first (Ctrl+P).");
                     }
@@ -614,7 +615,9 @@ impl App {
                 });
                 self.files_filter = flt;
                 if let Some(p) = pick {
-                    self.centre = Centre::Diff;
+                    if self.centre == Centre::Run {
+                        self.centre = Centre::Diff;
+                    }
                     self.open_file_diff(&p);
                 }
             }
@@ -803,7 +806,9 @@ impl App {
     pub fn open_file_diff_or_editor(&mut self, path: &str) {
         let in_diff = self.diffset.ready().is_some_and(|s| s.files.iter().any(|f| f.path == path));
         if in_diff {
-            self.centre = Centre::Diff;
+            if self.centre == Centre::Run {
+                self.centre = Centre::Diff;
+            }
             self.open_file_diff(path);
         } else {
             self.open_editor(path, None);

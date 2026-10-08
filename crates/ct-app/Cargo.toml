@@ -2,6 +2,9 @@
 name = "ct-app"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "CodeTrail - commit-diff viewer with AI change-reason tracking"
+build = "build.rs"
 
 [[bin]]
 name = "codetrail"

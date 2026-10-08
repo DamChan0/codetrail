@@ -133,11 +133,15 @@ impl App {
         });
         match pick {
             Some((WtView::All, _)) => {
-                self.centre = crate::app::Centre::Diff;
+                if self.centre == crate::app::Centre::Run {
+                    self.centre = crate::app::Centre::Diff;
+                }
                 self.select_worktree();
             }
             Some((v, Some(p))) => {
-                self.centre = crate::app::Centre::Diff;
+                if self.centre == crate::app::Centre::Run {
+                    self.centre = crate::app::Centre::Diff;
+                }
                 self.select_wt_file(v, &p);
             }
             _ => {}

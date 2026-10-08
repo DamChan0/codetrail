@@ -5,6 +5,16 @@ use crate::projects::{normalize, RecentProject, MAX_RECENT};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Main pane mode the user picked in the Diff | Blame | Edit switch. Selection changes never alter it.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ViewMode {
+    #[default]
+    Diff,
+    Blame,
+    Edit,
+}
+
 /// `[agent]` table: the one backend/model/thinking selection shared by Ask AI and new runs.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -39,6 +49,7 @@ pub struct Settings {
     /// Share of the rail height given to the changed-files list; `None` = default rule.
     pub files_split: Option<f32>,
     pub inspector_width: f32,
+    pub view_mode: ViewMode,
     /// Recently opened projects, most recent first (at most 12).
     pub recent: Vec<RecentProject>,
 }
@@ -58,6 +69,7 @@ impl Default for Settings {
             rail_width: 340.0,
             files_split: None,
             inspector_width: 360.0,
+            view_mode: ViewMode::Diff,
             recent: Vec::new(),
         }
     }
@@ -176,5 +188,21 @@ mod tests {
         s.files_split = None;
         s.save(&p).unwrap();
         assert_eq!(Settings::load(&p).0.files_split, None);
+    }
+
+    #[test]
+    fn view_mode_round_trips_and_bad_value_falls_back_to_defaults() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        assert_eq!(Settings::default().view_mode, ViewMode::Diff);
+        let mut s = Settings::default();
+        s.view_mode = ViewMode::Blame;
+        s.save(&p).unwrap();
+        assert!(std::fs::read_to_string(&p).unwrap().contains("view_mode = \"blame\""));
+        assert_eq!(Settings::load(&p).0.view_mode, ViewMode::Blame);
+        std::fs::write(&p, "view_mode = \"sideways\"\n").unwrap();
+        let (s, warn) = Settings::load(&p);
+        assert_eq!(s.view_mode, ViewMode::Diff);
+        assert!(warn.is_some());
     }
 }

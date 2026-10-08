@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=CodeTrail
+GenericName=Commit diff viewer
+Comment=Commit-diff viewer with AI change-reason tracking
+Exec=@BIN@ %F
+Icon=@ICON@
+Terminal=false
+Categories=Development;RevisionControl;
+Keywords=git;diff;commit;review;agent;
+StartupWMClass=codetrail

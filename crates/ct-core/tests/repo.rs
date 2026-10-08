@@ -632,6 +632,25 @@ fn file_history_follow_and_line_range() {
 }
 
 #[test]
+fn line_history_reports_path_and_line_range_per_commit() {
+    let t = T::new();
+    t.write("h.txt", b"a\nb\nc\nd\n");
+    let c1 = t.commit_all("create");
+    t.git(&["mv", "h.txt", "moved.txt"]);
+    let _ = t.commit_all("rename");
+    // two lines inserted above: the tracked line shifts from 2 to 4
+    t.write("moved.txt", b"x\ny\na\nB\nc\nd\n");
+    let c3 = t.commit_all("insert and touch");
+    let r = t.repo();
+    let h = r.line_history("moved.txt", (4, 4), 50).unwrap();
+    let got: Vec<_> = h.iter().map(|x| (x.commit.sha.as_str(), x.path.as_str(), x.lines)).collect();
+    assert_eq!(got, [(c3.as_str(), "moved.txt", Some((4, 4))), (c1.as_str(), "h.txt", Some((2, 2)))]);
+    assert!(r.line_history("moved.txt", (0, 1), 5).is_err());
+    assert!(r.line_history("moved.txt", (4, 4), 0).unwrap().is_empty());
+    assert_eq!(r.line_history("moved.txt", (4, 4), 1).unwrap().len(), 1);
+}
+
+#[test]
 fn show_file_and_worktree_read() {
     let t = T::new();
     t.write("s.txt", b"v1\n");

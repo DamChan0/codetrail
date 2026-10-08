@@ -34,6 +34,17 @@ pub struct RefInfo {
     pub is_head: bool,
 }
 
+/// One commit in a `git log -L` line history, with where the tracked lines live *after* it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineRev {
+    pub commit: CommitMeta,
+    /// Path of the file in this commit (differs from the queried path across renames).
+    pub path: String,
+    /// 1-based inclusive line range in this commit's version of `path`; `None` when the
+    /// tracked lines no longer exist after the commit (pure deletion) or git printed no hunk.
+    pub lines: Option<(u32, u32)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitMeta {
     pub sha: Oid,

@@ -5,7 +5,7 @@ use crate::editor::{self, Disk, FileStamp, Loaded, ReadOnly, SaveOutcome};
 use crate::highlight::{self, Span};
 use crate::jobs::{JobCtx, JobId, JobKind, Jobs};
 use crate::selection::{at_commit, RowSel};
-use crate::settings::Settings;
+use crate::settings::{Settings, ViewMode};
 use crate::theme::{Theme, ThemeFile};
 use ct_agent::ask as agent_ask;
 use ct_core::{BlameLine, CodeRef, CommitMeta, Comparison, DiffOpts, DiffSet, FileIndex, LogQuery, RefAt, RefInfo, Repo, SearchHit, SearchQuery, SearchStats, Treeish};
@@ -186,8 +186,9 @@ pub enum Msg {
     Hits(Vec<SearchHit>),
     SearchDone(Result<SearchStats, String>),
     Files(Result<(Arc<Vec<String>>, Arc<FileIndex>), String>),
-    Blame { path: String, res: Result<Box<BlameData>, String> },
-    History { path: String, line: u32, res: Result<Vec<CommitMeta>, String> },
+    Blame { path: String, res: Result<Arc<BlameData>, String> },
+    TtBlame { sha: String, path: String, res: Result<Arc<BlameData>, String> },
+    History { path: String, line: u32, end: u32, res: Result<Vec<ct_core::LineRev>, String> },
     FileLoaded { path: String, res: Result<Loaded, String> },
     Saved { path: String, written: String, res: Result<SaveOutcome, String> },
     Disk { path: String, res: Disk },
@@ -303,16 +304,20 @@ impl EditorState {
 pub struct BlameState {
     pub path: String,
     pub rev: Option<String>,
-    pub data: Loadable<Box<BlameData>>,
+    pub data: Loadable<Arc<BlameData>>,
     pub selected: Option<(usize, usize)>,
     pub scroll_to: Option<usize>,
+    /// Last vertical scroll offset, so Back from time travel can put the view back.
+    pub scroll_y: f32,
+    pub apply_y: Option<f32>,
 }
 
 #[derive(Default)]
 pub struct HistoryState {
     pub path: String,
     pub line: u32,
-    pub data: Loadable<Vec<CommitMeta>>,
+    pub end: u32,
+    pub data: Loadable<Vec<ct_core::LineRev>>,
 }
 
 #[derive(Default)]
@@ -369,6 +374,10 @@ pub struct Smoke {
 }
 
 pub struct App {
+    pub tt: Option<crate::timetravel::TimeTravel>,
+    pub tt_cache: crate::timetravel::Cache,
+    /// Why the shown mode differs from the stored preference (e.g. "read-only revision").
+    pub view_note: Option<&'static str>,
     pub wt_view: crate::worktree::WtView,
     pub files_filter: String,
     pub res: crate::resmon::ResState,
@@ -453,6 +462,9 @@ impl App {
         let jobs = Jobs::new(move || rc.request_repaint());
         let mut app = App {
             pj: Default::default(),
+            tt: None,
+            tt_cache: Default::default(),
+            view_note: None,
             wt_view: Default::default(),
             files_filter: String::new(),
             res: Default::default(),
@@ -733,9 +745,81 @@ impl App {
         self.diff_anchor = None;
         self.wt.quiet_gen = 0;
         self.request_file_diff();
-        if self.centre == Centre::Editor || self.centre == Centre::Blame {
-            // keep the centre; user switches explicitly
+        self.tt_discard();
+        self.apply_view();
+    }
+
+    /// Effective main-pane mode for the current file. The stored preference (`settings.view_mode`)
+    /// is only ever changed by the user; when it cannot apply here a fallback is shown and the
+    /// reason goes to `view_note`.
+    pub fn apply_view(&mut self) {
+        use ct_core::{FileKind, Status};
+        self.view_note = None;
+        if self.tt.is_some() || self.centre == Centre::Run {
+            return;
         }
+        let pref = self.settings.view_mode;
+        let Some(path) = self.file_sel.clone() else {
+            if !self.editor.as_ref().is_some_and(|e| e.dirty()) {
+                self.centre = Centre::Diff;
+            }
+            return;
+        };
+        if let Some(e) = &self.editor {
+            if pref == ViewMode::Edit && e.dirty() && e.path != path {
+                let name = e.path.clone();
+                self.centre = Centre::Editor;
+                self.flash(&format!("Unsaved changes in {name}: save or discard before opening another file."));
+                return;
+            }
+        }
+        let stat = self.diffset.ready().and_then(|s| s.files.iter().find(|f| f.path == path)).cloned();
+        let deleted = stat.as_ref().is_some_and(|f| f.status == Status::Deleted);
+        let binary = stat.as_ref().is_some_and(|f| f.binary || f.kind == FileKind::Binary);
+        let at_head = match &self.target {
+            Some(TargetSel::Worktree) => true,
+            Some(TargetSel::Commit(s)) => !self.head.is_empty() && (self.head.starts_with(s.as_str()) || s.starts_with(self.head.as_str())),
+            None => false,
+        };
+        let (mode, note) = match pref {
+            ViewMode::Diff => (ViewMode::Diff, None),
+            ViewMode::Blame if deleted => (ViewMode::Diff, Some("deleted file")),
+            ViewMode::Blame if binary => (ViewMode::Diff, Some("binary file")),
+            ViewMode::Blame => (ViewMode::Blame, None),
+            ViewMode::Edit if deleted => (ViewMode::Diff, Some("deleted file")),
+            ViewMode::Edit if binary => (ViewMode::Diff, Some("binary file")),
+            ViewMode::Edit if !at_head => (ViewMode::Blame, Some("read-only: historical revision")),
+            ViewMode::Edit => (ViewMode::Edit, None),
+        };
+        self.view_note = note;
+        match mode {
+            ViewMode::Diff => self.centre = Centre::Diff,
+            ViewMode::Blame => self.load_blame(&path, None),
+            ViewMode::Edit => self.open_editor(&path, None),
+        }
+    }
+
+    /// The user picked a mode in the switch (or Ctrl+E): store it and apply it to the open file.
+    pub fn set_view_pref(&mut self, mode: ViewMode) {
+        self.tt_discard();
+        if self.settings.view_mode != mode {
+            self.settings.view_mode = mode;
+            self.settings_dirty_at = Some(Instant::now());
+        }
+        if self.centre == Centre::Run {
+            self.centre = Centre::Diff;
+        }
+        if self.file_sel.is_none() {
+            let alt = self.editor.as_ref().map(|e| e.path.clone()).or_else(|| Some(self.blame.path.clone()).filter(|p| !p.is_empty()));
+            match (mode, alt) {
+                (ViewMode::Diff, _) => self.centre = Centre::Diff,
+                (ViewMode::Blame, Some(p)) => self.load_blame(&p, None),
+                (ViewMode::Edit, Some(p)) => self.open_editor(&p, None),
+                _ => self.flash("Pick a file first (Ctrl+P)."),
+            }
+            return;
+        }
+        self.apply_view();
     }
 
     pub fn request_file_diff(&mut self) {
@@ -938,6 +1022,7 @@ impl App {
 
     pub fn open_editor(&mut self, path: &str, line: Option<u32>) {
         let Some(repo) = self.repo.clone() else { return };
+        self.tt_discard();
         self.centre = Centre::Editor;
         if let Some(e) = &mut self.editor {
             if e.path == path {
@@ -1019,9 +1104,15 @@ impl App {
     }
 
     pub fn open_blame(&mut self, path: &str, line: Option<usize>) {
-        let Some(repo) = self.repo.clone() else { return };
-        self.centre = Centre::Blame;
         self.insp = InspTab::Blame;
+        self.load_blame(path, line);
+    }
+
+    /// Blame in the main pane without touching the inspector tab.
+    pub fn load_blame(&mut self, path: &str, line: Option<usize>) {
+        let Some(repo) = self.repo.clone() else { return };
+        self.tt_discard();
+        self.centre = Centre::Blame;
         let at = match (&self.cur, self.target.as_ref()) {
             (Some(c), Some(TargetSel::Commit(_))) => match &c.new_at {
                 Some(RefAt::Commit(sha)) => Some(sha.clone()),
@@ -1033,7 +1124,7 @@ impl App {
             self.blame.scroll_to = line;
             return;
         }
-        self.blame = BlameState { path: path.to_string(), rev: at.clone(), data: Loadable::Loading, selected: None, scroll_to: line };
+        self.blame = BlameState { path: path.to_string(), rev: at.clone(), data: Loadable::Loading, selected: None, scroll_to: line, scroll_y: 0.0, apply_y: None };
         let p = path.to_string();
         let timeout = self.git_timeout();
         self.jobs.spawn(JobKind::Blame, move |c| {
@@ -1042,24 +1133,30 @@ impl App {
                 Some(sha) => Treeish::Commit(sha.clone()),
                 None => Treeish::Worktree,
             };
-            let res = repo.blame(&target, &p, None).map_err(|e| e.to_string()).map(|lines| {
+            let res = repo.blame(&target, &p, None).map_err(|e| e.to_string()).or_else(|e| {
+                // Untracked / newly added files have no history: show the plain text with an empty gutter.
+                match (&target, crate::worktree::plain_lines(&repo.root, &p)) {
+                    (Treeish::Worktree, Some(lines)) => Ok(crate::timetravel::plain_blame(&p, lines)),
+                    _ => Err(e),
+                }
+            }).map(|lines| {
                 let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
                 let spans = highlight::highlight(highlight::lang_for_path(&p), &texts);
-                Box::new(BlameData { lines, spans })
+                Arc::new(BlameData { lines, spans })
             });
             c.finish(Msg::Blame { path: p, res });
         });
     }
 
-    pub fn request_history(&mut self, path: &str, line: u32) {
+    pub fn request_history(&mut self, path: &str, line: u32, end: u32) {
         let Some(repo) = self.repo.clone() else { return };
-        self.history = HistoryState { path: path.to_string(), line, data: Loadable::Loading };
+        self.history = HistoryState { path: path.to_string(), line, end, data: Loadable::Loading };
         let p = path.to_string();
         let timeout = self.git_timeout();
         self.jobs.spawn(JobKind::History, move |c| {
             let repo = repo.with_timeout(timeout).with_cancel(c.cancel.clone());
-            let res = repo.file_history(&p, Some((line, line)), 50).map_err(|e| e.to_string());
-            c.finish(Msg::History { path: p, line, res });
+            let res = repo.line_history(&p, (line, end.max(line)), 50).map_err(|e| e.to_string());
+            c.finish(Msg::History { path: p, line, end, res });
         });
     }
 
@@ -1274,8 +1371,9 @@ impl App {
                     Err(e) => Loadable::Failed(e),
                 };
             }
-            Msg::History { path, line, res } => {
-                if self.history.path == path && self.history.line == line {
+            Msg::TtBlame { sha, path, res } => self.tt_loaded(sha, path, res),
+            Msg::History { path, line, end, res } => {
+                if self.history.path == path && self.history.line == line && self.history.end == end {
                     self.history.data = match res {
                         Ok(v) => Loadable::Ready(v),
                         Err(e) => Loadable::Failed(e),

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>CodeTrail</title>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#14161c"/>
+  <rect x="8.5" y="8.5" width="239" height="239" rx="55.5" fill="none" stroke="#2a2e38"/>
+  <!-- a trail of commits: main line with a side branch that merges back -->
+  <g fill="none" stroke="#5b8def" stroke-width="14" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M88 56 V200"/>
+    <path d="M88 96 C88 140 168 120 168 164"/>
+  </g>
+  <g fill="#14161c" stroke="#5b8def" stroke-width="14">
+    <circle cx="88" cy="56" r="20"/>
+    <circle cx="88" cy="200" r="20"/>
+    <circle cx="168" cy="164" r="20"/>
+  </g>
+  <circle cx="88" cy="128" r="11" fill="#5b8def"/>
+</svg>

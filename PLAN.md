@@ -1,3 +1,5 @@
+> **Status:** original v1 plan (Korean), kept as design notes. It is not updated with the implementation; where it differs from the code, the code and [README.md](README.md) are authoritative (e.g. background Runs and the Pi/Claude/Codex accounts were added after this plan).
+
 # codetrail — 계획서 (v1)
 
 경량 commit-diff 뷰어 + AI 변경 이유 추적. VS Code 대체(diff/검색/간단 편집 한정).

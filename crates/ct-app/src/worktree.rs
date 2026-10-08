@@ -214,6 +214,12 @@ fn read_untracked(root: &Path, rel: &str) -> (FileKind, Vec<String>, bool, bool)
     (FileKind::Text, lines, no_nl, true)
 }
 
+/// Text lines of a working-tree file (None for binary / unreadable / oversized files).
+pub fn plain_lines(root: &Path, rel: &str) -> Option<Vec<String>> {
+    let (kind, lines, _, ok) = read_untracked(root, rel);
+    (kind == FileKind::Text && ok).then_some(lines)
+}
+
 pub fn untracked_stat(root: &Path, rel: &str) -> FileStat {
     let (kind, lines, _, _) = read_untracked(root, rel);
     FileStat { path: rel.to_string(), old_path: None, status: Status::Added, similarity: None, add: lines.len() as u32, del: 0, binary: kind == FileKind::Binary, kind, old_mode: None, new_mode: Some(0o100644) }

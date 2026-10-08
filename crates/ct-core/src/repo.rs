@@ -265,6 +265,53 @@ impl Repo {
         Ok(out)
     }
 
+    /// Like `file_history(path, Some(range), limit)` but also reports, per commit, the path and
+    /// the line range the tracked lines occupy in that commit (taken from the `+c,d` side of the
+    /// `git log -L` hunk headers; several hunks are merged into their union).
+    pub fn line_history(&self, path: &str, range: (u32, u32), limit: usize) -> Result<Vec<LineRev>> {
+        let (s, e) = range;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        if s == 0 || e < s {
+            return Err(Error::Invalid(format!("invalid line range {s}-{e}")));
+        }
+        let args: Vec<String> = vec![
+            "--literal-pathspecs".into(),
+            "log".into(),
+            LOG_FORMAT.into(),
+            "--no-color".into(),
+            "--no-ext-diff".into(),
+            "--no-textconv".into(),
+            format!("--max-count={limit}"),
+            format!("-L{s},{e}:{path}"),
+        ];
+        let v: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut out: Vec<LineRev> = Vec::new();
+        git::run_lines(&self.root, &v, &self.opts, |line| {
+            if let Some(c) = parse_commit_line(line) {
+                if out.len() >= limit {
+                    return false;
+                }
+                out.push(LineRev { commit: c, path: path.to_string(), lines: None });
+            } else if let Some(cur) = out.last_mut() {
+                let l = String::from_utf8_lossy(line);
+                if let Some(p) = l.strip_prefix("+++ b/") {
+                    cur.path = p.trim_end_matches(['\t', '\r']).to_string();
+                } else if l.starts_with("@@ ") {
+                    if let Some((a, b)) = parse_new_range(&l) {
+                        cur.lines = Some(match cur.lines {
+                            Some((x, y)) => (x.min(a), y.max(b)),
+                            None => (a, b),
+                        });
+                    }
+                }
+            }
+            true
+        })?;
+        Ok(out)
+    }
+
     // ───────────────────────────────── diff ──────────────────────────────────
 
     /// Parents of a commit, in order.
@@ -511,6 +558,15 @@ fn parse_blame(buf: &[u8]) -> Vec<BlameLine> {
         }
     }
     out
+}
+
+/// `@@ -a,b +c,d @@` -> inclusive new range (`c..c+d-1`); a zero-length range yields `None`.
+fn parse_new_range(h: &str) -> Option<(u32, u32)> {
+    let plus = h.split_whitespace().find(|t| t.starts_with('+'))?;
+    let mut it = plus[1..].splitn(2, ',');
+    let start: u32 = it.next()?.parse().ok()?;
+    let len: u32 = it.next().map_or(Some(1), |n| n.parse().ok())?;
+    (len > 0 && start > 0).then(|| (start, start + len - 1))
 }
 
 fn parse_commit_line(line: &[u8]) -> Option<CommitMeta> {

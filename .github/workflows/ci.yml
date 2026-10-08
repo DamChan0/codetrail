@@ -1,0 +1,28 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System packages (build + test)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends git
+      - name: Test
+        run: |
+          git config --global user.name ci && git config --global user.email ci@example.invalid
+          cargo test --workspace --locked
+  # clippy -D warnings is intentionally not enforced: the tree currently has style warnings
+  # (e.g. clippy::type_complexity in ct-agentd, unused items in ct-app). Re-enable once clean.
