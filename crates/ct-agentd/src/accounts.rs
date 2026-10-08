@@ -53,7 +53,7 @@ fn auth_tool(cfg: &Config, args: &[&str]) -> std::result::Result<ToolStatus, Str
     }
     let mut argv: Vec<OsString> = vec![script.into_os_string()];
     argv.extend(args.iter().map(OsString::from));
-    let spec = Spec { program: node, args: argv, cwd: Some(cfg.agent_dir()), env: proc::whitelist_env(&[], &[]) };
+    let spec = Spec { program: node, args: argv, cwd: Some(cfg.agent_dir()), env: proc::whitelist_env(&[], &[]), ceiling: None };
     let cap = proc::run_capture(spec, cfg.status_timeout).map_err(|_| "cannot run auth tool".to_string())?;
     if cap.timed_out || cap.code != Some(0) {
         return Err("auth tool failed".into());
@@ -107,6 +107,7 @@ fn status_spec(program: &Path, args: &[&str], backend_vars: &[&str]) -> Spec {
         args: args.iter().map(OsString::from).collect(),
         cwd: Some(std::env::temp_dir()),
         env: proc::whitelist_env(backend_vars, &[]),
+        ceiling: None, // run_capture enforces its own timeout
     }
 }
 
@@ -235,6 +236,7 @@ pub(crate) fn login_start(cfg: &Config, id: &str) -> Result<LoginHandle> {
         args: vec![helper.into_os_string(), id.into(), cfg.auth_json().into_os_string()],
         cwd: Some(cfg.agent_dir()),
         env,
+        ceiling: Some(cfg.login_ceiling),
     })
     .map_err(|e| Error::Other(format!("cannot start login helper: {e}")))?;
 

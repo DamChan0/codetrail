@@ -3,9 +3,12 @@
 //! added files, and computes the cheap live summary shown in the Commits rail and the header.
 
 use ct_core::{Comparison, DiffFile, DiffLine, DiffOpts, DiffSet, FileKind, FileStat, Hunk, LineKind, Repo, Status, Treeish};
+use crate::proc::run_bounded;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 /// Largest untracked file whose lines are listed; bigger ones are shown as added without a body.
 const MAX_UNTRACKED_BYTES: u64 = 2 * 1024 * 1024;
@@ -38,12 +41,38 @@ pub fn is_worktree(c: &Comparison) -> bool {
     c.new == Treeish::Worktree
 }
 
-pub fn untracked(root: &Path) -> Result<Vec<String>, String> {
-    let out = Command::new("git").arg("-C").arg(root).args(["ls-files", "--others", "--exclude-standard", "-z"]).output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+const GIT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// `git -C root --no-optional-locks <args>`: never takes the index lock, bounded in time.
+fn git(root: &Path, args: &[&str], cancel: Option<&AtomicBool>) -> Result<Vec<u8>, String> {
+    let mut c = Command::new("git");
+    c.arg("-C").arg(root).arg("--no-optional-locks").args(args);
+    let o = run_bounded(c, GIT_TIMEOUT, cancel)?;
+    if !o.ok {
+        return Err(o.stderr.trim().to_string());
     }
-    Ok(out.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect())
+    Ok(o.stdout)
+}
+
+pub fn untracked(root: &Path) -> Result<Vec<String>, String> {
+    let out = git(root, &["ls-files", "--others", "--exclude-standard", "-z"], None)?;
+    Ok(out.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect())
+}
+
+/// Cheap change signature: one `git status` plus size/mtime of every listed file. No diff work.
+fn status_sig(root: &Path, head: &str, cancel: Option<&AtomicBool>) -> Result<u64, String> {
+    let out = git(root, &["status", "--porcelain=v1", "-z", "-uall", "--no-renames"], cancel)?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    head.hash(&mut h);
+    for e in out.split(|b| *b == 0).filter(|s| s.len() > 3) {
+        e.hash(&mut h);
+        let path = String::from_utf8_lossy(&e[3..]).into_owned();
+        if let Ok(m) = std::fs::metadata(root.join(&path)) {
+            m.len().hash(&mut h);
+            m.modified().ok().hash(&mut h);
+        }
+    }
+    Ok(h.finish())
 }
 
 fn read_untracked(root: &Path, rel: &str) -> (FileKind, Vec<String>, bool, bool) {
@@ -126,7 +155,12 @@ fn untracked_file(root: &Path, rel: &str) -> DiffFile {
 }
 
 /// Live summary of everything uncommitted: staged + unstaged vs HEAD, plus untracked files.
-pub fn summary(repo: &Repo, head: &str) -> Result<Summary, String> {
+/// The numstat/diff work only runs when the cheap signature differs from `prev`.
+pub fn summary(repo: &Repo, head: &str, prev: Option<&Summary>, cancel: Option<&AtomicBool>) -> Result<Summary, String> {
+    let sig = status_sig(&repo.root, head, cancel)?;
+    if let Some(p) = prev.filter(|p| p.sig == sig) {
+        return Ok(p.clone());
+    }
     let mut set = if head.is_empty() {
         DiffSet::default()
     } else {
@@ -135,20 +169,12 @@ pub fn summary(repo: &Repo, head: &str) -> Result<Summary, String> {
     };
     let tracked = set.files.len();
     add_untracked(repo, &mut set)?;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for f in &set.files {
-        (&f.path, f.status.letter(), f.add, f.del).hash(&mut h);
-        if let Ok(m) = std::fs::metadata(repo.root.join(&f.path)) {
-            m.len().hash(&mut h);
-            m.modified().ok().hash(&mut h);
-        }
-    }
     Ok(Summary {
         files: set.files.len(),
         add: set.files.iter().map(|f| f.add).sum(),
         del: set.files.iter().map(|f| f.del).sum(),
         untracked: set.files.len() - tracked,
-        sig: h.finish(),
+        sig,
     })
 }
 
@@ -211,12 +237,12 @@ mod tests {
     #[test]
     fn summary_counts_everything_and_signature_tracks_content() {
         let (d, repo, head) = dirty_repo();
-        let s = summary(&repo, &head).unwrap();
+        let s = summary(&repo, &head, None, None).unwrap();
         assert_eq!((s.files, s.add, s.del, s.untracked), (4, 5, 1, 1));
         assert_eq!(s.text(), "4 files +5 −1");
-        assert_eq!(summary(&repo, &head).unwrap(), s, "stable while nothing changes");
+        assert_eq!(summary(&repo, &head, None, None).unwrap(), s, "stable while nothing changes");
         std::fs::write(d.path().join("n"), "new1\nnew2\nnew3 longer\n").unwrap();
-        assert_ne!(summary(&repo, &head).unwrap().sig, s.sig);
+        assert_ne!(summary(&repo, &head, None, None).unwrap().sig, s.sig);
     }
 
     #[test]
@@ -227,7 +253,7 @@ mod tests {
         git(d.path(), &["add", "."]);
         git(d.path(), &["commit", "-q", "-m", "i"]);
         let repo = Repo::open(d.path()).unwrap();
-        let s = summary(&repo, &repo.head().unwrap()).unwrap();
+        let s = summary(&repo, &repo.head().unwrap(), None, None).unwrap();
         assert!(!s.dirty());
         assert_eq!(s.text(), "clean");
     }

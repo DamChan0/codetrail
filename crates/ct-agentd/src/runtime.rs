@@ -63,7 +63,7 @@ pub(crate) fn setup(cfg: &Config, progress: &dyn Fn(&str)) -> Result<()> {
     let args: Vec<OsString> = ["ci", "--no-audit", "--no-fund", "--loglevel=error"].map(OsString::from).into();
     let mut env = proc::whitelist_env(&["npm_config_registry", "NPM_CONFIG_REGISTRY", "npm_config_cache", "NPM_CONFIG_CACHE"], &[]);
     proc::set_env(&mut env, "npm_config_update_notifier", "false");
-    let sp = proc::spawn(Spec { program: cfg.npm_bin.clone(), args, cwd: Some(dir.clone()), env }).map_err(|e| {
+    let sp = proc::spawn(Spec { program: cfg.npm_bin.clone(), args, cwd: Some(dir.clone()), env, ceiling: Some(cfg.install_ceiling) }).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             Error::Other("npm is required to install the agent runtime but was not found on PATH".into())
         } else {

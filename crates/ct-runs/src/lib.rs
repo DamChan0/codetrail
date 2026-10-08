@@ -8,6 +8,7 @@ mod gitrun;
 mod persist;
 mod proc;
 mod reasons;
+mod resources;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -24,6 +25,7 @@ use persist::{EventLog, Stored};
 
 pub use proc::process_start_time;
 pub use reasons::mask_secrets;
+pub use resources::{Limits, Resource};
 
 pub type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 
@@ -107,11 +109,19 @@ pub struct Timings {
     /// Pause between the artifact commit and the terminal state (test knob: widens the window in
     /// which an `abort()` still wins over a Settled that was already seen).
     pub finalize_delay: Duration,
+    /// Resource sampler period.
+    pub sample_interval: Duration,
 }
 
 impl Default for Timings {
     fn default() -> Self {
-        Timings { abort_grace: Duration::from_secs(5), term_grace: Duration::from_secs(3), tick: Duration::from_millis(25), finalize_delay: Duration::ZERO }
+        Timings {
+            abort_grace: Duration::from_secs(5),
+            term_grace: Duration::from_secs(3),
+            tick: Duration::from_millis(25),
+            finalize_delay: Duration::ZERO,
+            sample_interval: Duration::from_secs(2),
+        }
     }
 }
 
@@ -142,6 +152,8 @@ struct Entry {
     abort_req: bool,
     /// the terminal state is being written; `abort()` is refused from here on
     finalising: bool,
+    /// resource-limit reason; turns the abort into `Failed(reason)`
+    limit: Option<String>,
 }
 
 struct State {
@@ -152,6 +164,8 @@ struct State {
     running: usize,
     max: usize,
     shutting_down: bool,
+    /// the single sampler thread is running (only while `running > 0`)
+    sampler_active: bool,
 }
 
 struct Inner {
@@ -162,6 +176,10 @@ struct Inner {
     subs: Mutex<Vec<Sender<RunUpdate>>>,
     /// apply / discard are serialized (they mutate the user's repo)
     exclusive: Mutex<()>,
+    limits: Mutex<Limits>,
+    max_total_rss_mb: std::sync::atomic::AtomicU64,
+    /// latest sample per running run
+    res: Mutex<HashMap<String, Resource>>,
 }
 
 #[derive(Clone)]
@@ -190,15 +208,18 @@ impl RunManager {
                 queue.push_back(s.id.clone());
             }
             order.push(s.id.clone());
-            runs.insert(s.id.clone(), Entry { stored: s, ctl: None, thread: None, abort_req: false, finalising: false });
+            runs.insert(s.id.clone(), Entry { stored: s, ctl: None, thread: None, abort_req: false, finalising: false, limit: None });
         }
         let inner = Arc::new(Inner {
             data,
             factory,
             timings,
-            st: Mutex::new(State { runs, order, queue, running: 0, max: max_concurrent.max(1), shutting_down: false }),
+            st: Mutex::new(State { runs, order, queue, running: 0, max: max_concurrent.max(1), shutting_down: false, sampler_active: false }),
             subs: Mutex::new(Vec::new()),
             exclusive: Mutex::new(()),
+            limits: Mutex::new(Limits::default()),
+            max_total_rss_mb: std::sync::atomic::AtomicU64::new(resources::DEFAULT_MAX_TOTAL_RSS_MB),
+            res: Mutex::new(HashMap::new()),
         });
         pump(&inner);
         Ok(RunManager { inner })
@@ -229,7 +250,7 @@ impl RunManager {
             persist::save(&self.inner.data, &stored)?;
             st.order.push(id.clone());
             st.queue.push_back(id.clone());
-            st.runs.insert(id.clone(), Entry { stored: stored.clone(), ctl: None, thread: None, abort_req: false, finalising: false });
+            st.runs.insert(id.clone(), Entry { stored: stored.clone(), ctl: None, thread: None, abort_req: false, finalising: false, limit: None });
         }
         self.inner.emit_state(stored.info());
         pump(&self.inner);
@@ -263,6 +284,28 @@ impl RunManager {
             }
             _ => Err(anyhow!("run {id} is not active")),
         }
+    }
+
+    /// Resource totals (process group) of every running run, as of the last sample (≤ 2 s old).
+    pub fn resources(&self) -> Vec<(String, Resource)> {
+        let mut v: Vec<_> = self.inner.res.lock().iter().map(|(k, r)| (k.clone(), *r)).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    /// Limits applied to every run (also already running ones).
+    pub fn set_limits(&self, l: Limits) {
+        *self.inner.limits.lock() = l;
+    }
+
+    pub fn limits(&self) -> Limits {
+        *self.inner.limits.lock()
+    }
+
+    /// Global RSS budget over all running runs (0 = unlimited); new runs stay Queued while exceeded.
+    pub fn set_max_total_rss_mb(&self, mb: u64) {
+        self.inner.max_total_rss_mb.store(mb, std::sync::atomic::Ordering::Relaxed);
+        pump(&self.inner);
     }
 
     pub fn steer(&self, id: &str, text: &str) -> Result<()> {
@@ -475,12 +518,19 @@ impl Inner {
 /// Starts queued runs while below the concurrency limit.
 fn pump(inner: &Arc<Inner>) {
     let mut started: Vec<(String, Receiver<Cmd>, RunInfo)> = Vec::new();
+    let mut spawn_sampler = false;
     {
         let mut st = inner.st.lock();
         if st.shutting_down {
             return;
         }
+        let budget_kb = inner.max_total_rss_mb.load(std::sync::atomic::Ordering::Relaxed).saturating_mul(1024);
         while st.running < st.max {
+            // global budget: while the running runs already use too much, new ones stay Queued
+            // (with nothing running they always start, so the queue cannot deadlock)
+            if st.running > 0 && budget_kb > 0 && inner.res.lock().values().map(|r| r.rss_kb).sum::<u64>() > budget_kb {
+                break;
+            }
             let Some(id) = st.queue.pop_front() else { break };
             let Some(e) = st.runs.get_mut(&id) else { continue };
             if e.stored.state != "queued" {
@@ -494,6 +544,16 @@ fn pump(inner: &Arc<Inner>) {
             let info = e.stored.info();
             st.running += 1;
             started.push((id, rx, info));
+        }
+        if st.running > 0 && !st.sampler_active {
+            st.sampler_active = true;
+            spawn_sampler = true;
+        }
+    }
+    if spawn_sampler {
+        let i2 = inner.clone();
+        if std::thread::Builder::new().name("run-sampler".into()).spawn(move || sampler(i2)).is_err() {
+            inner.st.lock().sampler_active = false;
         }
     }
     for (id, rx, info) in started {
@@ -526,7 +586,10 @@ fn finish(inner: &Arc<Inner>, id: &str, state: RunState, extra: Option<Box<dyn F
             Some(e) => {
                 e.finalising = true;
                 if e.abort_req {
-                    RunState::Aborted
+                    match e.limit.take() {
+                        Some(l) => RunState::Failed(l),
+                        None => RunState::Aborted,
+                    }
                 } else {
                     state
                 }
@@ -550,6 +613,7 @@ fn finish(inner: &Arc<Inner>, id: &str, state: RunState, extra: Option<Box<dyn F
         }
         st.running = st.running.saturating_sub(1);
     }
+    inner.res.lock().remove(id);
     pump(inner);
 }
 
@@ -804,6 +868,66 @@ fn event_loop(
             }
         }
     }
+}
+
+/// The only sampler thread: alive while at least one run is running. Reads each run's process
+/// group from `/proc`, publishes [`Resource`]s, enforces [`Limits`], and re-runs the queue (the
+/// global RSS budget may have freed up).
+fn sampler(inner: Arc<Inner>) {
+    let mut tracks: HashMap<String, resources::Track> = HashMap::new();
+    let mut last = Instant::now();
+    loop {
+        std::thread::sleep(inner.timings.sample_interval);
+        let dt = last.elapsed().as_secs_f64();
+        last = Instant::now();
+        let live: Vec<(String, u32, Option<u64>, i64)> = {
+            let mut st = inner.st.lock();
+            if st.running == 0 {
+                st.sampler_active = false;
+                drop(st);
+                inner.res.lock().clear();
+                return;
+            }
+            st.runs
+                .iter()
+                .filter(|(_, e)| e.stored.state == "running" && !e.finalising)
+                .filter_map(|(id, e)| Some((id.clone(), e.stored.pid?, e.stored.pid_start, e.stored.started_ms)))
+                .collect()
+        };
+        let limits = *inner.limits.lock();
+        let now = ct_store::now_ms();
+        let mut seen = Vec::with_capacity(live.len());
+        for (id, pid, start, started_ms) in live {
+            let usage = resources::group_usage(pid, start);
+            let (res, reason) = tracks.entry(id.clone()).or_default().sample(&limits, usage, dt, now.saturating_sub(started_ms).max(0) as u64);
+            inner.res.lock().insert(id.clone(), res);
+            if let Some(r) = reason {
+                limit_abort(&inner, &id, r);
+            }
+            seen.push(id);
+        }
+        tracks.retain(|id, _| seen.contains(id));
+        inner.res.lock().retain(|id, _| seen.contains(id));
+        pump(&inner);
+    }
+}
+
+/// Stops a run that broke a resource limit through the normal staged abort; `finish` reports it
+/// as Failed with the reason.
+fn limit_abort(inner: &Arc<Inner>, id: &str, reason: String) {
+    let ctl = {
+        let mut st = inner.st.lock();
+        let Some(e) = st.runs.get_mut(id) else { return };
+        if e.stored.state != "running" || e.finalising || e.abort_req {
+            return;
+        }
+        let Some(ctl) = e.ctl.clone() else { return };
+        e.limit = Some(reason.clone());
+        e.abort_req = true;
+        ctl
+    };
+    inner.log_error(id, &reason);
+    let _ = ctl.send(Cmd::Abort);
 }
 
 /// SIGTERM → grace → SIGKILL of the session's group and any survivors of a dead leader.

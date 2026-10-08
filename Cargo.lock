@@ -477,6 +477,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ct-store",
+ "libc",
  "postcard",
  "regex",
  "serde",
@@ -528,6 +529,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "libc",
  "nucleo-matcher",
  "parking_lot",
  "rayon",

@@ -106,18 +106,17 @@ fn open_url(url: &str) {
         return;
     }
     let url = url.to_string();
-    let _ = std::thread::Builder::new().name("ct-open-url".into()).spawn(move || {
-        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-        let _ = std::process::Command::new(opener).arg(&url).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-    });
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let mut c = std::process::Command::new(opener);
+    c.arg(&url);
+    crate::proc::spawn_reaped("ct-open-url", c, std::time::Duration::from_secs(15));
 }
 
 /// Desktop notification through `notify-send` when present; silently nothing otherwise.
 fn notify(title: &str, body: &str) {
-    let (t, b) = (title.to_string(), body.to_string());
-    let _ = std::thread::Builder::new().name("ct-notify".into()).spawn(move || {
-        let _ = std::process::Command::new("notify-send").args(["-a", "codetrail", "--", &t, &b]).stdin(std::process::Stdio::null()).status();
-    });
+    let mut c = std::process::Command::new("notify-send");
+    c.args(["-a", "codetrail", "--", title, body]);
+    crate::proc::spawn_reaped("ct-notify", c, std::time::Duration::from_secs(10));
 }
 
 impl App {

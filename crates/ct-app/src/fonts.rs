@@ -93,9 +93,22 @@ pub fn discover() -> FontChoice {
     choose(&files)
 }
 
+/// Font files read so far. Each is leaked once and handed to egui as borrowed data: egui copies
+/// owned font bytes again when parsing them, and the same CJK file is often both the UI and the
+/// fallback face (a 19 MB file was resident three times).
+fn font_bytes(path: &std::path::Path) -> Option<&'static [u8]> {
+    static CACHE: parking_lot::Mutex<Vec<(PathBuf, &'static [u8])>> = parking_lot::Mutex::new(Vec::new());
+    let mut c = CACHE.lock();
+    if let Some((_, b)) = c.iter().find(|(p, _)| p == path) {
+        return Some(b);
+    }
+    let bytes: &'static [u8] = Box::leak(std::fs::read(path).ok()?.into_boxed_slice());
+    c.push((path.to_path_buf(), bytes));
+    Some(bytes)
+}
+
 fn load(f: &FoundFont) -> Option<FontData> {
-    let bytes = std::fs::read(&f.path).ok()?;
-    let mut d = FontData::from_owned(bytes);
+    let mut d = FontData::from_static(font_bytes(&f.path)?);
     d.index = f.index;
     Some(d)
 }

@@ -311,3 +311,37 @@ fn long_lived_store_sees_other_process_append() {
     app.export_json(&mut b).unwrap();
     assert_eq!(a, b);
 }
+
+#[test]
+fn resync_across_read_chunks_and_big_garbage_keeps_every_good_frame() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(d.path()).unwrap();
+    for i in 0..300 {
+        s.append(&rec("a.rs", i, None, &["l"], 1)).unwrap();
+    }
+    let log = s.log_path().to_path_buf();
+    let before = fs::read(&log).unwrap();
+    let mid = before.len() / 2;
+    // 200 KB of garbage (> several read chunks) incl. a fake magic prefix split at odd offsets
+    let mut junk = vec![0xAAu8; 200_000];
+    junk[99_999..100_003].copy_from_slice(b"CTF1");
+    junk[100_003..100_007].copy_from_slice(&u32::MAX.to_le_bytes()); // absurd length: must be rejected
+    // land on a frame boundary so only the junk is lost
+    let boundary = {
+        let mut p = 6usize;
+        while p < mid {
+            let len = u32::from_le_bytes(before[p + 4..p + 8].try_into().unwrap()) as usize;
+            p += 20 + len;
+        }
+        p
+    };
+    let mut spliced = before[..boundary].to_vec();
+    spliced.extend_from_slice(&junk);
+    spliced.extend_from_slice(&before[boundary..]);
+    fs::write(&log, &spliced).unwrap();
+    let _ = fs::remove_file(d.path().join("codetrail/index.ct"));
+    let s = Store::open(d.path()).unwrap();
+    assert_eq!(s.stats().records, 300);
+    assert_eq!(s.for_path("a.rs").len(), 300);
+    assert!(s.stats().skipped_frames >= 1);
+}

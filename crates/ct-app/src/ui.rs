@@ -53,9 +53,10 @@ impl eframe::App for App {
         self.shortcuts(ctx);
         self.debounce(ctx);
         self.wt_tick(ctx);
+        self.res_tick(ctx);
         if self.editor.is_some() && self.centre == Centre::Editor {
             self.check_editor_disk();
-            ctx.request_repaint_after(Duration::from_millis(1000));
+            widgets::repaint_if_focused(ctx, Duration::from_millis(1000));
         }
         if let Some(t) = self.settings_dirty_at {
             if t.elapsed() > Duration::from_millis(400) {
@@ -216,6 +217,7 @@ impl App {
             }
             Cmd::ToggleInspector => self.insp_open = !self.insp_open,
             Cmd::Refresh => {
+                self.request_status();
                 self.request_log(false);
                 self.request_diff();
                 self.request_files();
@@ -377,6 +379,7 @@ impl App {
                     }
                 }
                 ui.label(RichText::new(self.fonts_note.clone()).font(f.clone()).color(th.muted()));
+                self.resource_label(ui, &th, f.clone());
             });
         });
     }
@@ -443,8 +446,8 @@ impl App {
         let bot = egui::Rect::from_min_max(pos2(rect.min.x, rect.min.y + 22.0), pos2(rect.max.x, rect.max.y - 2.0));
         widgets::paint_text_fit(ui, top, "Working tree changes", widgets::ui_font(&th), th.fg());
         let (sum, col) = match &self.wt.summary {
-            Some(s) if s.dirty() => (format!("{}{}", s.text(), if s.untracked > 0 { format!(" · {} new", s.untracked) } else { String::new() }), th.warn()),
-            Some(s) => (s.text(), th.muted()),
+            Some(s) if s.dirty() => (format!("{}{}{}", s.text(), if s.untracked > 0 { format!(" · {} new", s.untracked) } else { String::new() }, if self.wt.paused { " · paused" } else { "" }), th.warn()),
+            Some(s) => (format!("{}{}", s.text(), if self.wt.paused { " · paused" } else { "" }), th.muted()),
             None => ("checking…".to_string(), th.muted()),
         };
         widgets::paint_text_fit(ui, bot, &sum, widgets::small_font(&th), col);

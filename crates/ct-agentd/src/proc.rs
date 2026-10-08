@@ -37,6 +37,9 @@ pub(crate) struct Spec {
     pub cwd: Option<PathBuf>,
     /// The complete child environment (the parent's is never inherited).
     pub env: Vec<(String, String)>,
+    /// Hard wall-clock ceiling: the whole process group is terminated (SIGTERM, then SIGKILL) when it
+    /// elapses. `None` = the owner of the handle is responsible (it kills on drop/close).
+    pub ceiling: Option<Duration>,
 }
 
 /// Variables forwarded to every child (besides `LC_*`, backend-specific vars and caller `env_allow`).
@@ -47,6 +50,7 @@ pub(crate) struct Spec {
 ///   they are the user's own network config and are accepted knowingly (decision t013).
 /// * `XDG_*`: relocate where claude/codex keep their login state, so they stay logged in.
 /// * `USER`, `LOGNAME`, `SHELL`, `TERM`, `TMPDIR`, `TZ`, `LANGUAGE`: tool basics (shell tool, temp files).
+///
 /// No provider API keys or tokens are forwarded unless the caller lists them in `env_allow`.
 const PASS_THROUGH: &[&str] = &[
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TMPDIR", "TZ", "XDG_CONFIG_HOME",
@@ -77,7 +81,23 @@ pub(crate) fn set_env(env: &mut Vec<(String, String)>, k: &str, v: impl Into<Str
     env.push((k.to_string(), v.into()));
 }
 
-fn spawn_in_thread(spec: Spec) -> io::Result<Spawned> {
+/// Spawn-depth guard: every child carries `CT_AGENTD_DEPTH`; a process that was itself started by us
+/// (e.g. a PATH shim that re-enters codetrail) refuses to fan out past this depth, so a recursive
+/// PATH entry can never multiply processes.
+pub(crate) const DEPTH_VAR: &str = "CT_AGENTD_DEPTH";
+const MAX_DEPTH: u32 = 3;
+
+fn check_depth(v: Option<&str>) -> io::Result<u32> {
+    let depth: u32 = v.and_then(|v| v.parse().ok()).unwrap_or(0);
+    if depth >= MAX_DEPTH {
+        return Err(io::Error::other(format!("refusing to spawn: nested agent depth {depth} (recursive PATH?)")));
+    }
+    Ok(depth)
+}
+
+fn spawn_in_thread(mut spec: Spec) -> io::Result<Spawned> {
+    let depth = check_depth(std::env::var(DEPTH_VAR).ok().as_deref())?;
+    set_env(&mut spec.env, DEPTH_VAR, (depth + 1).to_string());
     let (tx, rx) = mpsc::channel::<io::Result<Spawned>>();
     // The child's PDEATHSIG fires when the *thread* that forked it exits, so the thread that
     // spawns also waits for the child: it outlives it by construction.
@@ -124,6 +144,15 @@ fn spawn_in_thread(spec: Spec) -> io::Result<Spawned> {
             }
         };
         let host = Host(shared.clone());
+        if let Some(c) = spec.ceiling {
+            // blocks on the exit condvar: no polling, ends as soon as the child is gone
+            let h = host.clone();
+            let _ = std::thread::Builder::new().name("ct-agentd-ceiling".into()).spawn(move || {
+                if h.wait_exit(c).is_none() {
+                    h.terminate(Duration::from_secs(2));
+                }
+            });
+        }
         if tx.send(Ok(Spawned { host, stdin, stdout, stderr })).is_err() {
             // caller vanished: no one will manage this child
             kill_group(pid, libc::SIGKILL);
@@ -231,4 +260,17 @@ pub(crate) fn run_capture(spec: Spec, timeout: Duration) -> io::Result<Captured>
     let stdout = t_out.join().unwrap_or_default();
     let stderr = crate::util::lossy_masked(&t_err.join().unwrap_or_default());
     Ok(Captured { code, stdout, stderr, timed_out })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_depth;
+
+    #[test]
+    fn depth_guard_stops_nested_spawns() {
+        assert_eq!(check_depth(None).unwrap(), 0);
+        assert_eq!(check_depth(Some("2")).unwrap(), 2);
+        assert!(check_depth(Some("3")).unwrap_err().to_string().contains("nested agent depth"));
+        assert_eq!(check_depth(Some("junk")).unwrap(), 0);
+    }
 }

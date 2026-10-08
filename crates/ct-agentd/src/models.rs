@@ -46,6 +46,7 @@ fn codex_models(cfg: &Config) -> Vec<ModelInfo> {
         args: vec!["debug".into(), "models".into()],
         cwd: Some(std::env::temp_dir()),
         env: proc::whitelist_env(&["CODEX_HOME"], &[]),
+        ceiling: None,
     };
     let Ok(cap) = proc::run_capture(spec, cfg.status_timeout) else { return codex_fallback() };
     if cap.timed_out || cap.code != Some(0) {

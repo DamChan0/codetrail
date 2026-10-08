@@ -56,3 +56,27 @@ impl T {
 pub fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap()
 }
+
+/// Orphan audit: no process may outlive the test with a cwd inside its temp dir.
+impl Drop for T {
+    fn drop(&mut self) {
+        let root = self.dir.path().canonicalize().unwrap_or_else(|_| self.dir.path().to_path_buf());
+        let me = std::process::id();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut left = Vec::new();
+            for e in std::fs::read_dir("/proc").unwrap().flatten() {
+                let Some(p) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+                let alive = std::fs::read_to_string(format!("/proc/{p}/stat")).is_ok_and(|s| !s[s.rfind(')').unwrap_or(0)..].starts_with(") Z"));
+                if p != me && alive && std::fs::read_link(format!("/proc/{p}/cwd")).is_ok_and(|c| c.starts_with(&root)) {
+                    left.push(p);
+                }
+            }
+            if left.is_empty() || std::thread::panicking() {
+                return;
+            }
+            assert!(std::time::Instant::now() < end, "orphan processes left by test: {left:?}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}

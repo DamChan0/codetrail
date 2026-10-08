@@ -404,7 +404,7 @@ impl AgentSession for OneShotSession {
         };
         let args = build_args(self.kind, &self.opts, &self.model)?;
         let env = proc::whitelist_env(backend_vars, &self.opts.env_allow);
-        let sp = proc::spawn(Spec { program: program.clone(), args, cwd: Some(self.opts.cwd.clone()), env })
+        let sp = proc::spawn(Spec { program: program.clone(), args, cwd: Some(self.opts.cwd.clone()), env, ceiling: Some(self.cfg.ask_ceiling) })
             .map_err(|e| Error::Other(format!("cannot start {}: {e}", program.display())))?;
 
         // prompt goes through stdin (no argv length limit, no leading-dash ambiguity, not in `ps`)

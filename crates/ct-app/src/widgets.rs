@@ -508,11 +508,19 @@ pub fn empty_state(ui: &mut Ui, th: &Theme, title: &str, hint: &str) {
     });
 }
 
+/// Repaint timer for visible animations/clocks: nothing while the window is unfocused or minimised.
+/// Callers never ask for faster than ~20 fps.
+pub fn repaint_if_focused(ctx: &egui::Context, after: std::time::Duration) {
+    if ctx.input(|i| i.focused) {
+        ctx.request_repaint_after(after.max(std::time::Duration::from_millis(50)));
+    }
+}
+
 /// Loading skeleton: pulsing grey bars (static fallback when repaint is off).
 pub fn skeleton(ui: &mut Ui, th: &Theme, rows: usize, row_h: f32) {
     let t = ui.input(|i| i.time) as f32;
     let a = 0.5 + 0.5 * (t * 3.0).sin();
-    ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
+    repaint_if_focused(ui.ctx(), std::time::Duration::from_millis(60));
     for i in 0..rows {
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::hover());
         let bar_w = rect.width() * (0.45 + 0.4 * (((i * 37) % 11) as f32 / 11.0));

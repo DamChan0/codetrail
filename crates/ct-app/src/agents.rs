@@ -197,7 +197,17 @@ pub struct ApplyOutcome {
     pub message: String,
 }
 
+/// Process-group totals of one run (sampled by the run manager).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Resource {
+    pub rss_kb: u64,
+    pub cpu_pct: f32,
+    pub procs: u32,
+}
+
 pub trait RunService: Send + Sync {
+    /// Per-run resource use; empty when nothing is running.
+    fn resources(&self) -> Vec<(String, Resource)>;
     fn submit(&self, spec: RunSpec) -> Result<String, String>;
     fn abort(&self, id: &str) -> Result<(), String>;
     fn steer(&self, id: &str, text: &str) -> Result<(), String>;

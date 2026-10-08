@@ -39,6 +39,7 @@ pub enum JobKind {
     RunReview,
     Browse,
     Status,
+    Resources,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

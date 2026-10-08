@@ -36,6 +36,11 @@ const EVENT_QUEUE: usize = 1024;
 const MSG_QUEUE: usize = 1024;
 /// Stderr lines kept while the consumer lags; older lines are dropped (and counted).
 const STDERR_RING: usize = 200;
+/// Text held for a consumer that does not read (1 MiB); beyond it text is dropped with a marker.
+const MAX_PENDING_TEXT: usize = 1024 * 1024;
+const TRUNCATION_MARKER: &str = "\n[... output truncated: consumer too slow ...]\n";
+/// Tool calls tracked between start and end events.
+const MAX_TRACKED_TOOLS: usize = 1024;
 /// How often a lagging consumer's queue is retried for coalesced text / stderr.
 const OUTBOX_RETRY: Duration = Duration::from_millis(20);
 
@@ -58,11 +63,12 @@ struct Outbox {
     errs: VecDeque<String>,
     dropped: usize,
     dead: bool,
+    truncated: bool,
 }
 
 impl Outbox {
     fn new(tx: SyncSender<AgentEvent>) -> Self {
-        Outbox { tx, delta: String::new(), errs: VecDeque::new(), dropped: 0, dead: false }
+        Outbox { tx, delta: String::new(), errs: VecDeque::new(), dropped: 0, dead: false, truncated: false }
     }
 
     fn lagging(&self) -> bool {
@@ -73,7 +79,26 @@ impl Outbox {
         if self.dead {
             return;
         }
-        self.delta.push_str(t);
+        if self.delta.len() >= MAX_PENDING_TEXT {
+            // consumer is not reading and the backlog is full: keep memory bounded, say so once
+            if !self.truncated {
+                self.truncated = true;
+                self.delta.push_str(TRUNCATION_MARKER);
+            }
+            return;
+        }
+        let room = MAX_PENDING_TEXT - self.delta.len();
+        if t.len() > room {
+            let mut cut = room;
+            while !t.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.delta.push_str(&t[..cut]);
+            self.truncated = true;
+            self.delta.push_str(TRUNCATION_MARKER);
+        } else {
+            self.delta.push_str(t);
+        }
         self.pump();
     }
 
@@ -96,7 +121,7 @@ impl Outbox {
         }
         if !self.delta.is_empty() {
             match self.tx.try_send(AgentEvent::TextDelta(std::mem::take(&mut self.delta))) {
-                Ok(()) => {}
+                Ok(()) => self.truncated = false,
                 Err(TrySendError::Full(AgentEvent::TextDelta(t))) => {
                     self.delta = t;
                     return;
@@ -138,6 +163,7 @@ impl Outbox {
         let mut batch: Vec<AgentEvent> = Vec::new();
         if !self.delta.is_empty() {
             batch.push(AgentEvent::TextDelta(std::mem::take(&mut self.delta)));
+            self.truncated = false;
         }
         if self.dropped > 0 {
             batch.push(AgentEvent::Stderr(format!("[{} stderr lines dropped]", self.dropped)));
@@ -248,6 +274,9 @@ impl Mapper {
                 let name = str_of(v, "toolName");
                 let args = v.get("args").cloned().unwrap_or(Value::Null);
                 let path = file_path_of(&name, &args);
+                if self.tools.len() >= MAX_TRACKED_TOOLS {
+                    self.tools.clear(); // an end event that never came must not leak entries
+                }
                 self.tools.insert(id.clone(), (name.clone(), path));
                 out.push(AgentEvent::ToolStart { id, name: name.clone(), summary: tool_summary(&name, &args) });
             }
@@ -423,7 +452,7 @@ fn open(cfg: &Config, extra_args: Vec<OsString>, cwd: Option<PathBuf>, env_allow
     proc::set_env(&mut env, "PI_CODING_AGENT_DIR", home.to_string_lossy());
     proc::set_env(&mut env, "PI_SKIP_VERSION_CHECK", "1");
     proc::set_env(&mut env, "PI_TELEMETRY", "0");
-    let sp = proc::spawn(Spec { program: program.clone(), args, cwd, env })
+    let sp = proc::spawn(Spec { program: program.clone(), args, cwd, env, ceiling: None })
         .map_err(|e| Error::Other(format!("cannot start {}: {e}", program.display())))?;
 
     let pending: Arc<Mutex<HashMap<String, Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));

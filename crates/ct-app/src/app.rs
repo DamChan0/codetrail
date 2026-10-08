@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 pub type Ctx = JobCtx<Msg>;
 pub const PAGE: usize = 200;
 pub const MAX_SEARCH_HITS: usize = 5000;
+/// Scrolling loads history in pages; the list stops growing here (use the filter to go further).
+pub const MAX_COMMITS: usize = 20_000;
 
 #[derive(Default)]
 pub enum Loadable<T> {
@@ -184,6 +186,7 @@ pub enum Msg {
     Prompt(Result<agent_ask::Prompt, String>),
     AskChunk(String),
     AskDone(Result<(), String>),
+    Resources { sample: crate::resmon::Sample, runs: Vec<(String, crate::agents::Resource)> },
     Status { token: u64, res: Result<crate::worktree::Summary, String> },
     Browse { token: u64, res: Result<crate::projects::Listing, String> },
     Accounts { accounts: Vec<crate::agents::Account>, runtime: crate::agents::RuntimeStatus },
@@ -357,6 +360,7 @@ pub struct Smoke {
 }
 
 pub struct App {
+    pub res: crate::resmon::ResState,
     pub wt: crate::wtapp::WtState,
     pub pj: crate::projectapp::ProjectState,
     pub ag: crate::agentapp::AgentState,
@@ -438,6 +442,7 @@ impl App {
         let jobs = Jobs::new(move || rc.request_repaint());
         let mut app = App {
             pj: Default::default(),
+            res: Default::default(),
             wt: Default::default(),
             ag: crate::agentapp::AgentState::new(svc),
             th,
@@ -574,7 +579,7 @@ impl App {
                     Ok(s) => (Some(Arc::new(s)), None),
                     Err(e) => (None, Some(e.to_string())),
                 };
-                let dirty = crate::worktree::summary(&repo, &head).ok();
+                let dirty = crate::worktree::summary(&repo, &head, None, None).ok();
                 Ok(Opened { repo, head, head_name, refs, store, store_note, dirty })
             })();
             c.finish(Msg::Opened(res));
@@ -1151,6 +1156,10 @@ impl App {
                         self.commits_done = v.len() < PAGE;
                         if append {
                             self.commits.extend(v);
+                            if self.commits.len() >= MAX_COMMITS {
+                                self.commits.truncate(MAX_COMMITS);
+                                self.commits_done = true;
+                            }
                         } else {
                             self.commits = v;
                         }
@@ -1316,6 +1325,7 @@ impl App {
             }
             Msg::Browse { token, res } => self.pj_handle(token, res),
             Msg::Status { token, res } => self.wt_handle(token, res),
+            Msg::Resources { sample, runs } => self.res_handle(sample, runs),
             other => self.ag_handle(other),
         }
     }

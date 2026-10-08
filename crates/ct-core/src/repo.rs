@@ -73,6 +73,12 @@ impl Repo {
         self
     }
 
+    /// Cap on buffered git stdout (and on a single streamed line); exceeding it → `Error::TooLarge`.
+    pub fn with_max_output(mut self, bytes: usize) -> Repo {
+        self.opts.max_output = bytes;
+        self
+    }
+
     /// Setting the flag kills in-flight git subprocesses of this handle (→ `Error::Cancelled`).
     pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Repo {
         self.opts.cancel = Some(cancel);

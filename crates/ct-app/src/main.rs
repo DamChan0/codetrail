@@ -12,6 +12,8 @@ mod fsutil;
 mod highlight;
 mod jobs;
 mod projectapp;
+mod resmon;
+mod proc;
 mod projects;
 mod worktree;
 mod wtapp;
@@ -27,7 +29,7 @@ mod widgets;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "codetrail [REPO]\n       codetrail <install|hook|note|record|ask|export> ...\n       codetrail --smoke REPO --screenshot OUT.png [--scene commit|split|search|why|light|settings|runs|runs-stream|accounts|model-picker|new-run|project-picker|folder-browser|worktree] [--size WxH] [--query TEXT]";
+const USAGE: &str = "codetrail [REPO]\n       codetrail <install|hook|note|record|ask|export> ...\n       codetrail --smoke REPO --screenshot OUT.png [--scene commit|split|search|why|light|settings|runs|runs-stream|accounts|model-picker|new-run|project-picker|folder-browser|worktree|resources] [--size WxH] [--query TEXT]";
 
 struct Args {
     repo: Option<PathBuf>,
@@ -50,7 +52,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--screenshot" => shot = Some(PathBuf::from(val("--screenshot")?)),
             "--scene" => {
                 scene = val("--scene")?;
-                if !["commit", "split", "search", "why", "light", "settings", "runs", "runs-stream", "accounts", "model-picker", "new-run", "project-picker", "folder-browser", "worktree"].contains(&scene.as_str()) {
+                if !["commit", "split", "search", "why", "light", "settings", "runs", "runs-stream", "accounts", "model-picker", "new-run", "project-picker", "folder-browser", "worktree", "resources"].contains(&scene.as_str()) {
                     return Err(format!("unknown scene {scene:?}"));
                 }
             }

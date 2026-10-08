@@ -184,7 +184,7 @@ impl App {
             self.ag_select_run(&id);
         }
         if self.ag.runs.active() > 0 {
-            ui.ctx().request_repaint_after(Duration::from_secs(1));
+            widgets::repaint_if_focused(ui.ctx(), Duration::from_secs(1));
         }
     }
 
@@ -303,7 +303,7 @@ impl App {
                     self.ag_steer(&info.id, t.trim());
                 }
             });
-            ui.ctx().request_repaint_after(Duration::from_secs(1));
+            widgets::repaint_if_focused(ui.ctx(), Duration::from_secs(1));
         }
     }
 

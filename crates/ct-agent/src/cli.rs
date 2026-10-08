@@ -35,6 +35,13 @@ pub fn dispatch(args: &[String], input: &mut dyn Read, out: &mut dyn Write, err:
         let (kind, event) = (rest.first().map(String::as_str), rest.get(1).map(String::as_str));
         if kind == Some("claude") {
             if let Some(ev) = event {
+                // Last line of defence: whatever blocks (stdin, fs, a stuck child), exit 0 shortly after the
+                // git deadline. Blocks in sleep, no polling.
+                gitx::set_hard_deadline(std::time::Instant::now() + hook::STOP_BUDGET);
+                std::thread::spawn(|| {
+                    std::thread::sleep(hook::STOP_BUDGET + std::time::Duration::from_millis(500));
+                    std::process::exit(0);
+                });
                 let mut s = String::new();
                 let _ = input.read_to_string(&mut s);
                 if let Some(o) = hook::handle_hook(ev, &s) {

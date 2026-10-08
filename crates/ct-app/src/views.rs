@@ -768,7 +768,7 @@ impl App {
                 if let Some(t) = self.ask.started {
                     let left = (self.settings.ask_timeout_secs as i64 - t.elapsed().as_secs() as i64).max(0);
                     ui.label(RichText::new(format!("{}s · times out in {}s", t.elapsed().as_secs(), left)).font(widgets::small_font(&th)).color(th.muted()));
-                    ui.ctx().request_repaint_after(Duration::from_millis(500));
+                    widgets::repaint_if_focused(ui.ctx(), Duration::from_millis(500));
                 }
             }
         });
@@ -921,6 +921,11 @@ impl App {
                 }
                 // Opens on "Working tree changes" by itself when the repo is dirty.
                 "worktree" => {}
+                // Static sample: amber app RAM (>70% of 150 MB) and runs subtotal.
+                "resources" => {
+                    self.res.sample = Some(crate::resmon::Sample { app_rss_kb: 118 * 1024, child_rss_kb: 41 * 1024, children: 2, cpu_pct: 0.4, ticks: 0 });
+                    self.res.runs = vec![("r1".into(), crate::agents::Resource { rss_kb: 1800 * 1024, cpu_pct: 62.0, procs: 5 }), ("r2".into(), crate::agents::Resource { rss_kb: 900 * 1024, cpu_pct: 20.0, procs: 3 })];
+                }
                 "project-picker" => {
                     let now = crate::agentapp::now_ms();
                     let h = crate::projects::home_dir();

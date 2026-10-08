@@ -7,7 +7,7 @@
 //!   - the whole frame is written with ONE `write_all` while holding `flock(LOCK_EX)`; no fsync
 //!     (a crash may lose the newest frames; this is deliberate and documented).
 //! * corrupt frames are skipped by resyncing on the next magic; the skip count is exposed in [`Stats`].
-//! * `index.ct` caches the merged in-memory index keyed by (log length, log mtime, version) and is
+//! * `index.ct` caches the in-memory index (record offsets, not contents; records are read back on demand) keyed by (log length, log mtime, version) and is
 //!   replaced atomically (tmp + rename). A log with a different version is opened read-only.
 //!
 //! The data is LOCAL ONLY: deleting `.git` deletes the log. Use [`Store::export_json`] for backups.
@@ -16,7 +16,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -27,7 +27,7 @@ pub type Oid = String;
 pub const FORMAT_VERSION: u16 = 1;
 const LOG_MAGIC: &[u8; 4] = b"CTLG";
 const FRAME_MAGIC: &[u8; 4] = b"CTF1";
-const IDX_MAGIC: &[u8; 4] = b"CTI2";
+const IDX_MAGIC: &[u8; 4] = b"CTI3";
 const LOG_HEADER_LEN: usize = 6;
 const FRAME_HEADER_LEN: usize = 20;
 pub const MAX_FRAME_LEN: usize = 1 << 20;
@@ -234,29 +234,95 @@ pub fn parse_id(s: &str) -> Option<u128> {
 
 // ---------------------------------------------------------------- scanning
 
-struct Scan {
-    frames: Vec<Frame>,
-    skipped: u64,
-    /// Scan consumed the buffer exactly (no trailing garbage / torn frame).
-    clean: bool,
+/// Sliding window over a log reader: memory is bounded by one frame (<= `MAX_FRAME_LEN`) + one chunk,
+/// never by the log size.
+struct Window<R> {
+    r: R,
+    buf: Vec<u8>,
+    start: usize,
+    /// File offset of `buf[0]`.
+    base: u64,
+    eof: bool,
 }
 
-fn find_magic(buf: &[u8], from: usize) -> Option<usize> {
-    if from >= buf.len() {
-        return None;
+const CHUNK: usize = 64 * 1024;
+
+impl<R: Read> Window<R> {
+    fn new(r: R, base: u64) -> Self {
+        Window { r, buf: Vec::new(), start: 0, base, eof: false }
     }
-    buf[from..].windows(4).position(|w| w == FRAME_MAGIC).map(|p| p + from)
+
+    fn offset(&self) -> u64 {
+        self.base + self.start as u64
+    }
+
+    fn avail(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+
+    /// Ensure at least `n` unread bytes unless EOF; returns whether they are there.
+    fn have(&mut self, n: usize) -> bool {
+        while self.buf.len() - self.start < n && !self.eof {
+            if self.start > 0 {
+                self.buf.drain(..self.start);
+                self.base += self.start as u64;
+                self.start = 0;
+            }
+            let old = self.buf.len();
+            self.buf.resize(old + CHUNK, 0);
+            match self.r.read(&mut self.buf[old..]) {
+                Ok(0) | Err(_) => {
+                    self.buf.truncate(old);
+                    self.eof = true;
+                }
+                Ok(k) => self.buf.truncate(old + k),
+            }
+        }
+        self.buf.len() - self.start >= n
+    }
+
+    /// Move to the next frame magic strictly after the cursor. `false` = none before EOF (cursor at end).
+    fn seek_magic(&mut self) -> bool {
+        let mut from = self.start + 1;
+        loop {
+            if let Some(p) = self.buf.get(from..).and_then(|s| s.windows(4).position(|w| w == FRAME_MAGIC)) {
+                self.start = from + p;
+                return true;
+            }
+            if self.eof {
+                self.start = self.buf.len();
+                return false;
+            }
+            // keep only a possible magic prefix (last 3 bytes), then read more
+            self.start = self.buf.len().saturating_sub(3).max(self.start);
+            let need = self.buf.len() - self.start + 1;
+            self.have(need);
+            from = self.start;
+        }
+    }
 }
 
-/// `from`: first byte to parse (log header length for a full scan, 0 for a tail slice).
-fn scan_frames(buf: &[u8], from: usize) -> Scan {
-    let mut frames = Vec::new();
+struct ScanEnd {
+    skipped: u64,
+    /// Scan consumed the stream exactly (no trailing garbage / torn frame).
+    clean: bool,
+    /// Offset after the last byte consumed.
+    end: u64,
+}
+
+/// Stream frames from `r` (positioned at file offset `base`), calling `on_frame(frame_offset, frame)`.
+/// Corrupt regions are skipped by resyncing on the next magic.
+fn scan_stream<R: Read>(r: R, base: u64, mut on_frame: impl FnMut(u64, Frame)) -> ScanEnd {
+    let mut w = Window::new(r, base);
     let mut skipped = 0u64;
-    let mut pos = from.min(buf.len());
     let mut clean = true;
-    while pos < buf.len() {
-        let ok = (|| {
-            let h = buf.get(pos..pos + FRAME_HEADER_LEN)?;
+    while w.have(1) {
+        let off = w.offset();
+        let parsed = (|| {
+            if !w.have(FRAME_HEADER_LEN) {
+                return None;
+            }
+            let h = w.avail();
             if &h[0..4] != FRAME_MAGIC {
                 return None;
             }
@@ -265,50 +331,64 @@ fn scan_frames(buf: &[u8], from: usize) -> Scan {
                 return None;
             }
             let crc = u32::from_le_bytes(h[16..20].try_into().ok()?);
-            let payload = buf.get(pos + FRAME_HEADER_LEN..pos + FRAME_HEADER_LEN + len)?;
+            if !w.have(FRAME_HEADER_LEN + len) {
+                return None;
+            }
+            let payload = &w.avail()[FRAME_HEADER_LEN..FRAME_HEADER_LEN + len];
             if crc32fast::hash(payload) != crc {
                 return None;
             }
             let f: Frame = postcard::from_bytes(payload).ok()?;
             Some((f, FRAME_HEADER_LEN + len))
         })();
-        match ok {
+        match parsed {
             Some((f, adv)) => {
-                frames.push(f);
-                pos += adv;
+                on_frame(off, f);
+                w.start += adv;
             }
             None => {
                 skipped += 1;
                 clean = false;
-                match find_magic(buf, pos + 1) {
-                    Some(n) => pos = n,
-                    None => {
-                        clean = false;
-                        break;
-                    }
+                if !w.seek_magic() {
+                    break;
                 }
             }
         }
     }
-    Scan { frames, skipped, clean: clean && pos == buf.len() }
+    ScanEnd { skipped, clean: clean && !w.have(1), end: w.offset() }
 }
 
 // ---------------------------------------------------------------- index
 
-#[derive(Serialize, Deserialize, Default)]
+/// One record in the in-memory index: where it lives in the log, not its content. Records are read
+/// back from `off` on demand, so memory is O(records x 32 B) instead of O(log size).
+#[derive(Clone, Copy)]
+struct Entry {
+    id: u128,
+    path: u32,
+    /// Offset of the record's frame.
+    off: u64,
+}
+
+#[derive(Clone, Default)]
 struct IndexBody {
-    records: Vec<Record>,
-    notes: Vec<NoteFrame>,
+    /// File order.
+    entries: Vec<Entry>,
+    paths: Vec<String>,
+    /// (record id, offset of the note frame) in file order; the latest per record wins.
+    notes: Vec<(u128, u64)>,
     frames: u64,
-    orphan_notes: u64,
     skipped: u64,
     /// Byte offset the body is complete up to when the scan ended cleanly (0 = not clean: always rescan).
     clean_end: u64,
 }
 
+#[derive(Clone)]
 struct Index {
     body: IndexBody,
-    by_path: HashMap<String, Vec<usize>>,
+    by_path: HashMap<u32, Vec<u32>>,
+    path_ids: HashMap<String, u32>,
+    note_of: HashMap<u128, u64>,
     stats: Stats,
     len: u64,
     mtime: u64,
@@ -316,61 +396,61 @@ struct Index {
 
 impl Index {
     fn from_body(body: IndexBody, len: u64, mtime: u64, read_only: bool, from_cache: bool) -> Index {
-        let mut by_path: HashMap<String, Vec<usize>> = HashMap::new();
-        for (i, r) in body.records.iter().enumerate() {
-            by_path.entry(r.path.clone()).or_default().push(i);
+        let mut by_path: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (i, e) in body.entries.iter().enumerate() {
+            by_path.entry(e.path).or_default().push(i as u32);
         }
+        let path_ids = body.paths.iter().enumerate().map(|(i, p)| (p.clone(), i as u32)).collect();
+        let note_of: HashMap<u128, u64> = body.notes.iter().copied().collect();
+        let orphan_notes = if body.notes.is_empty() {
+            0
+        } else {
+            let mut missing: HashMap<u128, u64> = HashMap::new();
+            for (id, _) in &body.notes {
+                *missing.entry(*id).or_default() += 1;
+            }
+            for e in &body.entries {
+                missing.remove(&e.id);
+            }
+            missing.values().sum()
+        };
         let stats = Stats {
             log_len: len,
             frames: body.frames,
-            records: body.records.len() as u64,
+            records: body.entries.len() as u64,
             notes: body.notes.len() as u64,
-            orphan_notes: body.orphan_notes,
+            orphan_notes,
             skipped_frames: body.skipped,
             read_only,
             from_cache,
         };
-        Index { body, by_path, stats, len, mtime }
+        Index { body, by_path, path_ids, note_of, stats, len, mtime }
     }
 
-    fn apply(body: &mut IndexBody, scan: Scan) {
-        let mut pos: HashMap<u128, usize> = body.records.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
-        body.skipped += scan.skipped;
-        body.frames += scan.frames.len() as u64;
-        for f in scan.frames {
-            match f {
+    /// Scan the log from `start` (header length for a full scan, `clean_end` for an extension),
+    /// streaming: nothing but the index entries is retained.
+    fn scan_into<R: Read>(mut body: IndexBody, f: R, start: u64) -> IndexBody {
+        let mut path_ids: HashMap<String, u32> =
+            body.paths.iter().enumerate().map(|(i, p)| (p.clone(), i as u32)).collect();
+        let mut frames = 0u64;
+        let end = scan_stream(BufReader::with_capacity(CHUNK, f), start, |off, fr| {
+            frames += 1;
+            match fr {
                 Frame::Edit(r) | Frame::Unattributed(r) => {
-                    pos.insert(r.id, body.records.len());
-                    body.records.push(r);
+                    let next = body.paths.len() as u32;
+                    let path = *path_ids.entry(r.path.clone()).or_insert_with(|| {
+                        body.paths.push(r.path.clone());
+                        next
+                    });
+                    body.entries.push(Entry { id: r.id, path, off });
                 }
-                Frame::Note(n) => {
-                    match pos.get(&n.record_id) {
-                        Some(&i) => body.records[i].reason = n.reason.clone(),
-                        None => body.orphan_notes += 1,
-                    }
-                    body.notes.push(n);
-                }
+                Frame::Note(n) => body.notes.push((n.record_id, off)),
             }
-        }
-        body.records.sort_by_key(|r| (r.ts_ms, r.id));
-    }
-
-    fn build(buf: &[u8]) -> IndexBody {
-        let scan = scan_frames(buf, LOG_HEADER_LEN);
-        let clean = scan.clean;
-        let mut body = IndexBody::default();
-        Index::apply(&mut body, scan);
-        body.clean_end = if clean { buf.len() as u64 } else { 0 };
+        });
+        body.frames += frames;
+        body.skipped += end.skipped;
+        body.clean_end = if end.clean { end.end } else { 0 };
         body
-    }
-
-    /// Extend with frames appended after `clean_end`. `tail` = log bytes from `clean_end` to the new length.
-    fn extend(mut self, tail: &[u8], new_len: u64, mtime: u64) -> Index {
-        let scan = scan_frames(tail, 0);
-        let clean = scan.clean;
-        Index::apply(&mut self.body, scan);
-        self.body.clean_end = if clean { new_len } else { 0 };
-        Index::from_body(self.body, new_len, mtime, false, false)
     }
 }
 
@@ -506,17 +586,17 @@ impl Store {
         }))
     }
 
-    /// Current index. Every call stats the log (cheap) and, when another process appended, reloads
-    /// only the new tail. The shared flock excludes in-flight appends so a half-written frame is
-    /// never observed.
+    /// Current index. Every call stats the log (cheap) and, when another process appended, scans only
+    /// the new tail (streaming). The shared flock excludes in-flight appends so a half-written frame
+    /// is never observed.
     fn index(&self) -> Arc<Index> {
         let mut cache = self.cache.lock();
-        let fresh = self.refresh(cache.as_ref());
+        let fresh = self.refresh(cache.take());
         *cache = Some(fresh.clone());
         fresh
     }
 
-    fn refresh(&self, cached: Option<&Arc<Index>>) -> Arc<Index> {
+    fn refresh(&self, cached: Option<Arc<Index>>) -> Arc<Index> {
         let read_only = self.read_only.is_some();
         let empty = |len| Arc::new(Index::from_body(IndexBody::default(), len, 0, read_only, false));
         let Ok(mut f) = File::open(&self.log) else { return empty(0) };
@@ -525,46 +605,31 @@ impl Store {
             return empty(meta.len());
         }
         let _ = f.lock_shared();
+        let had_cache = cached.is_some();
         let out = (|| {
             let meta = f.metadata().ok()?;
             let (len, mtime) = (meta.len(), mtime_ns(&meta));
             if let Some(c) = cached {
                 if c.len == len && c.mtime == mtime {
-                    return Some(c.clone());
+                    return Some(c);
                 }
                 if len > c.len && c.body.clean_end == c.len && c.len >= LOG_HEADER_LEN as u64 {
                     f.seek(SeekFrom::Start(c.len)).ok()?;
-                    let mut tail = Vec::with_capacity((len - c.len) as usize);
-                    Read::by_ref(&mut f).take(len - c.len).read_to_end(&mut tail).ok()?;
-                    if tail.len() as u64 == len - c.len {
-                        let base = Index::from_body(
-                            IndexBody {
-                                records: c.body.records.clone(),
-                                notes: c.body.notes.clone(),
-                                frames: c.body.frames,
-                                orphan_notes: c.body.orphan_notes,
-                                skipped: c.body.skipped,
-                                clean_end: c.body.clean_end,
-                            },
-                            c.len,
-                            c.mtime,
-                            false,
-                            false,
-                        );
-                        return Some(Arc::new(base.extend(&tail, len, mtime)));
-                    }
+                    let start = c.len;
+                    // sole owner in the common case: extend in place instead of copying the index
+                    let idx = Arc::try_unwrap(c).unwrap_or_else(|a| (*a).clone());
+                    let body = Index::scan_into(idx.body, &mut f, start);
+                    return Some(Arc::new(Index::from_body(body, len, mtime, false, false)));
                 }
             }
             let idx_path = self.dir.join("index.ct");
-            if cached.is_none() {
+            if !had_cache {
                 if let Some(body) = read_cache(&idx_path, len, mtime) {
                     return Some(Arc::new(Index::from_body(body, len, mtime, false, true)));
                 }
             }
-            f.seek(SeekFrom::Start(0)).ok()?;
-            let mut buf = Vec::with_capacity(len as usize);
-            Read::by_ref(&mut f).take(len).read_to_end(&mut buf).ok()?;
-            let body = Index::build(&buf);
+            f.seek(SeekFrom::Start(LOG_HEADER_LEN as u64)).ok()?;
+            let body = Index::scan_into(IndexBody::default(), &mut f, LOG_HEADER_LEN as u64);
             let _ = write_cache(&idx_path, &body, len, mtime); // consistent: read under the shared lock
             Some(Arc::new(Index::from_body(body, len, mtime, false, false)))
         })();
@@ -576,12 +641,50 @@ impl Store {
         self.index().stats.clone()
     }
 
+    /// Read one frame back from the log (header + crc verified).
+    fn frame_at(f: &mut File, off: u64) -> Option<Frame> {
+        f.seek(SeekFrom::Start(off)).ok()?;
+        let mut h = [0u8; FRAME_HEADER_LEN];
+        f.read_exact(&mut h).ok()?;
+        if &h[0..4] != FRAME_MAGIC {
+            return None;
+        }
+        let len = u32::from_le_bytes(h[4..8].try_into().ok()?) as usize;
+        if len > MAX_FRAME_LEN {
+            return None;
+        }
+        let crc = u32::from_le_bytes(h[16..20].try_into().ok()?);
+        let mut payload = vec![0u8; len];
+        f.read_exact(&mut payload).ok()?;
+        (crc32fast::hash(&payload) == crc).then_some(())?;
+        postcard::from_bytes(&payload).ok()
+    }
+
+    /// Materialise the record of `e` (latest note merged in).
+    fn load(idx: &Index, f: &mut File, e: &Entry) -> Option<Record> {
+        let (Frame::Edit(mut r) | Frame::Unattributed(mut r)) = Self::frame_at(f, e.off)? else { return None };
+        if let Some(Frame::Note(n)) = idx.note_of.get(&e.id).and_then(|&o| Self::frame_at(f, o)) {
+            r.reason = n.reason;
+        }
+        Some(r)
+    }
+
+    fn load_entries<'a>(&self, idx: &Index, entries: impl Iterator<Item = &'a Entry>) -> Vec<Record> {
+        let Ok(mut f) = File::open(&self.log) else { return Vec::new() };
+        let mut out: Vec<Record> = entries.filter_map(|e| Self::load(idx, &mut f, e)).collect();
+        out.sort_by_key(|r| (r.ts_ms, r.id));
+        out
+    }
+
     pub fn all(&self) -> Vec<Record> {
-        self.index().body.records.clone()
+        let idx = self.index();
+        self.load_entries(&idx, idx.body.entries.iter())
     }
 
     pub fn get(&self, id: u128) -> Option<Record> {
-        self.index().body.records.iter().find(|r| r.id == id).cloned()
+        let idx = self.index();
+        let e = idx.body.entries.iter().find(|e| e.id == id)?;
+        self.load_entries(&idx, std::iter::once(e)).pop()
     }
 
     /// Resolve a full id or a unique hex prefix (>= 6 chars).
@@ -591,20 +694,21 @@ impl Store {
             return Err(format!("invalid record id '{s}'"));
         }
         let idx = self.index();
-        let hits: Vec<&Record> = idx.body.records.iter().filter(|r| fmt_id(r.id).starts_with(&s)).collect();
+        let hits: Vec<&Entry> = idx.body.entries.iter().filter(|e| fmt_id(e.id).starts_with(&s)).collect();
         match hits.len() {
             0 => Err(format!("no record with id '{s}'")),
-            1 => Ok(hits[0].clone()),
+            1 => self
+                .load_entries(&idx, hits.into_iter())
+                .pop()
+                .ok_or_else(|| format!("record '{s}' is unreadable")),
             n => Err(format!("id prefix '{s}' is ambiguous ({n} records)")),
         }
     }
 
     pub fn for_path(&self, path: &str) -> Vec<Record> {
         let idx = self.index();
-        idx.by_path
-            .get(path)
-            .map(|v| v.iter().map(|&i| idx.body.records[i].clone()).collect())
-            .unwrap_or_default()
+        let Some(rows) = idx.path_ids.get(path).and_then(|p| idx.by_path.get(p)) else { return Vec::new() };
+        self.load_entries(&idx, rows.iter().map(|&i| &idx.body.entries[i as usize]))
     }
 
     /// Records whose spans overlap `[start, end]` (1-based, inclusive) in the file as last edited.
@@ -689,25 +793,27 @@ impl Store {
         out
     }
 
-    /// Dump every record (+ note history) as JSON for backup / re-clone.
+    /// Dump every record (+ note history) as JSON for backup / re-clone. Streams: records and notes are
+    /// read from the log one at a time while being written, never all in memory.
     pub fn export_json<W: Write>(&self, mut w: W) -> Result<()> {
+        use std::cell::RefCell;
         let idx = self.index();
         #[derive(Serialize)]
-        struct ER<'a> {
+        struct ER {
             id: String,
             ts_ms: i64,
             agent: String,
-            session: &'a str,
-            kind: &'a str,
-            tool: &'a str,
-            tool_use_id: &'a str,
-            head_at_edit: &'a str,
-            path: &'a str,
-            pre_blob: &'a Option<Oid>,
-            post_blob: &'a Option<Oid>,
-            spans: &'a [Span],
+            session: String,
+            kind: &'static str,
+            tool: String,
+            tool_use_id: String,
+            head_at_edit: String,
+            path: String,
+            pre_blob: Option<Oid>,
+            post_blob: Option<Oid>,
+            spans: Vec<Span>,
             reason: String,
-            transcript: &'a Option<TranscriptPtr>,
+            transcript: Option<TranscriptPtr>,
         }
         #[derive(Serialize)]
         struct EN {
@@ -717,58 +823,68 @@ impl Store {
             session: String,
             reason: String,
         }
+        /// A sequence serialised straight from an iterator.
+        struct Seq<I>(RefCell<Option<I>>);
+        impl<T: Serialize, I: Iterator<Item = T>> Serialize for Seq<I> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+                s.collect_seq(self.0.borrow_mut().take().into_iter().flatten())
+            }
+        }
         #[derive(Serialize)]
-        struct Doc<'a> {
+        struct Doc<R: Serialize, N: Serialize> {
             format: &'static str,
             version: u16,
             skipped_frames: u64,
             read_only: Option<String>,
-            records: Vec<ER<'a>>,
-            notes: Vec<EN>,
+            records: R,
+            notes: N,
         }
+        let mut order: Vec<&Entry> = idx.body.entries.iter().collect();
+        order.sort_by_key(|e| (e.id, e.off)); // ids are time-ordered
+        let mut rf = File::open(&self.log).ok();
+        let mut nf = File::open(&self.log).ok();
+        let records = order.into_iter().filter_map(|e| {
+            let r = Self::load(&idx, rf.as_mut()?, e)?;
+            Some(ER {
+                id: fmt_id(r.id),
+                ts_ms: r.ts_ms,
+                agent: r.agent.name(),
+                kind: match r.kind {
+                    Kind::Edit => "edit",
+                    Kind::Unattributed => "unattributed",
+                },
+                reason: decode_reason(&r),
+                session: r.session,
+                tool: r.tool,
+                tool_use_id: r.tool_use_id,
+                head_at_edit: r.head_at_edit,
+                path: r.path,
+                pre_blob: r.pre_blob,
+                post_blob: r.post_blob,
+                spans: r.spans,
+                transcript: r.transcript,
+            })
+        });
+        let notes = idx.body.notes.iter().filter_map(|&(_, off)| {
+            let Some(Frame::Note(n)) = Self::frame_at(nf.as_mut()?, off) else { return None };
+            Some(EN {
+                record_id: fmt_id(n.record_id),
+                ts_ms: n.ts_ms,
+                agent: n.agent.name(),
+                session: n.session,
+                reason: decode_reason_bytes(&n.reason),
+            })
+        });
         let doc = Doc {
             format: "codetrail-export",
             version: FORMAT_VERSION,
             skipped_frames: idx.stats.skipped_frames,
             read_only: self.read_only_reason(),
-            records: idx
-                .body
-                .records
-                .iter()
-                .map(|r| ER {
-                    id: fmt_id(r.id),
-                    ts_ms: r.ts_ms,
-                    agent: r.agent.name(),
-                    session: &r.session,
-                    kind: match r.kind {
-                        Kind::Edit => "edit",
-                        Kind::Unattributed => "unattributed",
-                    },
-                    tool: &r.tool,
-                    tool_use_id: &r.tool_use_id,
-                    head_at_edit: &r.head_at_edit,
-                    path: &r.path,
-                    pre_blob: &r.pre_blob,
-                    post_blob: &r.post_blob,
-                    spans: &r.spans,
-                    reason: decode_reason(r),
-                    transcript: &r.transcript,
-                })
-                .collect(),
-            notes: idx
-                .body
-                .notes
-                .iter()
-                .map(|n| EN {
-                    record_id: fmt_id(n.record_id),
-                    ts_ms: n.ts_ms,
-                    agent: n.agent.name(),
-                    session: n.session.clone(),
-                    reason: decode_reason_bytes(&n.reason),
-                })
-                .collect(),
+            records: Seq(RefCell::new(Some(records))),
+            notes: Seq(RefCell::new(Some(notes))),
         };
-        serde_json::to_writer_pretty(&mut w, &doc).map_err(|e| StoreError::Encode(e.to_string()))?;
+        serde_json::to_writer_pretty(std::io::BufWriter::new(&mut w), &doc)
+            .map_err(|e| StoreError::Encode(e.to_string()))?;
         w.write_all(b"\n")?;
         Ok(())
     }
@@ -789,31 +905,104 @@ fn mtime_ns(m: &fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
+/// `index.ct`: derived cache of the in-memory index, fixed-width and streamed (never one big buffer).
 fn read_cache(path: &Path, len: u64, mtime: u64) -> Option<IndexBody> {
-    let b = fs::read(path).ok()?;
-    if b.len() < 4 + 2 + 8 + 8 || &b[0..4] != IDX_MAGIC {
+    let mut r = BufReader::with_capacity(CHUNK, File::open(path).ok()?);
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic).ok()?;
+    if &magic != IDX_MAGIC {
         return None;
     }
-    if u16::from_le_bytes([b[4], b[5]]) != FORMAT_VERSION {
+    let mut u16b = [0u8; 2];
+    r.read_exact(&mut u16b).ok()?;
+    if u16::from_le_bytes(u16b) != FORMAT_VERSION {
         return None;
     }
-    let l = u64::from_le_bytes(b[6..14].try_into().ok()?);
-    let m = u64::from_le_bytes(b[14..22].try_into().ok()?);
-    if l != len || m != mtime {
+    let mut u64s = || -> Option<u64> {
+        let mut b = [0u8; 8];
+        r.read_exact(&mut b).ok()?;
+        Some(u64::from_le_bytes(b))
+    };
+    if u64s()? != len || u64s()? != mtime {
         return None;
     }
-    postcard::from_bytes(&b[22..]).ok()
+    let (frames, skipped, clean_end) = (u64s()?, u64s()?, u64s()?);
+    let n_paths = u64s()?;
+    let n_entries = u64s()?;
+    let n_notes = u64s()?;
+    // sanity bound against a corrupt header: an entry cannot be smaller than a frame header
+    let max = len / FRAME_HEADER_LEN as u64;
+    if n_entries > max || n_notes > max || n_paths > n_entries {
+        return None;
+    }
+    let mut body = IndexBody { frames, skipped, clean_end, ..Default::default() };
+    for _ in 0..n_paths {
+        let mut l = [0u8; 4];
+        r.read_exact(&mut l).ok()?;
+        let l = u32::from_le_bytes(l) as usize;
+        if l > MAX_FRAME_LEN {
+            return None;
+        }
+        let mut p = vec![0u8; l];
+        r.read_exact(&mut p).ok()?;
+        body.paths.push(String::from_utf8(p).ok()?);
+    }
+    body.entries.reserve_exact(n_entries as usize);
+    for _ in 0..n_entries {
+        let mut b = [0u8; 28];
+        r.read_exact(&mut b).ok()?;
+        let path = u32::from_le_bytes(b[16..20].try_into().ok()?);
+        if path as u64 >= n_paths {
+            return None;
+        }
+        body.entries.push(Entry {
+            id: u128::from_le_bytes(b[0..16].try_into().ok()?),
+            path,
+            off: u64::from_le_bytes(b[20..28].try_into().ok()?),
+        });
+    }
+    for _ in 0..n_notes {
+        let mut b = [0u8; 24];
+        r.read_exact(&mut b).ok()?;
+        body.notes.push((u128::from_le_bytes(b[0..16].try_into().ok()?), u64::from_le_bytes(b[16..24].try_into().ok()?)));
+    }
+    let mut extra = [0u8; 1];
+    (r.read(&mut extra).ok()? == 0).then_some(body)
 }
 
 fn write_cache(path: &Path, body: &IndexBody, len: u64, mtime: u64) -> Result<()> {
-    let mut out = Vec::new();
-    out.extend_from_slice(IDX_MAGIC);
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(&mtime.to_le_bytes());
-    out.extend_from_slice(&postcard::to_stdvec(body).map_err(|e| StoreError::Encode(e.to_string()))?);
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    fs::write(&tmp, out)?;
+    {
+        let mut w = std::io::BufWriter::with_capacity(CHUNK, File::create(&tmp)?);
+        w.write_all(IDX_MAGIC)?;
+        w.write_all(&FORMAT_VERSION.to_le_bytes())?;
+        for v in [
+            len,
+            mtime,
+            body.frames,
+            body.skipped,
+            body.clean_end,
+            body.paths.len() as u64,
+            body.entries.len() as u64,
+            body.notes.len() as u64,
+        ] {
+            w.write_all(&v.to_le_bytes())?;
+        }
+        for p in &body.paths {
+            w.write_all(&(p.len() as u32).to_le_bytes())?;
+            w.write_all(p.as_bytes())?;
+        }
+        for e in &body.entries {
+            w.write_all(&e.id.to_le_bytes())?;
+            w.write_all(&e.path.to_le_bytes())?;
+            w.write_all(&e.off.to_le_bytes())?;
+        }
+        for (id, off) in &body.notes {
+            w.write_all(&id.to_le_bytes())?;
+            w.write_all(&off.to_le_bytes())?;
+        }
+        w.flush()?;
+    }
     fs::rename(&tmp, path)?;
     Ok(())
 }

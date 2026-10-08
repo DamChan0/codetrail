@@ -26,6 +26,12 @@ pub struct Config {
     pub rpc_timeout: Duration,
     /// Timeout for short status commands (`claude auth status`, ...).
     pub status_timeout: Duration,
+    /// Wall-clock ceiling for the login helper.
+    pub login_ceiling: Duration,
+    /// Wall-clock ceiling for `npm ci` (runtime install).
+    pub install_ceiling: Duration,
+    /// Wall-clock ceiling for one claude/codex prompt (one process per prompt).
+    pub ask_ceiling: Duration,
 }
 
 struct Overrides {
@@ -59,6 +65,9 @@ impl Config {
             grace_term: Duration::from_secs(3),
             rpc_timeout: Duration::from_secs(30),
             status_timeout: Duration::from_secs(15),
+            login_ceiling: Duration::from_secs(10 * 60),
+            install_ceiling: Duration::from_secs(15 * 60),
+            ask_ceiling: Duration::from_secs(10 * 60),
         }
     }
 

@@ -188,6 +188,9 @@ pub fn run_info(id: &str, prompt: &str, state: RunState, started_ms: i64, ended_
 }
 
 impl RunService for FakeRuns {
+    fn resources(&self) -> Vec<(String, crate::agents::Resource)> {
+        self.infos.lock().iter().filter(|r| r.state.is_active()).map(|r| (r.id.clone(), crate::agents::Resource { rss_kb: 600 * 1024, cpu_pct: 35.0, procs: 3 })).collect()
+    }
     fn submit(&self, spec: RunSpec) -> Result<String, String> {
         let id = format!("r{}", self.infos.lock().len() + 1);
         let mut i = run_info(&id, &spec.prompt, RunState::Queued, crate::agentapp::now_ms(), None, 0);

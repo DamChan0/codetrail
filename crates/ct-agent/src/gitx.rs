@@ -4,7 +4,9 @@ use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
+use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const MAX_DIFF_BYTES: usize = 1 << 20;
@@ -46,16 +48,55 @@ pub fn find_repo(start: &Path) -> Option<RepoCtx> {
     None
 }
 
-pub fn git_out(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let o = Command::new("git")
-        .current_dir(root)
+/// Absolute path of `git`, resolved once from PATH (never re-resolved per call).
+static GIT_BIN: LazyLock<PathBuf> = LazyLock::new(|| {
+    std::env::var_os("PATH")
+        .and_then(|p| std::env::split_paths(&p).map(|d| d.join("git")).find(|c| c.is_absolute() && c.is_file()))
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/git"))
+});
+
+/// Process-wide deadline for the hook path: every git call made after `set_hard_deadline` is killed by then.
+static HARD_DEADLINE: OnceLock<Instant> = OnceLock::new();
+/// Ceiling for any git call when no hook deadline is set (CLI subcommands).
+const DEFAULT_GIT_CEILING: Duration = Duration::from_secs(30);
+
+pub fn set_hard_deadline(at: Instant) {
+    let _ = HARD_DEADLINE.set(at);
+}
+
+fn call_deadline() -> Instant {
+    HARD_DEADLINE.get().copied().unwrap_or_else(|| Instant::now() + DEFAULT_GIT_CEILING)
+}
+
+/// git in its own process group (killed as a group), with PDEATHSIG so it never outlives us.
+fn spawn_git(root: &Path, args: &[&str], piped_stdin: bool) -> Option<Child> {
+    let mut cmd = Command::new(&*GIT_BIN);
+    cmd.current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(if piped_stdin { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    o.status.success().then_some(o.stdout)
+        .process_group(0);
+    // SAFETY: only async-signal-safe prctl between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
+    cmd.spawn().ok()
+}
+
+fn kill_group(child: &mut Child) {
+    // SAFETY: plain signal to the group we created with process_group(0).
+    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+pub fn git_out(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    git_io(root, args, None, call_deadline())
 }
 
 pub fn git_str(root: &Path, args: &[&str]) -> Option<String> {
@@ -159,15 +200,7 @@ pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
 
 /// Run git with optional stdin; kills it at `deadline`. `None` on failure / timeout.
 pub fn git_io(root: &Path, args: &[&str], input: Option<Vec<u8>>, deadline: Instant) -> Option<Vec<u8>> {
-    let mut child = Command::new("git")
-        .current_dir(root)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .args(args)
-        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    let mut child = spawn_git(root, args, input.is_some())?;
     if let Some(inp) = input {
         let mut si = child.stdin.take()?;
         std::thread::spawn(move || {
@@ -187,8 +220,7 @@ pub fn git_io(root: &Path, args: &[&str], input: Option<Vec<u8>>, deadline: Inst
                 return st.success().then_some(out);
             }
             None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_group(&mut child);
                 return None;
             }
             None => std::thread::sleep(Duration::from_millis(1)),

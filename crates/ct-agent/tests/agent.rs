@@ -496,3 +496,38 @@ fn ask_question_secret_is_withheld_unless_approved() {
     let o = cli(&root, h.path(), &["ask", "f.txt:3-4@worktree", "--print", "--question", q, "--include-secrets"]);
     assert!(s(&o.stdout).contains("hunter2hunter2"));
 }
+
+#[test]
+fn hook_with_hanging_git_on_path_exits_zero_within_deadline_and_kills_it() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let d = repo();
+    let root = d.path().canonicalize().unwrap();
+    let shim = tempfile::tempdir().unwrap();
+    let marker = shim.path().join("git.pid");
+    let fake = shim.path().join("git");
+    fs::write(&fake, format!("#!/bin/sh\necho $$ > {}\nexec sleep 600\n", marker.display())).unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let f = root.join("f.txt");
+    fs::write(&f, "changed\n").unwrap();
+    let inp = ev("Stop", &root, json!({"stop_hook_active":false}));
+    let path = format!("{}:{}", shim.path().display(), std::env::var("PATH").unwrap());
+    let t = Instant::now();
+    let mut child = Command::new(BIN)
+        .args(["hook", "claude", "Stop"])
+        .env("PATH", path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(inp.as_bytes()).unwrap();
+    let o = child.wait_with_output().unwrap();
+    let took = t.elapsed();
+    assert_eq!(o.status.code(), Some(0));
+    assert!(took < Duration::from_secs(5), "hook took {took:?}");
+    let pid: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let alive = fs::read_to_string(format!("/proc/{pid}/stat")).map_or(false, |s| !s.contains(") Z "));
+    assert!(!alive, "hung git {pid} survived the hook");
+}

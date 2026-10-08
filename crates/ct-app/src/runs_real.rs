@@ -43,6 +43,9 @@ fn info(i: r::RunInfo) -> RunInfo {
 }
 
 impl RunService for RealRuns {
+    fn resources(&self) -> Vec<(String, crate::agents::Resource)> {
+        self.0.resources().into_iter().map(|(id, r)| (id, crate::agents::Resource { rss_kb: r.rss_kb, cpu_pct: r.cpu_pct, procs: r.procs })).collect()
+    }
     fn submit(&self, spec: RunSpec) -> Result<String, String> {
         self.0.submit(r::RunSpec { repo: spec.repo, prompt: spec.prompt, model: model(&spec.model), base_ref: spec.base_ref, isolate: spec.isolate }).map_err(|e| format!("{e:#}"))
     }

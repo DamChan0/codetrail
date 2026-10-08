@@ -38,6 +38,38 @@ struct Env {
     data: PathBuf,
 }
 
+
+/// Orphan audit: when a test's environment goes away no process may still run with a cwd inside
+/// its temp dir (git, fake agents, hooks, agent descendants).
+fn leftover_in(root: &Path) -> Vec<u32> {
+    let me = std::process::id();
+    let mut v = Vec::new();
+    for e in fs::read_dir("/proc").unwrap().flatten() {
+        let Some(p) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        let alive = fs::read_to_string(format!("/proc/{p}/stat")).is_ok_and(|s| !s[s.rfind(')').unwrap_or(0)..].starts_with(") Z"));
+        if p != me && alive && fs::read_link(format!("/proc/{p}/cwd")).is_ok_and(|c| c.starts_with(root)) {
+            v.push(p);
+        }
+    }
+    v
+}
+
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        let root = self._tmp.path().canonicalize().unwrap_or_else(|_| self._tmp.path().to_path_buf());
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let l = leftover_in(&root);
+            if l.is_empty() || std::thread::panicking() {
+                return;
+            }
+            assert!(Instant::now() < end, "orphan processes left by test: {l:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 fn env() -> Env {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
@@ -191,7 +223,7 @@ impl AgentSession for Fake {
 
 // ------------------------------------------------------------------ run helpers
 
-const FAST: Timings = Timings { abort_grace: Duration::from_millis(300), term_grace: Duration::from_millis(300), tick: Duration::from_millis(10), finalize_delay: Duration::ZERO };
+const FAST: Timings = Timings { abort_grace: Duration::from_millis(300), term_grace: Duration::from_millis(300), tick: Duration::from_millis(10), finalize_delay: Duration::ZERO, sample_interval: Duration::from_millis(100) };
 
 fn mgr(e: &Env, max: usize, f: Arc<Fac>) -> RunManager {
     RunManager::open_with(&e.data, max, f, FAST).unwrap()
