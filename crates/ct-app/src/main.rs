@@ -11,6 +11,8 @@ mod fonts;
 mod fsutil;
 mod highlight;
 mod jobs;
+mod projectapp;
+mod projects;
 mod runs_real;
 mod selection;
 mod settings;
@@ -23,7 +25,7 @@ mod widgets;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "codetrail [REPO]\n       codetrail <install|hook|note|record|ask|export> ...\n       codetrail --smoke REPO --screenshot OUT.png [--scene commit|split|search|why|light|settings|runs|runs-stream|accounts|model-picker|new-run] [--size WxH] [--query TEXT]";
+const USAGE: &str = "codetrail [REPO]\n       codetrail <install|hook|note|record|ask|export> ...\n       codetrail --smoke REPO --screenshot OUT.png [--scene commit|split|search|why|light|settings|runs|runs-stream|accounts|model-picker|new-run|project-picker|folder-browser] [--size WxH] [--query TEXT]";
 
 struct Args {
     repo: Option<PathBuf>,
@@ -46,7 +48,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--screenshot" => shot = Some(PathBuf::from(val("--screenshot")?)),
             "--scene" => {
                 scene = val("--scene")?;
-                if !["commit", "split", "search", "why", "light", "settings", "runs", "runs-stream", "accounts", "model-picker", "new-run"].contains(&scene.as_str()) {
+                if !["commit", "split", "search", "why", "light", "settings", "runs", "runs-stream", "accounts", "model-picker", "new-run", "project-picker", "folder-browser"].contains(&scene.as_str()) {
                     return Err(format!("unknown scene {scene:?}"));
                 }
             }
@@ -85,8 +87,8 @@ fn main() -> ExitCode {
         }
     };
     let (repo_arg, smoke) = match args.smoke {
-        Some((r, out, scene, query)) => (r, Some((out, scene, query))),
-        None => (args.repo.unwrap_or_else(|| PathBuf::from(".")), None),
+        Some((r, out, scene, query)) => (Some(r), Some((out, scene, query))),
+        None => (args.repo, None),
     };
     let size = args.size;
     let viewport = egui::ViewportBuilder::default().with_inner_size([size.0, size.1]).with_min_inner_size([640.0, 420.0]).with_title("CodeTrail").with_app_id("codetrail");
@@ -104,6 +106,8 @@ fn main() -> ExitCode {
             if let Some(b) = sb {
                 banners.push((widgets::Level::Warn, b));
             }
+            // No path argument: reopen the last project that still exists; none -> the app opens the picker.
+            let repo_arg = repo_arg.clone().or_else(|| settings.recent.first().map(|r| PathBuf::from(&r.path))).unwrap_or_default();
             let choice = fonts::discover();
             let note = fonts::install(&cc.egui_ctx, &choice);
             let th = theme::Theme { file: theme_file.clone(), ui_font: settings.ui_font_size, code_font: settings.code_font_size };

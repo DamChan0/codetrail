@@ -25,9 +25,11 @@ pub enum Cmd {
     GotoLine,
     ToggleInspector,
     Refresh,
+    OpenProject,
 }
 
-pub const COMMANDS: [(Cmd, &str, &str); 13] = [
+pub const COMMANDS: [(Cmd, &str, &str); 14] = [
+    (Cmd::OpenProject, "Switch project", "Ctrl+O"),
     (Cmd::PickFile, "Go to file", "Ctrl+P"),
     (Cmd::SearchPanel, "Search in files", "Ctrl+Shift+F"),
     (Cmd::BaseMenu, "Change base", "Ctrl+B"),
@@ -124,6 +126,8 @@ impl eframe::App for App {
         self.ask_preview_window(ctx);
         self.settings_window(ctx);
         self.agent_windows(ctx);
+        self.project_popover(ctx);
+        self.folder_browser(ctx);
         self.smoke_tick(ctx);
     }
 }
@@ -201,6 +205,7 @@ impl App {
                 self.settings_dirty_at = Some(Instant::now());
             }
             Cmd::Settings => self.settings_open = !self.settings_open,
+            Cmd::OpenProject => self.pj_toggle_popover(),
             Cmd::GotoLine => {
                 if let Some(e) = &mut self.editor {
                     if self.centre == Centre::Editor {
@@ -230,6 +235,7 @@ impl App {
             hit(CMD_SHIFT, Key::C, Cmd::CopyRef);
             hit(CMD, Key::P, Cmd::PickFile);
             hit(CMD, Key::K, Cmd::Palette);
+            hit(CMD, Key::O, Cmd::OpenProject);
             hit(CMD, Key::B, Cmd::BaseMenu);
             hit(CMD, Key::E, Cmd::ToggleEdit);
             hit(CMD, Key::S, Cmd::Save);
@@ -290,10 +296,10 @@ impl App {
     fn top_bar(&mut self, ui: &mut Ui) {
         let th = self.th.clone();
         let m = th.m().clone();
+        let narrow = ui.ctx().screen_rect().width() < 1000.0;
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = m.space[1];
-            let repo_name = self.repo.as_ref().map(|r| short_repo_name(&r.root)).unwrap_or_else(|| short_repo_name(&self.repo_arg));
-            ui.label(RichText::new(repo_name).font(widgets::heading_font(&th)).color(th.fg()));
+            self.project_header(ui, narrow);
             if !self.head_name.is_empty() {
                 widgets::badge(ui, &th, &self.head_name, th.muted());
             }
@@ -1040,7 +1046,11 @@ impl App {
         let mut changed_theme = false;
         let mut changed_settings = false;
         let mut reset = false;
-        egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(true).default_width(380.0).default_pos(pos2(ctx.screen_rect().right() - 420.0, 64.0)).frame(egui::Frame::new().fill(th.raised()).stroke(egui::Stroke::new(1.0, th.border())).corner_radius(th.radius()).inner_margin(egui::Margin::same(16)).shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(110) })).show(ctx, |ui| {
+        // Fixed size + anchor: an auto-sized, resizable window whose rows use right-to-left layouts
+        // re-measures its own width from the previous frame and grows every frame.
+        let win_w = (ctx.screen_rect().width() - 32.0).clamp(280.0, 420.0);
+        let win_h = (ctx.screen_rect().height() - 120.0).clamp(240.0, 720.0);
+        egui::Window::new("Settings").id(egui::Id::new("settings_window")).open(&mut open).collapsible(false).resizable(false).fixed_size(vec2(win_w, win_h)).anchor(egui::Align2::RIGHT_TOP, vec2(-16.0, 56.0)).frame(egui::Frame::new().fill(th.raised()).stroke(egui::Stroke::new(1.0, th.border())).corner_radius(th.radius()).inner_margin(egui::Margin::same(16)).shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(110) })).show(ctx, |ui| {
             ui.spacing_mut().item_spacing = vec2(8.0, 10.0);
             let sv = ui.visuals_mut();
             sv.widgets.inactive.bg_fill = th.border();
@@ -1049,8 +1059,7 @@ impl App {
             sv.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, th.fg());
             sv.widgets.active.fg_stroke = egui::Stroke::new(1.0, th.accent());
             sv.selection.bg_fill = th.accent();
-            let win_h = (ctx.screen_rect().height() - 220.0).clamp(240.0, 720.0);
-            ScrollArea::vertical().max_height(win_h).min_scrolled_height(win_h).auto_shrink([false, false]).show(ui, |ui| {
+            ScrollArea::vertical().max_height(win_h - 32.0).auto_shrink([false, false]).show(ui, |ui| {
                 widgets::heading(ui, &th, "Appearance");
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Theme").color(th.muted()));
@@ -1203,4 +1212,43 @@ fn fuzzy_galley(ui: &Ui, name: &str, font: &FontId, th: &crate::theme::Theme, hi
         job.append(&ch.to_string(), 0.0, egui::TextFormat { font_id: font.clone(), color: col, ..Default::default() });
     }
     ui.fonts(|f| f.layout_job(job))
+}
+
+#[cfg(test)]
+mod settings_window_tests {
+    use super::*;
+    use crate::agents_fake::FakeAgents;
+
+    pub fn test_app(ctx: &egui::Context) -> App {
+        let (th, _) = theme::ThemeFile::load(std::path::Path::new("/nonexistent/theme.toml"));
+        App::new(ctx.clone(), std::path::PathBuf::from("/nonexistent"), th, crate::settings::Settings::default(), Vec::new(), String::new(), None, std::sync::Arc::new(FakeAgents::new()))
+    }
+
+    fn frame(ctx: &egui::Context, app: &mut App, size: egui::Vec2) {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)), ..Default::default() };
+        let _ = ctx.run(input, |ctx| app.settings_window(ctx));
+    }
+
+    fn rects(ctx: &egui::Context) -> Vec<Rect> {
+        ctx.memory(|m| m.areas().visible_layer_ids().into_iter().filter(|l| l.order == egui::Order::Middle).filter_map(|l| m.area_rect(l.id)).collect())
+    }
+
+    #[test]
+    fn settings_window_is_single_and_size_stable_across_frames() {
+        for size in [vec2(1440.0, 900.0), vec2(720.0, 760.0)] {
+            let ctx = egui::Context::default();
+            let mut app = test_app(&ctx);
+            app.settings_open = true;
+            let mut seen = Vec::new();
+            for _ in 0..40 {
+                frame(&ctx, &mut app, size);
+                seen.push(rects(&ctx));
+            }
+            let last = seen.last().unwrap();
+            assert_eq!(last.len(), 1, "exactly one settings window at {size:?}: {last:?}");
+            assert_eq!(seen[10], seen[39], "window rect must be stable after settling at {size:?}");
+            let r = last[0];
+            assert!(r.width() <= size.x && r.height() <= size.y, "window {r:?} fits the screen {size:?}");
+        }
+    }
 }

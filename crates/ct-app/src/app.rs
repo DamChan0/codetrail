@@ -183,6 +183,7 @@ pub enum Msg {
     Prompt(Result<agent_ask::Prompt, String>),
     AskChunk(String),
     AskDone(Result<(), String>),
+    Browse { token: u64, res: Result<crate::projects::Listing, String> },
     Accounts { accounts: Vec<crate::agents::Account>, runtime: crate::agents::RuntimeStatus },
     RuntimeProgress(String),
     RuntimeDone(Result<(), String>),
@@ -354,6 +355,7 @@ pub struct Smoke {
 }
 
 pub struct App {
+    pub pj: crate::projectapp::ProjectState,
     pub ag: crate::agentapp::AgentState,
     pub th: Theme,
     pub settings: Settings,
@@ -432,6 +434,7 @@ impl App {
         let rc = ctx.clone();
         let jobs = Jobs::new(move || rc.request_repaint());
         let mut app = App {
+            pj: Default::default(),
             ag: crate::agentapp::AgentState::new(svc),
             th,
             diff_opts: DiffOpts::default(),
@@ -495,7 +498,11 @@ impl App {
             smoke,
             last_search_stats_line: String::new(),
         };
-        app.open_repo();
+        if app.repo_arg.as_os_str().is_empty() {
+            app.pj_open_browser();
+        } else {
+            app.open_repo();
+        }
         app
     }
 
@@ -1098,6 +1105,7 @@ impl App {
         match msg {
             Msg::Opened(res) => match res {
                 Ok(o) => {
+                    self.pj_record_open(&o.repo.root);
                     self.repo = Some(o.repo);
                     self.head = o.head;
                     self.head_name = o.head_name;
@@ -1277,6 +1285,7 @@ impl App {
                     Err(e) => AskPhase::Failed(e),
                 };
             }
+            Msg::Browse { token, res } => self.pj_handle(token, res),
             other => self.ag_handle(other),
         }
     }

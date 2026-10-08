@@ -56,6 +56,15 @@ impl App {
             widgets::empty_state(ui, &th, "No repository", "Start CodeTrail inside a git repository, or pass its path as an argument.");
             return;
         }
+        if self.repo_arg.as_os_str().is_empty() {
+            widgets::empty_state(ui, &th, "No project open", "Press Ctrl+O or click the project name to choose a git repository.");
+            ui.vertical_centered(|ui| {
+                if Btn::new("Open folder…").kind(BtnKind::Primary).show(ui, &th).clicked() {
+                    self.pj_open_browser();
+                }
+            });
+            return;
+        }
         if self.centre == Centre::Run {
             self.run_ui(ui);
             return;
@@ -910,6 +919,21 @@ impl App {
                     self.insp = InspTab::Ask;
                     self.ag_ensure_models();
                 }
+                "project-picker" => {
+                    let now = crate::agentapp::now_ms();
+                    let h = crate::projects::home_dir();
+                    for (i, p) in ["/tmp/ct-demo", "project/penny-procmon", "project/codetrail", "work/clients/acme/services/billing-gateway-with-a-very-long-name"].iter().enumerate() {
+                        let path = if p.starts_with('/') { std::path::PathBuf::from(p) } else { h.join(p) };
+                        self.settings.recent.push(crate::projects::RecentProject { path: path.to_string_lossy().into_owned(), opened_ms: now - 1000 * (i as i64 + 1) });
+                    }
+                    self.pj.popover = true;
+                }
+                "folder-browser" => {
+                    self.pj_open_browser();
+                    if let Some(b) = &mut self.pj.browser {
+                        b.focus = false;
+                    }
+                }
                 "new-run" => {
                     self.rail = RailTab::Runs;
                     self.ag_open_runs();
@@ -941,6 +965,7 @@ impl App {
         if scene == "model-picker" && !self.insp_open && !self.smoke.as_ref().is_some_and(|s| s.requested) {
             self.insp_open = true;
         }
+        let browser_ready = scene != "folder-browser" || self.pj.browser.as_ref().is_some_and(|b| b.listing.ready().is_some());
         let ag_scene = matches!(scene.as_str(), "runs" | "runs-stream" | "accounts" | "model-picker" | "new-run");
         let ag_ready = !ag_scene || (self.ag.accounts.ready().is_some() && !self.ag.models.is_loading() && (self.ag.runs_svc.ready().is_some() || !matches!(scene.as_str(), "runs" | "runs-stream" | "new-run")));
         if scene == "runs-stream" && self.ag.runs_svc.ready().is_some() && self.centre != Centre::Run {
@@ -958,7 +983,7 @@ impl App {
             }
             self.ag_select_run("r1");
         }
-        let mut settled = ag_ready && ready && (scene != "search" || self.search.ran.is_some());
+        let mut settled = ag_ready && browser_ready && ready && (scene != "search" || self.search.ran.is_some());
         if scene == "why" && ready {
             if let Loadable::Ready(p) = &self.prepared {
                 if self.selection.is_none() {

@@ -146,14 +146,20 @@ impl App {
                 self.ag.run_banner = None;
             }
         }
-        if self.ag.runs.infos.is_empty() {
+        let root = self.repo.as_ref().map(|r| r.root.clone());
+        let here = |r: &RunInfo| root.as_ref().map_or(true, |p| &r.spec.repo == p);
+        let hidden = self.ag.runs.infos.iter().filter(|r| !here(r)).count();
+        if !self.ag.runs.infos.iter().any(|r| here(r)) {
             widgets::empty_state(ui, &th, "No runs yet", "A run lets an agent work on its own copy of this repo while you keep reading.");
+            if hidden > 0 {
+                ui.vertical_centered(|ui| ui.label(RichText::new(format!("{hidden} run(s) belong to other projects.")).font(widgets::small_font(&th)).color(th.muted())));
+            }
             return;
         }
         let now = now_ms();
         let mut clicked: Option<String> = None;
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for r in &self.ag.runs.infos {
+            for r in self.ag.runs.infos.iter().filter(|r| here(r)) {
                 let sel = self.ag.runs.selected.as_deref() == Some(r.id.as_str()) && self.centre == Centre::Run;
                 let (resp, rect) = widgets::list_row(ui, &th, 52.0, sel);
                 let col = state_color(&th, &r.state);
@@ -559,7 +565,7 @@ impl App {
     }
 }
 
-fn dialog<R>(th: &crate::theme::Theme, ctx: &egui::Context, title: &str, width: f32, add: impl FnOnce(&mut Ui) -> R) -> Option<R> {
+pub fn dialog<R>(th: &crate::theme::Theme, ctx: &egui::Context, title: &str, width: f32, add: impl FnOnce(&mut Ui) -> R) -> Option<R> {
     let mut out = None;
     let w = width.min(ctx.screen_rect().width() - 32.0);
     egui::Window::new(title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).fixed_size(vec2(w, 0.0)).frame(egui::Frame::new().fill(th.raised()).stroke(egui::Stroke::new(1.0, th.border())).corner_radius(th.radius()).inner_margin(egui::Margin::same(16)).shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(110) })).show(ctx, |ui| {
