@@ -160,6 +160,7 @@ pub struct Opened {
     pub refs: Vec<RefInfo>,
     pub store: Option<Arc<Store>>,
     pub store_note: Option<String>,
+    pub dirty: Option<crate::worktree::Summary>,
 }
 
 pub struct BlameData {
@@ -183,6 +184,7 @@ pub enum Msg {
     Prompt(Result<agent_ask::Prompt, String>),
     AskChunk(String),
     AskDone(Result<(), String>),
+    Status { token: u64, res: Result<crate::worktree::Summary, String> },
     Browse { token: u64, res: Result<crate::projects::Listing, String> },
     Accounts { accounts: Vec<crate::agents::Account>, runtime: crate::agents::RuntimeStatus },
     RuntimeProgress(String),
@@ -355,6 +357,7 @@ pub struct Smoke {
 }
 
 pub struct App {
+    pub wt: crate::wtapp::WtState,
     pub pj: crate::projectapp::ProjectState,
     pub ag: crate::agentapp::AgentState,
     pub th: Theme,
@@ -435,6 +438,7 @@ impl App {
         let jobs = Jobs::new(move || rc.request_repaint());
         let mut app = App {
             pj: Default::default(),
+            wt: Default::default(),
             ag: crate::agentapp::AgentState::new(svc),
             th,
             diff_opts: DiffOpts::default(),
@@ -570,7 +574,8 @@ impl App {
                     Ok(s) => (Some(Arc::new(s)), None),
                     Err(e) => (None, Some(e.to_string())),
                 };
-                Ok(Opened { repo, head, head_name, refs, store, store_note })
+                let dirty = crate::worktree::summary(&repo, &head).ok();
+                Ok(Opened { repo, head, head_name, refs, store, store_note, dirty })
             })();
             c.finish(Msg::Opened(res));
         });
@@ -644,8 +649,11 @@ impl App {
 
     pub fn request_diff(&mut self) {
         let (Some(repo), Some(target)) = (self.repo.clone(), self.target.clone()) else { return };
-        self.diffset = Loadable::Loading;
-        self.prepared = Loadable::Idle;
+        let quiet = std::mem::take(&mut self.wt.quiet_gen) == u64::MAX;
+        if !quiet {
+            self.diffset = Loadable::Loading;
+            self.prepared = Loadable::Idle;
+        }
         let base = self.base.clone();
         let range = self.range.clone();
         let parent_n = self.parent_n;
@@ -654,13 +662,19 @@ impl App {
         let opts = self.diff_opts.clone();
         let timeout = self.git_timeout();
         self.cmp_gen += 1;
+        if quiet {
+            self.wt.quiet_gen = self.cmp_gen;
+        }
         self.jobs.cancel(JobKind::FileDiff);
         self.jobs.spawn(JobKind::Diff, move |c| {
             let repo = repo.with_timeout(timeout).with_cancel(c.cancel.clone());
             let res = (|| -> Result<(DiffSet, CurCmp), String> {
                 let input = CmpInput { base: &base, range: range.as_ref().map(|(a, b)| (a.as_str(), b.as_str())), parent_n, target: &target, prev: prev.as_deref(), head: &head };
                 let cmp = build_comparison(&input, &|a, b| repo.merge_base(a, b)).map_err(|e| e.to_string())?;
-                let set = repo.diff(&cmp, &opts).map_err(|e| e.to_string())?;
+                let mut set = repo.diff(&cmp, &opts).map_err(|e| e.to_string())?;
+                if crate::worktree::is_worktree(&cmp) {
+                    crate::worktree::add_untracked(&repo, &mut set)?;
+                }
                 let at_of = |t: &Treeish| -> Option<RefAt> {
                     match t {
                         Treeish::Commit(r) => repo.resolve(r).ok().map(|o| at_commit(&o)),
@@ -681,6 +695,7 @@ impl App {
         self.show_large = false;
         self.diff_sel = None;
         self.diff_anchor = None;
+        self.wt.quiet_gen = 0;
         self.request_file_diff();
         if self.centre == Centre::Editor || self.centre == Centre::Blame {
             // keep the centre; user switches explicitly
@@ -689,7 +704,9 @@ impl App {
 
     pub fn request_file_diff(&mut self) {
         let (Some(repo), Some(cur), Some(path)) = (self.repo.clone(), self.cur.clone(), self.file_sel.clone()) else { return };
-        self.prepared = Loadable::Loading;
+        if self.wt.quiet_gen != self.cmp_gen || self.prepared.ready().is_none() {
+            self.prepared = Loadable::Loading;
+        }
         let opts = self.diff_opts.clone();
         let store = self.store.clone();
         let tab = self.settings.tab_width;
@@ -698,7 +715,7 @@ impl App {
         self.jobs.spawn(JobKind::FileDiff, move |c| {
             let repo = repo.with_timeout(timeout).with_cancel(c.cancel.clone());
             let res = (|| -> Result<Box<Prepared>, String> {
-                let file = repo.file_diff(&cur.cmp, &path, &opts).map_err(|e| e.to_string())?;
+                let file = crate::worktree::file_diff(&repo, &cur.cmp, &path, &opts)?;
                 let blobs: Vec<String> = file.new_oid.iter().cloned().collect();
                 let model = DiffModel::build(file, tab);
                 let why = (0..model.file.hunks.len())
@@ -1113,6 +1130,12 @@ impl App {
                     self.store = o.store;
                     self.store_note = o.store_note;
                     self.open_state = Loadable::Ready(());
+                    self.wt.last = Instant::now();
+                    let dirty = o.dirty.as_ref().is_some_and(|s| s.dirty());
+                    self.wt.summary = o.dirty;
+                    if dirty && self.target.is_none() {
+                        self.select_worktree();
+                    }
                     self.request_log(false);
                     self.request_files();
                 }
@@ -1146,6 +1169,11 @@ impl App {
                     let first = set.files.first().map(|f| f.path.clone());
                     self.cur = Some(cur);
                     self.diffset = Loadable::Ready(set);
+                    if keep.is_some() && self.wt.quiet_gen == self.cmp_gen {
+                        // Live refresh: same file stays open; selection and scroll are untouched.
+                        self.request_file_diff();
+                        return;
+                    }
                     match keep.or(first) {
                         Some(p) => self.open_file_diff(&p),
                         None => {
@@ -1243,6 +1271,7 @@ impl App {
                         e.saved_text = written;
                         e.conflict = None;
                         e.notice = Some((format!("Saved {path}"), Instant::now()));
+                        self.request_status();
                     }
                     Ok(SaveOutcome::Conflict(d)) => e.conflict = Some(d),
                     Err(er) => e.notice = Some((er, Instant::now())),
@@ -1286,6 +1315,7 @@ impl App {
                 };
             }
             Msg::Browse { token, res } => self.pj_handle(token, res),
+            Msg::Status { token, res } => self.wt_handle(token, res),
             other => self.ag_handle(other),
         }
     }

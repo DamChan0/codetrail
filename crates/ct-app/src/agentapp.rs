@@ -493,6 +493,7 @@ impl App {
                     Err(e) => (crate::widgets::Level::Error, format!("{what} failed: {e}")),
                 });
                 if what == "Apply" {
+                    self.request_status();
                     self.request_log(false);
                 }
             }

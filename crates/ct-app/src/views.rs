@@ -919,6 +919,8 @@ impl App {
                     self.insp = InspTab::Ask;
                     self.ag_ensure_models();
                 }
+                // Opens on "Working tree changes" by itself when the repo is dirty.
+                "worktree" => {}
                 "project-picker" => {
                     let now = crate::agentapp::now_ms();
                     let h = crate::projects::home_dir();

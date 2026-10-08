@@ -52,6 +52,7 @@ impl eframe::App for App {
         self.smoke_prepare();
         self.shortcuts(ctx);
         self.debounce(ctx);
+        self.wt_tick(ctx);
         if self.editor.is_some() && self.centre == Centre::Editor {
             self.check_editor_disk();
             ctx.request_repaint_after(Duration::from_millis(1000));
@@ -437,8 +438,16 @@ impl App {
         ui.add_space(m.space[1]);
         // Working tree row.
         let wt_sel = matches!(self.target, Some(TargetSel::Worktree));
-        let (resp, rect) = widgets::list_row(ui, &th, 32.0, wt_sel);
-        widgets::paint_text_fit(ui, rect, "Working tree changes", widgets::ui_font(&th), th.fg());
+        let (resp, rect) = widgets::list_row(ui, &th, 44.0, wt_sel);
+        let top = egui::Rect::from_min_max(rect.min + vec2(0.0, 4.0), pos2(rect.max.x, rect.min.y + 22.0));
+        let bot = egui::Rect::from_min_max(pos2(rect.min.x, rect.min.y + 22.0), pos2(rect.max.x, rect.max.y - 2.0));
+        widgets::paint_text_fit(ui, top, "Working tree changes", widgets::ui_font(&th), th.fg());
+        let (sum, col) = match &self.wt.summary {
+            Some(s) if s.dirty() => (format!("{}{}", s.text(), if s.untracked > 0 { format!(" · {} new", s.untracked) } else { String::new() }), th.warn()),
+            Some(s) => (s.text(), th.muted()),
+            None => ("checking…".to_string(), th.muted()),
+        };
+        widgets::paint_text_fit(ui, bot, &sum, widgets::small_font(&th), col);
         if resp.clicked() {
             self.select_worktree();
         }

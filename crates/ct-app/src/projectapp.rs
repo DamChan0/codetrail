@@ -136,6 +136,11 @@ impl App {
             self.pj_toggle_popover();
         }
         self.pj.chip_rect = Some(r.rect);
+        if let Some(s) = self.wt.summary.as_ref().filter(|s| s.dirty()) {
+            let (rect, resp) = ui.allocate_exact_size(vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 4.0, th.warn());
+            resp.on_hover_text(format!("Uncommitted changes: {}", s.text()));
+        }
         if let Some(full) = full {
             let room = ui.available_width() - if narrow { 360.0 } else { 520.0 };
             if room >= 70.0 {
