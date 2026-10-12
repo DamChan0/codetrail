@@ -983,6 +983,12 @@ impl App {
                             f.test = Some(Err(ct_core::remote::describe(&ct_core::RemoteErrorKind::AuthFailed, "Permission denied (publickey)")));
                         }
                     }
+                    if q == "new" {
+                        self.rs_form_new();
+                    }
+                    if q == "no-tailscale" {
+                        self.rs_peers_done(Err("`tailscale` was not found in PATH: install Tailscale (https://tailscale.com/download) or enter the host manually".into()));
+                    }
                     self.settings_open_section(crate::settingspage::Section::Remotes);
                 }
                 "remote-picker" => {

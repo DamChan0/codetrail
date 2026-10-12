@@ -22,6 +22,9 @@ pub enum Transport {
     Ssh,
     /// Adds `-o ProxyCommand="tailscale nc %h %p"`.
     TailscaleNc,
+    /// Plain ssh to a tailnet name/IP; Tailscale SSH authenticates by tailnet identity, so no `-i`
+    /// and no ProxyCommand.
+    TailscaleSsh,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,5 +274,17 @@ mod tests {
         let j = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<RemoteSpec>(&j).unwrap(), s);
         assert!(serde_json::to_string(&Transport::TailscaleNc).unwrap().contains("tailscale_nc"));
+        assert_eq!(serde_json::to_string(&Transport::TailscaleSsh).unwrap(), "\"tailscale_ssh\"");
+        let mut t = spec();
+        t.transport = Transport::TailscaleSsh;
+        assert_eq!(serde_json::from_str::<RemoteSpec>(&serde_json::to_string(&t).unwrap()).unwrap(), t);
+    }
+
+    #[test]
+    fn old_configs_without_new_variant_still_load() {
+        let j = r#"{"name":"n","host":"h","user":null,"port":null,"identity_file":null,"transport":"tailscale_nc","trust_new_host":false}"#;
+        assert_eq!(serde_json::from_str::<RemoteSpec>(j).unwrap().transport, Transport::TailscaleNc);
+        let j = j.replace("tailscale_nc", "ssh");
+        assert_eq!(serde_json::from_str::<RemoteSpec>(&j).unwrap().transport, Transport::Ssh);
     }
 }

@@ -45,13 +45,13 @@ pub struct RemoteForm {
     pub user: String,
     pub port: String,
     pub identity_file: String,
-    pub tailscale_nc: bool,
+    pub transport: Transport,
     pub trust_new_host: bool,
 }
 
 impl RemoteForm {
     pub fn from_spec(s: &RemoteSpec) -> Self {
-        RemoteForm { name: s.name.clone(), host: s.host.clone(), user: s.user.clone().unwrap_or_default(), port: s.port.map(|p| p.to_string()).unwrap_or_default(), identity_file: s.identity_file.clone().unwrap_or_default(), tailscale_nc: s.transport == Transport::TailscaleNc, trust_new_host: s.trust_new_host }
+        RemoteForm { name: s.name.clone(), host: s.host.clone(), user: s.user.clone().unwrap_or_default(), port: s.port.map(|p| p.to_string()).unwrap_or_default(), identity_file: s.identity_file.clone().unwrap_or_default(), transport: s.transport, trust_new_host: s.trust_new_host }
     }
 
     /// `others`: names already taken by *other* remotes (the one being edited is excluded).
@@ -71,7 +71,7 @@ impl RemoteForm {
             "" => None,
             p => Some(p.parse::<u16>().ok().filter(|p| *p != 0).ok_or_else(|| "Port must be a number from 1 to 65535.".to_string())?),
         };
-        let spec = RemoteSpec { name, host: self.host.trim().to_string(), user: opt(&self.user), port, identity_file: opt(&self.identity_file), transport: if self.tailscale_nc { Transport::TailscaleNc } else { Transport::Ssh }, trust_new_host: self.trust_new_host };
+        let spec = RemoteSpec { name, host: self.host.trim().to_string(), user: opt(&self.user), port, identity_file: opt(&self.identity_file).filter(|_| self.transport != Transport::TailscaleSsh), transport: self.transport, trust_new_host: self.trust_new_host };
         spec.validate().map_err(|e| e.to_string())?;
         Ok(spec)
     }
@@ -80,7 +80,7 @@ impl RemoteForm {
 /// Remotes shown by the `remote-*` smoke scenes (they run against the fake ssh).
 pub fn smoke_remotes() -> Vec<RemoteSpec> {
     let r = |name: &str, host: &str, user: &str| RemoteSpec { name: name.into(), host: host.into(), user: Some(user.into()), port: None, identity_file: None, transport: Transport::Ssh, trust_new_host: false };
-    vec![r("dev-box", "fake-host", "dev"), RemoteSpec { transport: Transport::TailscaleNc, ..r("build-server", "build.tail1234.ts.net", "ci") }, r("home-nas", "192.168.1.20", "me")]
+    vec![RemoteSpec { transport: Transport::TailscaleSsh, ..r("dev-box", "fake-host", "dev") }, RemoteSpec { transport: Transport::TailscaleNc, ..r("build-server", "build.tail1234.ts.net", "ci") }, r("home-nas", "192.168.1.20", "me")]
 }
 
 /// Header chip text: `user@host:~/path`.
@@ -163,12 +163,21 @@ mod tests {
         let mut f = form();
         f.user = " me ".into();
         f.port = "2222".into();
-        f.tailscale_nc = true;
+        f.transport = Transport::TailscaleNc;
         f.trust_new_host = true;
         let s = f.build(&[]).unwrap();
         assert_eq!((s.user.as_deref(), s.port, s.transport, s.trust_new_host), (Some("me"), Some(2222), Transport::TailscaleNc, true));
         assert_eq!(RemoteForm::from_spec(&s).build(&[]).unwrap(), s);
         assert_eq!(chip_label(&s, "~/code"), "me@dev.tail1234.ts.net:~/code");
+    }
+
+    #[test]
+    fn tailscale_ssh_form_drops_a_stale_identity_file() {
+        let f = RemoteForm { transport: Transport::TailscaleSsh, identity_file: "/k/id".into(), ..form() };
+        let s = f.build(&[]).unwrap();
+        assert_eq!((s.transport, s.identity_file), (Transport::TailscaleSsh, None));
+        let k = RemoteForm { transport: Transport::Ssh, identity_file: "/k/id".into(), ..form() }.build(&[]).unwrap();
+        assert_eq!(k.identity_file.as_deref(), Some("/k/id"));
     }
 
     #[test]

@@ -25,7 +25,24 @@ machine. Nothing is installed on the remote side: CodeTrail runs `git` there ove
   under `~/.cache/codetrail/remote/<hash>/` (hard cap 64 MiB), so the Why panel works. **[unverified]**
 - The `ssh` binary can be overridden with the environment variable `CT_SSH_BIN` (used by tests).
 
-## SSH requirements
+## Recommended setup: Tailscale
+
+Use Tailscale first, keys last. Settings > Remotes > **Discover Tailscale peers** lists your tailnet;
+picking a peer creates a remote with transport **Tailscale SSH (no key)**: plain `ssh` to the tailnet
+name, authenticated by your tailnet identity (the target runs `tailscale up --ssh`). There is no key,
+no `-i`, no ProxyCommand and nothing to rotate. Fall back to *SSH via Tailscale nc* (host has sshd but
+no route into the tailnet) or plain *SSH (key)* only when Tailscale is not an option. If `tailscale`
+is missing or logged out, the settings page shows the install/login hint and key-based SSH stays usable.
+
+| Transport (`RemoteSpec.transport`) | ssh arguments added | Auth |
+|---|---|---|
+| Tailscale SSH — `tailscale_ssh` (default for new/discovered remotes) | none (never `-i`/`IdentitiesOnly`, even if an identity file is stored) | tailnet identity |
+| SSH via Tailscale nc — `tailscale_nc` | `-o ProxyCommand="tailscale nc %h %p"` | sshd login (key or Tailscale SSH) |
+| SSH (key) — `ssh` | `-i <file> -o IdentitiesOnly=yes` if an identity file is set | ssh key / agent |
+
+Existing saved remotes keep loading unchanged (`ssh`, `tailscale_nc`).
+
+## SSH requirements (key-based transports only)
 
 - The remote needs only `git` (any reasonably recent version) and a POSIX shell.
 - Authentication must work **without prompts**: `BatchMode=yes` forbids password and passphrase
@@ -49,7 +66,7 @@ CodeTrail never uses `StrictHostKeyChecking=no`. A changed host key is always an
 (`host key changed`); fix it deliberately with `ssh-keygen -R <host>` after you have verified why
 it changed.
 
-## Tailscale
+## Tailscale details
 
 1. **Peers list**: the settings page runs `tailscale status --json` (cleared environment, only
    `PATH`; 5 s timeout, process-group kill, 4 MiB output cap) and lists this node and up to 200
@@ -58,9 +75,11 @@ it changed.
    (172 nodes parsed).
 2. **Plain ssh over the tailnet**: the MagicDNS name / `100.x` address is just an ssh host.
    Transport *SSH* works as long as your normal `ssh` can reach it.
-3. **Tailscale SSH**: if the target runs `tailscale up --ssh`, authentication is handled by
-   Tailscale (ACLs), no keys needed. Use transport *SSH* with the tailnet name. **[unverified]**
-4. **Transport *Tailscale (nc)***: adds `-o ProxyCommand="tailscale nc %h %p"`. Use it when
+3. **Tailscale SSH** (recommended): if the target runs `tailscale up --ssh`, authentication is handled
+   by Tailscale (ACLs), no keys needed. Use transport *Tailscale SSH (no key)* with the tailnet name.
+   The ssh arguments for this transport are covered by unit tests; a real Tailscale SSH login was
+   **[unverified]**.
+4. **Transport *SSH via Tailscale nc***: adds `-o ProxyCommand="tailscale nc %h %p"`. Use it when
    the machine runs in userspace-networking mode or the OS has no route into the tailnet.
    **[unverified]**
 

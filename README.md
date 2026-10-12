@@ -70,6 +70,13 @@ Left rail tabs: **Commits** · **Current** · **Search** · **Files** · **Runs*
 
 ![Current changes](docs/screens/current-dirty-desktop.png)
 
+## Remote repositories
+
+View diffs of repositories on another machine (read-only): Settings > Remotes. **Recommended: Tailscale**
+— click *Discover Tailscale peers*, pick a machine; it uses Tailscale SSH, so there are no keys to
+manage (the target needs `tailscale up --ssh` and git). Plain key-based SSH is the last resort for
+machines not on your tailnet. Details, limits and troubleshooting: [docs/REMOTE.md](docs/REMOTE.md).
+
 ## Agent integration
 
 ```

@@ -8,7 +8,7 @@ use crate::app::{App, Loadable, Msg};
 use crate::jobs::JobKind;
 use crate::remote_backend::{RealRemote, RemoteBackend, RemoteForm};
 use ct_core::remote::discover::{SshHost, TailnetPeer};
-use ct_core::remote::{DirEntry, RemoteInfo, RemoteSpec};
+use ct_core::remote::{DirEntry, RemoteInfo, RemoteSpec, Transport};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -164,7 +164,7 @@ impl App {
     // ------------------------------------------------------------ settings model
 
     pub fn rs_form_new(&mut self) {
-        self.rs.form = Some(FormState { orig: None, f: RemoteForm::default(), error: None, test: None });
+        self.rs.form = Some(FormState { orig: None, f: RemoteForm { transport: Transport::TailscaleSsh, ..Default::default() }, error: None, test: None });
     }
 
     pub fn rs_form_edit(&mut self, name: &str) {
@@ -259,12 +259,11 @@ impl App {
         });
     }
 
-    /// Prefills the add form from a tailnet peer (host = MagicDNS name, Tailscale transport off:
-    /// a peer reachable by name works with plain ssh; the nc transport is for hosts without sshd on
-    /// the tailnet interface).
+    /// Prefills the add form from a tailnet peer (host = MagicDNS name, transport = Tailscale SSH:
+    /// authenticates by tailnet identity, no keys; the nc transport / plain ssh stay selectable).
     pub fn rs_peer_use(&mut self, p: &TailnetPeer) {
         let name: String = p.name.chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).collect();
-        self.rs.form = Some(FormState { orig: None, f: RemoteForm { name, host: p.address().to_string(), ..Default::default() }, error: None, test: None });
+        self.rs.form = Some(FormState { orig: None, f: RemoteForm { name, host: p.address().to_string(), transport: Transport::TailscaleSsh, ..Default::default() }, error: None, test: None });
     }
 
     // ------------------------------------------------------------ project picker
@@ -429,7 +428,7 @@ fn info_line(i: &RemoteInfo) -> String {
 impl App {
     pub(crate) fn sec_remotes(&mut self, ui: &mut Ui) {
         let th = self.th.clone();
-        hint(ui, &th, "Remote repositories are read-only: git runs on the remote over ssh. Nothing connects until you test a remote or open a project on it. Passwords are never asked for; use keys or ssh-agent.");
+        hint(ui, &th, "Remote repositories are read-only: git runs on the remote over ssh. Nothing connects until you test a remote or open a project on it. Passwords are never asked for. Recommended: Tailscale (no keys to manage); key-based ssh only if Tailscale isn't available.");
         let mut act: Option<(&'static str, String)> = None;
         if self.settings.remotes.is_empty() && self.rs.form.is_none() {
             widgets::empty_state(ui, &th, "No remotes yet", "Add one below, import from ~/.ssh/config, or discover Tailscale peers.");
@@ -489,16 +488,17 @@ impl App {
         self.remote_form_ui(ui);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
-            if Btn::new("Add").kind(BtnKind::Primary).show(ui, &th).clicked() {
+            if Btn::new("Discover Tailscale peers").kind(BtnKind::Primary).enabled(!matches!(self.rs.peers, Some(Loadable::Loading))).show(ui, &th).clicked() {
+                self.rs_discover();
+            }
+            if Btn::new("Add manually").show(ui, &th).clicked() {
                 self.rs_form_new();
             }
             if Btn::new("Import from ~/.ssh/config").show(ui, &th).clicked() {
                 self.rs_import_open();
             }
-            if Btn::new("Discover Tailscale peers").enabled(!matches!(self.rs.peers, Some(Loadable::Loading))).show(ui, &th).clicked() {
-                self.rs_discover();
-            }
         });
+        hint(ui, &th, "Recommended: Tailscale \u{2014} no keys to manage.");
         self.remote_import_ui(ui);
         self.remote_peers_ui(ui);
     }
@@ -516,28 +516,37 @@ impl App {
             text_field(ui, &th, "Host", &mut f.host, "dev.example.com, 100.x.y.z or ssh alias");
             text_field(ui, &th, "User", &mut f.user, "optional");
             text_field(ui, &th, "Port", &mut f.port, "22");
-            row(ui, &th, "Identity file", |ui| {
-                let w = (ui.available_width() - 96.0).clamp(100.0, 280.0);
-                ui.add(egui::TextEdit::singleline(&mut f.identity_file).hint_text("optional, e.g. ~/.ssh/id_ed25519").desired_width(w).margin(vec2(8.0, 6.0)));
-                let keys = ssh_key_candidates();
-                ui.menu_button("Browse", |ui| {
-                    if keys.is_empty() {
-                        ui.label("No keys in ~/.ssh");
-                    }
-                    for k in keys {
-                        if ui.button(&k).clicked() {
-                            f.identity_file = k;
-                            ui.close_menu();
-                        }
-                    }
-                });
-            });
             row(ui, &th, "Transport", |ui| {
-                let mut i = usize::from(f.tailscale_nc);
-                if widgets::segmented(ui, &th, &["SSH", "SSH via Tailscale nc"], &mut i) {
-                    f.tailscale_nc = i == 1;
+                const T: [Transport; 3] = [Transport::TailscaleSsh, Transport::TailscaleNc, Transport::Ssh];
+                let mut i = T.iter().position(|t| *t == f.transport).unwrap_or(0);
+                let labels: [&str; 3] = if ui.available_width() >= 430.0 { ["Tailscale SSH (no key)", "SSH via Tailscale nc", "SSH (key)"] } else { ["Tailscale SSH", "Tailscale nc", "SSH key"] };
+                if widgets::segmented(ui, &th, &labels, &mut i) {
+                    f.transport = T[i];
                 }
             });
+            match f.transport {
+                Transport::TailscaleSsh => hint(ui, &th, "Recommended. Plain ssh to the tailnet name; Tailscale authenticates you, so there is no key to manage (the host must run `tailscale up --ssh`)."),
+                Transport::TailscaleNc => hint(ui, &th, "Reaches the host through `tailscale nc`; the host still needs sshd and a login (key or Tailscale SSH)."),
+                Transport::Ssh => hint(ui, &th, "Key-based SSH: use only if Tailscale isn't available."),
+            }
+            if f.transport == Transport::Ssh {
+                row(ui, &th, "Identity file", |ui| {
+                    let w = (ui.available_width() - 96.0).clamp(100.0, 280.0);
+                    ui.add(egui::TextEdit::singleline(&mut f.identity_file).hint_text("optional, e.g. ~/.ssh/id_ed25519").desired_width(w).margin(vec2(8.0, 6.0)));
+                    let keys = ssh_key_candidates();
+                    ui.menu_button("Browse", |ui| {
+                        if keys.is_empty() {
+                            ui.label("No keys in ~/.ssh");
+                        }
+                        for k in keys {
+                            if ui.button(&k).clicked() {
+                                f.identity_file = k;
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                });
+            }
             ui.checkbox(&mut f.trust_new_host, "Trust new host key");
             if f.trust_new_host {
                 widgets::banner(ui, &th, Level::Warn, "A host key seen for the first time is accepted without asking (accept-new). A changed key is still refused. Only enable this for hosts you control.", None, false);
@@ -636,6 +645,7 @@ impl App {
                 }
                 Loadable::Failed(e) => {
                     widgets::banner(ui, &th, Level::Warn, e, None, false);
+                    hint(ui, &th, "Install Tailscale (https://tailscale.com/download) and run `tailscale up` to log in. Plain SSH (key) still works: use \"Add manually\".");
                 }
                 Loadable::Ready(v) if v.is_empty() => hint(ui, &th, "No other peers on this tailnet."),
                 Loadable::Ready(v) => {
@@ -1095,6 +1105,8 @@ mod tests {
             app.rs.status.insert("alpha".into(), Status::Failed("host key not trusted yet: enable 'Trust new host key' or run `ssh <host>` once [Host key verification failed.]".into()));
             app.rs_form_new();
             app.rs.form.as_mut().unwrap().f.trust_new_host = true;
+            // narrow sizes also exercise the key-based form (identity file row)
+            app.rs.form.as_mut().unwrap().f.transport = if size.x < 1000.0 { ct_core::remote::Transport::Ssh } else { ct_core::remote::Transport::TailscaleSsh };
             app.rs.import = Some(ImportState { hosts: vec![(SshHost { alias: "web".into(), hostname: Some("web.example".into()), user: Some("me".into()), port: Some(22), identity_file: None }, false)] });
             app.rs_peers_done(Err("`tailscale` was not found in PATH: install Tailscale or enter the host manually".into()));
             app.settings_open_section(crate::settingspage::Section::Remotes);

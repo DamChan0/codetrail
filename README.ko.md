@@ -38,6 +38,10 @@ codetrail [/path/to/repo]
 
 왼쪽 탭 **Commits · Current · Search · Files · Runs**. 가운데 **Diff · Blame · Edit**, 오른쪽 인스펙터 **Why · Blame · Ask AI**. `j`/`k` 커밋 이동, `[`/`]` hunk 이동, `Ctrl+E` 편집, `Ctrl+S` 저장(1MB 초과·바이너리는 읽기 전용).
 
+## 원격 저장소
+
+다른 머신의 저장소 diff를 읽기 전용으로 봅니다: 설정 > Remotes. **Tailscale 권장** — *Discover Tailscale peers*를 눌러 머신을 고르면 Tailscale SSH로 연결되어 관리할 키가 없습니다(대상에 `tailscale up --ssh`와 git 필요). 키 기반 SSH는 tailnet 밖 머신을 위한 마지막 수단입니다. 자세한 내용: [docs/REMOTE.md](docs/REMOTE.md).
+
 ## 에이전트 연동
 
 ```

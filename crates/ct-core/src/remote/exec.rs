@@ -99,6 +99,7 @@ pub fn policy_string(spec: &RemoteSpec) -> String {
         match spec.transport {
             Transport::Ssh => "ssh",
             Transport::TailscaleNc => "tailscale_nc",
+            Transport::TailscaleSsh => "tailscale_ssh",
         },
         spec.trust_new_host
     )
@@ -137,7 +138,8 @@ pub fn ssh_args_with(spec: &RemoteSpec, control_dir: &Path, remote_cmd: &str, pe
         a.push("-p".into());
         a.push(p.to_string());
     }
-    if let Some(f) = &spec.identity_file {
+    // Tailscale SSH authenticates by tailnet identity: never offer a key
+    if let Some(f) = spec.identity_file.as_ref().filter(|_| spec.transport != Transport::TailscaleSsh) {
         a.push("-i".into());
         a.push(f.clone());
         a.push("-o".into());
@@ -524,6 +526,7 @@ mod tests {
             Box::new(|s| s.identity_file = Some("/k/a".into())),
             Box::new(|s| s.identity_file = Some("/k/b".into())),
             Box::new(|s| s.transport = Transport::TailscaleNc),
+            Box::new(|s| s.transport = Transport::TailscaleSsh),
             Box::new(|s| s.trust_new_host = true),
         ];
         for v in &variants {
@@ -646,5 +649,17 @@ mod tests {
         let big = "x".repeat(10_000);
         assert!(short_detail(&format!("Warning: Permanently added 'h' (ED25519) to the list of known hosts.\n{big}")).len() <= 410);
         assert_eq!(short_detail("a\n\nb\n"), "a | b");
+    }
+
+    #[test]
+    fn tailscale_ssh_is_plain_ssh_without_key_or_proxy() {
+        let mut s = RemoteSpec { name: "n".into(), host: "box.tail1.ts.net".into(), user: Some("me".into()), port: None, identity_file: Some("/k/id".into()), transport: Transport::TailscaleSsh, trust_new_host: false };
+        let a = ssh_args(&s, Path::new("/d"), "true");
+        assert!(!a.iter().any(|x| x == "-i" || x == "IdentitiesOnly=yes" || x.starts_with("ProxyCommand")), "{a:?}");
+        assert!(a.iter().any(|x| x == "BatchMode=yes") && a.iter().any(|x| x == "StrictHostKeyChecking=yes"));
+        assert_eq!(a[a.len() - 2], "me@box.tail1.ts.net");
+        // the same spec over plain ssh keeps the key
+        s.transport = Transport::Ssh;
+        assert!(ssh_args(&s, Path::new("/d"), "true").iter().any(|x| x == "-i"));
     }
 }
