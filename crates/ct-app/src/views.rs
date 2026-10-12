@@ -51,16 +51,8 @@ impl App {
     pub fn centre_ui(&mut self, ui: &mut Ui) {
         let th = self.th.clone();
         let m = th.m().clone();
-        if let Some(e) = self.rs.conn_lost.clone() {
-            ui.add_space(m.space[2]);
-            if widgets::banner(ui, &th, Level::Error, &format!("Connection lost — {e}"), Some("Retry"), false) == widgets::BannerAction::Action {
-                self.rs_retry();
-            }
-        }
-        if let Loadable::Failed(e) = &self.open_state {
-            ui.add_space(m.space[2]);
-            widgets::banner(ui, &th, Level::Error, &format!("Cannot open repository: {e}"), None, false);
-            widgets::empty_state(ui, &th, "No repository", "Start CodeTrail inside a git repository, or pass its path as an argument.");
+        if matches!(self.open_state, Loadable::Failed(_)) {
+            widgets::empty_state(ui, &th, "No repository", "See the message at the top.");
             return;
         }
         if self.repo_arg.as_os_str().is_empty() {
@@ -1087,6 +1079,14 @@ impl App {
         let ready = failed || (!self.busy() && self.repo.is_some() && !self.commits.is_empty() && !matches!(self.diffset, Loadable::Loading));
         if scene == "search" && self.repo.is_some() && self.search.ran.is_none() {
             self.start_search();
+        }
+        if scene == "remote-auth-fail" {
+            // the live bug: widths saved on a big screen + a remote that rejects authentication
+            self.settings.rail_width = 520.0;
+            self.settings.inspector_width = 560.0;
+            let e = ct_core::remote::describe(&ct_core::RemoteErrorKind::AuthFailed, "dmkimd@100.103.68.41: Permission denied (publickey,password).");
+            self.rs.conn_lost = Some(e.clone());
+            self.open_state = Loadable::Failed(e);
         }
         if scene == "model-picker" && !self.insp_open && !self.smoke.as_ref().is_some_and(|s| s.requested) {
             self.insp_open = true;

@@ -121,35 +121,58 @@ impl eframe::App for App {
 
 impl App {
     fn main_panes(&mut self, ctx: &egui::Context, th: &crate::theme::Theme) {
-        let narrow = ctx.screen_rect().width() < 1000.0;
-        let init_id = egui::Id::new("narrow_init");
-        if ctx.data(|d| d.get_temp::<bool>(init_id)).is_none() {
-            ctx.data_mut(|d| d.insert_temp(init_id, true));
-            if narrow {
+        use crate::panels;
+        let win_w = ctx.screen_rect().width();
+        let docked = win_w >= panels::DOCK_MIN_WINDOW;
+        // Entering a narrow window hides the inspector (it re-opens as a drawer via its button).
+        let was_docked_id = egui::Id::new("was_docked");
+        let was_docked = ctx.data(|d| d.get_temp::<bool>(was_docked_id));
+        if was_docked != Some(docked) {
+            ctx.data_mut(|d| d.insert_temp(was_docked_id, docked));
+            if !docked && was_docked.is_none_or(|w| w) {
                 self.insp_open = false;
             }
         }
-        let rail_w = self.settings.rail_width;
-        if !(narrow && self.insp_open) {
-            let max_w = if narrow { 300.0 } else { 520.0 };
-            let r = egui::SidePanel::left("rail").resizable(true).default_width(rail_w.min(max_w)).width_range(280.0..=max_w).frame(egui::Frame::new().fill(th.bg()).stroke(egui::Stroke::new(1.0, th.border()))).show(ctx, |ui| self.rail_ui(ui));
-            if !narrow && (r.response.rect.width() - rail_w).abs() > 1.0 {
-                self.settings.rail_width = r.response.rect.width();
+        // The saved widths are only replaced while the user drags a splitter (pointer down).
+        let dragging = ctx.input(|i| i.pointer.primary_down());
+        let lay = panels::panel_layout(win_w, self.settings.rail_width, self.settings.inspector_width, self.insp_open);
+        self.conn_banner(ctx, th);
+        let (rw, rlo, rhi) = lay.rail;
+        let r = egui::SidePanel::left("rail").resizable(true).default_width(rw).width_range(rlo..=rhi).frame(egui::Frame::new().fill(th.bg()).stroke(egui::Stroke::new(1.0, th.border()))).show(ctx, |ui| self.rail_ui(ui));
+        let rail_seen = ctx.data(|d| d.get_temp::<f32>(egui::Id::new("rail_seen")));
+        let now = r.response.rect.width();
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("rail_seen"), now));
+        if dragging && rail_seen.is_some_and(|p| (p - now).abs() > 0.5) {
+            self.settings.rail_width = now;
+            self.settings_dirty_at = Some(Instant::now());
+        }
+
+        if let Some((iw, lo, hi)) = lay.insp {
+            let r = egui::SidePanel::right("inspector").resizable(true).default_width(iw).width_range(lo..=hi).frame(egui::Frame::new().fill(th.bg()).stroke(egui::Stroke::new(1.0, th.border()))).show(ctx, |ui| self.inspector_ui(ui));
+            let seen = ctx.data(|d| d.get_temp::<f32>(egui::Id::new("insp_seen")));
+            let now = r.response.rect.width();
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("insp_seen"), now));
+            if dragging && seen.is_some_and(|p| (p - now).abs() > 0.5) {
+                self.settings.inspector_width = now;
                 self.settings_dirty_at = Some(Instant::now());
             }
         }
 
-        if self.insp_open {
-            let insp_w = self.settings.inspector_width;
-            let (lo, hi) = if narrow { (280.0, ctx.screen_rect().width() - 360.0) } else { (280.0, 560.0) };
-            let r = egui::SidePanel::right("inspector").resizable(true).default_width(insp_w.clamp(lo, hi.max(lo))).width_range(lo..=hi.max(lo)).frame(egui::Frame::new().fill(th.bg()).stroke(egui::Stroke::new(1.0, th.border()))).show(ctx, |ui| self.inspector_ui(ui));
-            if !narrow && (r.response.rect.width() - insp_w).abs() > 1.0 {
-                self.settings.inspector_width = r.response.rect.width();
-                self.settings_dirty_at = Some(Instant::now());
-            }
-        }
-
+        let area = ctx.available_rect();
         egui::CentralPanel::default().frame(egui::Frame::new().fill(th.sunken())).show(ctx, |ui| self.centre_ui(ui));
+
+        if let Some(dw) = lay.drawer {
+            let h = area.height();
+            let pos = egui::pos2(area.right() - dw, area.top());
+            egui::Area::new(egui::Id::new("inspector_drawer")).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
+                egui::Frame::new().fill(th.bg()).stroke(egui::Stroke::new(1.0, th.border())).show(ui, |ui| {
+                    ui.set_width(dw - 2.0);
+                    ui.set_height(h - 2.0);
+                    ui.set_max_size(vec2(dw - 2.0, h - 2.0));
+                    self.inspector_ui(ui);
+                });
+            });
+        }
     }
 
     pub fn persist_settings(&mut self) {
@@ -490,8 +513,8 @@ impl App {
 
         // Commit list.
         let row_h = th.m().commit_row_height;
-        if let Loadable::Failed(e) = &self.open_state {
-            widgets::banner(ui, &th, Level::Error, &format!("Cannot open repository: {e}"), None, false);
+        if matches!(self.open_state, Loadable::Failed(_)) {
+            widgets::empty_state(ui, &th, "Repository not opened", "See the message at the top.");
             return;
         }
         if self.open_state.is_loading() || (self.commits_loading && self.commits.is_empty()) {

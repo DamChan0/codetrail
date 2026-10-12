@@ -59,7 +59,7 @@ pub fn describe(kind: &RemoteErrorKind, detail: &str) -> String {
     let hint = match kind {
         RemoteErrorKind::HostKeyUnknown => "host key not trusted yet: enable 'Trust new host key' or run `ssh <host>` once",
         RemoteErrorKind::HostKeyChanged => "host key CHANGED (possible man-in-the-middle): verify the host, then `ssh-keygen -R <host>`",
-        RemoteErrorKind::AuthFailed => "authentication failed: add your key to the remote's authorized_keys, load it in ssh-agent or set an identity file (password prompts are disabled)",
+        RemoteErrorKind::AuthFailed => "authentication failed. Use Tailscale (no keys): set Transport to Tailscale SSH and run `tailscale set --ssh` on that machine, or add your key (authorized_keys, ssh-agent or an identity file); password prompts are disabled",
         RemoteErrorKind::Unreachable => "host unreachable: check the name/address, that sshd is running and the network/Tailscale connection",
         RemoteErrorKind::Timeout => "connection timed out",
         RemoteErrorKind::NoGit => "git was not found on the remote (non-interactive PATH)",
