@@ -52,7 +52,7 @@ fn path_str(t: &T) -> String {
 }
 
 fn log_lines_for(host: &str) -> Vec<String> {
-    std::fs::read_to_string(&env().log).unwrap().lines().filter(|l| l.contains(&format!("target=tester@{host} "))).map(String::from).collect()
+    std::fs::read_to_string(&env().log).unwrap().lines().filter(|l| l.contains(&format!("target=tester@{host} ")) && l.contains("ctl= |")).map(String::from).collect()
 }
 
 fn pgrep(pat: &str) -> bool {
@@ -121,9 +121,14 @@ fn remote_matches_local_for_the_whole_api() {
     assert!(matches!(r.read_worktree_file("/etc/passwd"), Err(Error::Invalid(_))));
     let wt = Comparison::commit_vs_worktree(&head).unwrap();
     assert_eq!(r.diff(&wt, &DiffOpts::default()).unwrap(), local.diff(&wt, &DiffOpts::default()).unwrap());
+    // uncommitted lines carry "now" as their time: compare without it
+    let norm = |mut v: Vec<BlameLine>| {
+        v.iter_mut().filter(|b| b.sha.bytes().all(|c| c == b'0')).for_each(|b| b.time = 0);
+        v
+    };
     assert_eq!(
-        r.blame(&Treeish::Worktree, "a.txt", None).unwrap(),
-        local.blame(&Treeish::Worktree, "a.txt", None).unwrap()
+        norm(r.blame(&Treeish::Worktree, "a.txt", None).unwrap()),
+        norm(local.blame(&Treeish::Worktree, "a.txt", None).unwrap())
     );
     let mut lf = local.list_files().unwrap();
     let mut rf = r.list_files().unwrap();
@@ -536,4 +541,161 @@ fn measure_overhead_with_fake_ssh() {
     };
     let (l, rm) = (time(&|| drop(local.head().unwrap())), time(&|| drop(r.head().unwrap())));
     eprintln!("overhead: local head {l:.1} ms, remote(fake ssh) head {rm:.1} ms, delta {:.1} ms", rm - l);
+}
+
+// ───────────────────────── review-fix regressions (t033) ─────────────────────────
+
+fn mkfifo(p: &Path) {
+    assert!(std::process::Command::new("mkfifo").arg(p).status().unwrap().success());
+}
+
+/// Review #2: remote worktree reads never follow symlinks out of the repository.
+#[test]
+fn remote_read_refuses_symlinks_fifos_and_oversize() {
+    let t = fixture();
+    let r = Repo::open_remote(&spec("repo-symlink"), &path_str(&t)).unwrap();
+    let root = t.path();
+    std::os::unix::fs::symlink("/etc/passwd", root.join("link")).unwrap();
+    std::os::unix::fs::symlink("/etc", root.join("dir-link")).unwrap();
+    std::os::unix::fs::symlink("dir", root.join("inner-link")).unwrap();
+    std::os::unix::fs::symlink("nowhere-at-all", root.join("dangling")).unwrap();
+    mkfifo(&root.join("pipe"));
+
+    // final symlink → typed error carrying the target, content never read
+    match r.read_worktree_file("link") {
+        Err(Error::Invalid(m)) => assert_eq!(m, "symlink: /etc/passwd"),
+        o => panic!("{o:?}"),
+    }
+    assert!(matches!(r.read_worktree_file("dangling"), Err(Error::Invalid(m)) if m == "symlink: nowhere-at-all"));
+    // symlinked intermediate directory that leaves the repository
+    let e = r.read_worktree_file("dir-link/passwd").unwrap_err();
+    assert!(matches!(&e, Error::Invalid(m) if m.contains("outside the repository")), "{e:?}");
+    // FIFO: must return immediately instead of blocking on open()
+    let t0 = Instant::now();
+    let e = r.read_worktree_file("pipe").unwrap_err();
+    assert!(matches!(&e, Error::Invalid(m) if m.contains("not a regular file")), "{e:?}");
+    assert!(t0.elapsed() < Duration::from_secs(5));
+    assert!(matches!(r.read_worktree_file("dir"), Err(Error::Invalid(m)) if m.contains("not a regular file")));
+    // a symlinked directory that stays inside the repository is fine; so is a regular file
+    assert_eq!(r.read_worktree_file("inner-link/q'uote.rs").unwrap(), b"fn main() { println!(\"$(id)\"); }\n");
+    assert_eq!(r.read_worktree_file("a.txt").unwrap(), b"one\nTWO\nthree\nfour\n");
+    // over the cap: refused before any content is transferred
+    let small = r.clone().with_max_output(10);
+    assert!(matches!(small.read_worktree_file("a.txt"), Err(Error::TooLarge { limit: 10, .. })));
+    assert!(matches!(r.read_worktree_file("missing"), Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound));
+}
+
+fn cache_path(r: &Repo, root: &Path) -> PathBuf {
+    r.fetch_records_cache_at(root).unwrap().unwrap()
+}
+
+/// Review #4/#5: the records cache never follows symlinks and validates freshness by content.
+#[test]
+fn records_cache_is_symlink_safe_and_content_validated() {
+    let t = fixture();
+    let sp = spec("repo-cache-sec");
+    let r = Repo::open_remote(&sp, &path_str(&t)).unwrap();
+    let logdir = t.path().join(".git/codetrail");
+    std::fs::create_dir_all(&logdir).unwrap();
+    let remote_log = logdir.join("log.ct");
+    std::fs::write(&remote_log, b"frame-1").unwrap();
+    let victim_dir = tempfile::tempdir().unwrap();
+    let victim = victim_dir.path().join("precious.txt");
+    std::fs::write(&victim, b"precious").unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let log = cache_path(&r, root.path());
+    let entry = log.parent().unwrap().to_path_buf();
+    // root and entry are private
+    assert_eq!(std::fs::metadata(&entry).unwrap().permissions().mode() & 0o777, 0o700);
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    // symlinked meta → not followed (victim intact), replaced by a regular file
+    std::fs::remove_file(entry.join("meta")).unwrap();
+    symlink(&victim, entry.join("meta")).unwrap();
+    std::fs::write(&remote_log, b"frame-1-and-2").unwrap();
+    let log = cache_path(&r, root.path());
+    assert_eq!(std::fs::read(&log).unwrap(), b"frame-1-and-2");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+    assert!(!std::fs::symlink_metadata(entry.join("meta")).unwrap().file_type().is_symlink());
+
+    // symlinked log.ct whose target looks "fresh" → replaced, victim intact and never returned
+    std::fs::remove_file(&log).unwrap();
+    symlink(&victim, &log).unwrap();
+    let log = cache_path(&r, root.path());
+    assert_eq!(std::fs::read(&log).unwrap(), b"frame-1-and-2");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+    assert!(!std::fs::symlink_metadata(&log).unwrap().file_type().is_symlink());
+
+    // the whole entry directory replaced by a symlink to someone else's directory
+    std::fs::remove_dir_all(&entry).unwrap();
+    symlink(victim_dir.path(), &entry).unwrap();
+    let log = cache_path(&r, root.path());
+    assert_eq!(std::fs::read(&log).unwrap(), b"frame-1-and-2");
+    assert!(!std::fs::symlink_metadata(&entry).unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read_dir(victim_dir.path()).unwrap().count(), 1, "nothing was written into the symlink target");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+
+    // predictable temp names can no longer be pre-planted: no leftovers, no foreign writes
+    assert!(std::fs::read_dir(&entry).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
+
+    // a loose root is tightened
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    cache_path(&r, root.path());
+    assert_eq!(std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o777, 0o700);
+    // a symlinked root is refused
+    let linked_root = victim_dir.path().join("root-link");
+    symlink(root.path(), &linked_root).unwrap();
+    assert!(r.fetch_records_cache_at(&linked_root).is_err());
+
+    // same size + same mtime but different bytes → still re-downloaded (digest differs)
+    let mtime = std::fs::metadata(&remote_log).unwrap().modified().unwrap();
+    std::fs::write(&remote_log, b"AAAAAAAA").unwrap();
+    std::fs::File::options().write(true).open(&remote_log).unwrap().set_modified(mtime).unwrap();
+    assert_eq!(std::fs::read(cache_path(&r, root.path())).unwrap(), b"AAAAAAAA");
+    std::fs::write(&remote_log, b"BBBBBBBB").unwrap();
+    std::fs::File::options().write(true).open(&remote_log).unwrap().set_modified(mtime).unwrap();
+    assert_eq!(std::fs::read(cache_path(&r, root.path())).unwrap(), b"BBBBBBBB");
+}
+
+/// Review #5: identity file / transport / trust policy are part of the cache namespace.
+#[test]
+fn records_cache_key_covers_every_connection_field() {
+    let t = fixture();
+    let logdir = t.path().join(".git/codetrail");
+    std::fs::create_dir_all(&logdir).unwrap();
+    std::fs::write(logdir.join("log.ct"), b"same").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let base = spec("repo-cache-key");
+    let mut seen = std::collections::HashSet::new();
+    let variants: Vec<Box<dyn Fn(&mut RemoteSpec)>> = vec![
+        Box::new(|_| {}),
+        Box::new(|s| s.identity_file = Some("/k/a".into())),
+        Box::new(|s| s.identity_file = Some("/k/b".into())),
+        Box::new(|s| s.transport = Transport::TailscaleNc),
+        Box::new(|s| s.trust_new_host = true),
+        Box::new(|s| s.port = Some(2200)),
+        Box::new(|s| s.user = Some("other".into())),
+    ];
+    for v in &variants {
+        let mut s = base.clone();
+        v(&mut s);
+        let r = Repo::open_remote(&s, &path_str(&t)).unwrap();
+        assert!(seen.insert(cache_path(&r, root.path())), "{s:?} reuses another endpoint's cache entry");
+    }
+}
+
+/// Review #7: connection tests leave no master behind; real calls keep ControlPersist.
+#[test]
+fn test_connection_uses_an_ephemeral_master() {
+    remote::test_connection(&spec("repo-eph"), Duration::from_secs(10)).unwrap();
+    let t = fixture();
+    Repo::open_remote(&spec("repo-eph2"), &path_str(&t)).unwrap();
+    let eph = log_lines_for("repo-eph");
+    assert!(eph[0].contains("ControlPersist=no") && !eph[0].contains("ControlPersist=120"), "{}", eph[0]);
+    let norm = log_lines_for("repo-eph2");
+    assert!(norm[0].contains("ControlPersist=120"), "{}", norm[0]);
+    // both address the same socket when the policy is the same
+    let cp = |l: &str| l.split(" -o ").find(|w| w.starts_with("ControlPath=")).map(|w| w.split('/').next_back().unwrap().to_string());
+    assert!(cp(&eph[0]).is_some());
 }

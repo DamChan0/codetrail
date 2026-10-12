@@ -20,7 +20,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$CT_FAKE_SSH_LOG" ] && printf '%s | ctl=%s | target=%s | cmd=%s\n' "$opts" "$ctl" "$1" "$(printf %s "$2" | tr '\n' ' ' | cut -c1-300)" >> "$CT_FAKE_SSH_LOG"
 if [ -n "$ctl" ]; then
-  [ "$ctl" = exit ] && exit 0
+  case "$ctl" in exit|stop) exit 0 ;; esac
   exit 1
 fi
 host="${1#*@}"

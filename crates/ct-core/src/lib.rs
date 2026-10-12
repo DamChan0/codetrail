@@ -9,7 +9,7 @@ mod types;
 
 pub use git::{git_slots, GitSlots, MAX_GIT_PROCS};
 pub use remote::RemoteErrorKind;
-pub use repo::GitCall;
+pub use repo::{GitCall, MAX_LOG_LIMIT};
 pub use search::{search_content, FileIndex};
 pub use types::*;
 

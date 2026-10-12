@@ -80,13 +80,43 @@ pub fn wrap_sh(script: &str) -> String {
     format!("sh -c {}", shquote(script))
 }
 
-fn control_path_arg(dir: &Path) -> String {
-    // ssh expands %-tokens in ControlPath; a literal % in the directory must be doubled
-    format!("ControlPath={}/%C", dir.to_string_lossy().replace('%', "%%"))
+/// Application-level identity of a connection: every field that changes *how* we connect or
+/// authenticate (not `name`, which is a label). ssh's own `%C` hash omits identity file, transport
+/// and host-key policy, so two different policies would share one ControlMaster.
+pub fn policy_hash(spec: &RemoteSpec) -> String {
+    format!("{:016x}", xxhash_rust::xxh3::xxh3_64(policy_string(spec).as_bytes()))
 }
 
-/// Full argument vector for `ssh` (without the program name).
+/// Canonical, unambiguous (NUL-separated) form of the connection policy; also the namespace of the
+/// records cache.
+pub fn policy_string(spec: &RemoteSpec) -> String {
+    format!(
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        spec.host,
+        spec.user.as_deref().unwrap_or(""),
+        spec.port.map_or(String::new(), |p| p.to_string()),
+        spec.identity_file.as_deref().unwrap_or(""),
+        match spec.transport {
+            Transport::Ssh => "ssh",
+            Transport::TailscaleNc => "tailscale_nc",
+        },
+        spec.trust_new_host
+    )
+}
+
+/// `ControlPath=<dir>/<16 hex policy hash>` (no `%C`; `%` in the directory is doubled for ssh).
+fn control_path_arg(dir: &Path, spec: &RemoteSpec) -> String {
+    format!("ControlPath={}/{}", dir.to_string_lossy().replace('%', "%%"), policy_hash(spec))
+}
+
+/// Full argument vector for `ssh` (without the program name); the master persists 120 s.
+#[cfg(test)]
 pub fn ssh_args(spec: &RemoteSpec, control_dir: &Path, remote_cmd: &str) -> Vec<String> {
+    ssh_args_with(spec, control_dir, remote_cmd, true)
+}
+
+/// [`ssh_args`]; `persist == false` → `ControlPersist=no` (the master exits with its last client).
+pub fn ssh_args_with(spec: &RemoteSpec, control_dir: &Path, remote_cmd: &str, persist: bool) -> Vec<String> {
     let mut a: Vec<String> = vec!["-T".into()];
     let mut o = |s: String| {
         a.push("-o".into());
@@ -97,8 +127,8 @@ pub fn ssh_args(spec: &RemoteSpec, control_dir: &Path, remote_cmd: &str) -> Vec<
     o("ServerAliveInterval=10".into());
     o("ServerAliveCountMax=3".into());
     o("ControlMaster=auto".into());
-    o("ControlPersist=120".into());
-    o(control_path_arg(control_dir));
+    o(if persist { "ControlPersist=120".into() } else { "ControlPersist=no".into() });
+    o(control_path_arg(control_dir, spec));
     // never forward anything, whatever ~/.ssh/config says
     o("ForwardAgent=no".into());
     o("ForwardX11=no".into());
@@ -125,23 +155,34 @@ pub fn ssh_args(spec: &RemoteSpec, control_dir: &Path, remote_cmd: &str) -> Vec<
     a
 }
 
-/// Max bytes of the ControlPath directory: `<dir>/` + 40-hex `%C` + ssh's 17-byte temp suffix must
-/// fit sockaddr_un.sun_path (108 incl. NUL).
+/// Max bytes of the ControlPath directory: `<dir>/` + 16-hex policy hash + ssh's 17-byte temp
+/// suffix must fit sockaddr_un.sun_path (108 incl. NUL).
 const MAX_CTL_DIR: usize = 49;
 
-fn ensure_private_dir(p: &Path) -> std::io::Result<()> {
-    match std::fs::DirBuilder::new().recursive(true).mode(0o700).create(p) {
+/// Creates `p` (0700) atomically if missing and verifies it is a real directory (never a symlink)
+/// owned by us; loosened permissions on our own directory are repaired.
+pub(super) fn ensure_private_dir(p: &Path) -> std::io::Result<()> {
+    if let Some(parent) = p.parent() {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(p) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
-    let m = std::fs::metadata(p)?;
-    // SAFETY: geteuid has no preconditions
-    if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } {
-        return Err(std::io::Error::other(format!("{} is not a directory owned by you", p.display())));
-    }
-    if m.mode() & 0o077 != 0 {
+    let check = || -> std::io::Result<std::fs::Metadata> {
+        let m = std::fs::symlink_metadata(p)?;
+        // SAFETY: geteuid has no preconditions
+        if m.file_type().is_symlink() || !m.is_dir() || m.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::other(format!("{} is not a real directory owned by you (symlink or foreign owner)", p.display())));
+        }
+        Ok(m)
+    };
+    if check()?.mode() & 0o077 != 0 {
         std::fs::set_permissions(p, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        if check()?.mode() & 0o077 != 0 {
+            return Err(std::io::Error::other(format!("cannot restrict {} to mode 0700", p.display())));
+        }
     }
     Ok(())
 }
@@ -154,55 +195,100 @@ fn control_dir_candidates() -> Vec<PathBuf> {
     if let Some(h) = std::env::var_os("HOME").filter(|x| !x.is_empty()) {
         v.push(PathBuf::from(h).join(".cache/codetrail/ssh"));
     }
+    // last resort; only used when ensure_private_dir proves it is a real directory of ours
     // SAFETY: getuid has no preconditions
     v.push(PathBuf::from(format!("/tmp/ct-ssh-{}", unsafe { libc::getuid() })));
     v
 }
 
-/// Directory for ControlMaster sockets (mode 0700, short enough for a unix socket path).
+/// First candidate that is (or can be made into) a safe private directory.
+fn pick_dir(cands: &[PathBuf]) -> Result<PathBuf> {
+    let mut last = None;
+    for c in cands {
+        if c.as_os_str().len() > MAX_CTL_DIR {
+            continue;
+        }
+        match ensure_private_dir(c) {
+            Ok(()) => return Ok(c.clone()),
+            Err(e) => last = Some(format!("{}: {e}", c.display())),
+        }
+    }
+    Err(Error::Remote {
+        kind: RemoteErrorKind::Other,
+        detail: format!("no safe directory for ssh control sockets ({})", last.unwrap_or_else(|| "no usable path".into())),
+    })
+}
+
+/// Directory for ControlMaster sockets: validated once, then cached for the process (so connect
+/// and close always agree).
 pub fn control_dir() -> Result<PathBuf> {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     if let Some(d) = DIR.get() {
         return Ok(d.clone());
     }
-    let mut last = None;
-    for c in control_dir_candidates() {
-        if c.as_os_str().len() > MAX_CTL_DIR {
-            continue;
-        }
-        match ensure_private_dir(&c) {
-            Ok(()) => {
-                let _ = DIR.set(c.clone());
-                return Ok(c);
-            }
-            Err(e) => last = Some(e),
-        }
-    }
-    Err(Error::Remote {
-        kind: RemoteErrorKind::Other,
-        detail: format!("cannot create an ssh control socket directory: {}", last.map_or("no usable path".into(), |e| e.to_string())),
-    })
+    let d = pick_dir(&control_dir_candidates())?;
+    Ok(DIR.get_or_init(|| d).clone())
 }
 
-/// `ssh` for running `remote_cmd` on the remote (stdio is set up by the caller).
-pub fn ssh_command(spec: &RemoteSpec, remote_cmd: &str) -> Result<Command> {
+/// At most this many ControlMasters are kept alive by one process.
+pub const MAX_MASTERS: usize = 8;
+
+/// LRU list of the policies we have started a persistent master for (front = least recent).
+struct Registry(Vec<(String, RemoteSpec)>);
+
+impl Registry {
+    /// Marks `spec` used; returns the least recently used spec to shut down when over the cap.
+    fn touch(&mut self, spec: &RemoteSpec) -> Option<RemoteSpec> {
+        let key = policy_hash(spec);
+        if let Some(i) = self.0.iter().position(|(k, _)| *k == key) {
+            let e = self.0.remove(i);
+            self.0.push(e);
+            return None;
+        }
+        let evicted = (self.0.len() >= MAX_MASTERS).then(|| self.0.remove(0).1);
+        self.0.push((key, spec.clone()));
+        evicted
+    }
+
+    fn forget(&mut self, spec: &RemoteSpec) {
+        let key = policy_hash(spec);
+        self.0.retain(|(k, _)| *k != key);
+    }
+}
+
+static REGISTRY: parking_lot::Mutex<Registry> = parking_lot::Mutex::new(Registry(Vec::new()));
+
+/// `ssh` for running `remote_cmd` on the remote (stdio is set up by the caller). `persist`: leave
+/// the ControlMaster up for 120 s (counted against [`MAX_MASTERS`]; the LRU master is stopped).
+pub fn ssh_command(spec: &RemoteSpec, remote_cmd: &str, persist: bool) -> Result<Command> {
     spec.validate()?;
     let dir = control_dir()?;
+    if persist {
+        let evicted = REGISTRY.lock().touch(spec);
+        if let Some(old) = evicted {
+            // `stop`: no new sessions, running ones finish; the master then exits
+            control_op(&old, "stop");
+        }
+    }
     let mut c = Command::new(ssh_bin());
-    c.args(ssh_args(spec, &dir, remote_cmd));
+    c.args(ssh_args_with(spec, &dir, remote_cmd, persist));
     Ok(c)
 }
 
 /// `ssh -O exit` for the ControlMaster of `spec`; bounded to 2 s, never errors.
 pub fn close(spec: &RemoteSpec) {
+    REGISTRY.lock().forget(spec);
+    control_op(spec, "exit");
+}
+
+/// `ssh -O <op>` against the validated, cached control directory; bounded to 2 s.
+fn control_op(spec: &RemoteSpec, op: &str) {
     if spec.validate().is_err() {
         return;
     }
-    let Some(dir) = control_dir_candidates().into_iter().find(|d| d.is_dir() && d.as_os_str().len() <= MAX_CTL_DIR) else {
-        return;
-    };
+    let Ok(dir) = control_dir() else { return };
     let mut c = Command::new(ssh_bin());
-    c.args(["-O", "exit", "-o"]).arg(control_path_arg(&dir));
+    c.args(["-O", op, "-o"]).arg(control_path_arg(&dir, spec));
     if let Some(p) = spec.port {
         c.args(["-p", &p.to_string()]);
     }
@@ -355,13 +441,15 @@ mod tests {
             "ServerAliveCountMax=3",
             "ControlMaster=auto",
             "ControlPersist=120",
-            "ControlPath=/run/user/1/codetrail-ssh/%C",
             "StrictHostKeyChecking=yes",
             "ForwardAgent=no",
             "ForwardX11=no",
         ] {
             assert_eq!(a[pos(&a, o) - 1], "-o", "{o}");
         }
+        let cp = format!("ControlPath=/run/user/1/codetrail-ssh/{}", policy_hash(&spec()));
+        assert_eq!(a[pos(&a, &cp) - 1], "-o");
+        assert!(!a.iter().any(|x| x.contains("%C")), "ssh's %C hash must not be used");
         let n = a.len();
         assert_eq!(&a[n - 3..], ["--", "box.example", "CMD"]);
         assert!(!a.iter().any(|x| x == "-p" || x == "-i" || x.starts_with("ProxyCommand") || x.contains("IdentitiesOnly")));
@@ -414,7 +502,111 @@ mod tests {
     #[test]
     fn control_path_percent_is_escaped() {
         let a = ssh_args(&spec(), Path::new("/we%ird"), "x");
-        assert!(a.iter().any(|x| x == "ControlPath=/we%%ird/%C"));
+        assert!(a.iter().any(|x| *x == format!("ControlPath=/we%%ird/{}", policy_hash(&spec()))));
+    }
+
+    fn control_path_of(s: &RemoteSpec) -> String {
+        let a = ssh_args(s, Path::new("/d"), "x");
+        a.into_iter().find(|x| x.starts_with("ControlPath=")).unwrap()
+    }
+
+    /// Regression (review #1): ssh's `%C` ignores identity/transport/host-key policy, so specs that
+    /// differ in any connection field must never share a ControlPath.
+    #[test]
+    fn every_connection_field_changes_the_control_path() {
+        let base = spec();
+        let mut seen = std::collections::HashSet::new();
+        assert!(seen.insert(control_path_of(&base)));
+        let variants: Vec<Box<dyn Fn(&mut RemoteSpec)>> = vec![
+            Box::new(|s| s.host = "other.example".into()),
+            Box::new(|s| s.user = Some("bob".into())),
+            Box::new(|s| s.port = Some(2222)),
+            Box::new(|s| s.identity_file = Some("/k/a".into())),
+            Box::new(|s| s.identity_file = Some("/k/b".into())),
+            Box::new(|s| s.transport = Transport::TailscaleNc),
+            Box::new(|s| s.trust_new_host = true),
+        ];
+        for v in &variants {
+            let mut s = base.clone();
+            v(&mut s);
+            assert!(seen.insert(control_path_of(&s)), "{s:?} shares a ControlPath");
+        }
+        // the label is not part of the policy
+        let mut renamed = base.clone();
+        renamed.name = "other label".into();
+        assert_eq!(control_path_of(&renamed), control_path_of(&base));
+        // field boundaries cannot be forged: user "a" + host "b" vs host "ab"
+        let mut x = base.clone();
+        x.user = Some("a".into());
+        x.host = "b".into();
+        let mut y = base.clone();
+        y.host = "ab".into();
+        assert_ne!(control_path_of(&x), control_path_of(&y));
+    }
+
+    #[test]
+    fn control_path_fits_a_unix_socket() {
+        let dir = "d".repeat(MAX_CTL_DIR);
+        let cp = control_path_of_dir(&spec(), Path::new(&dir));
+        // ssh appends a 17-byte ".XXXXXXXXXXXXXXXX" temp suffix while binding; sun_path is 108 incl. NUL
+        assert!(cp.len() + 17 < 100, "{} bytes", cp.len());
+    }
+
+    fn control_path_of_dir(s: &RemoteSpec, d: &Path) -> String {
+        control_path_arg(d, s).strip_prefix("ControlPath=").unwrap().to_string()
+    }
+
+    #[test]
+    fn ephemeral_master_does_not_persist() {
+        let a = ssh_args_with(&spec(), Path::new("/d"), "x", false);
+        assert!(a.iter().any(|x| x == "ControlPersist=no") && !a.iter().any(|x| x == "ControlPersist=120"));
+    }
+
+    /// Regression (review #5): symlinks and foreign owners are rejected, never followed.
+    #[test]
+    fn control_dir_rejects_symlinks_and_picks_the_next_safe_candidate() {
+        let t = tempfile::tempdir().unwrap();
+        let victim = t.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::set_permissions(&victim, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let planted = t.path().join("ct-ssh-planted");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let e = ensure_private_dir(&planted).unwrap_err();
+        assert!(e.to_string().contains("symlink"), "{e}");
+        // the victim directory was not chmod'ed through the link
+        assert_eq!(std::fs::metadata(&victim).unwrap().mode() & 0o777, 0o755);
+        // a dangling symlink is rejected too
+        let dangling = t.path().join("dangling");
+        std::os::unix::fs::symlink(t.path().join("nowhere"), &dangling).unwrap();
+        assert!(ensure_private_dir(&dangling).is_err());
+        // only unsafe candidates → typed error, no panic, no fallback to /tmp guessing
+        let err = pick_dir(&[planted.clone(), dangling.clone()]).unwrap_err();
+        assert!(matches!(&err, Error::Remote { kind: RemoteErrorKind::Other, detail } if detail.contains("no safe directory")), "{err:?}");
+        // a later safe candidate is used
+        let good = t.path().join("good/ssh");
+        assert_eq!(pick_dir(&[planted, good.clone()]).unwrap(), good);
+        assert_eq!(std::fs::symlink_metadata(&good).unwrap().mode() & 0o777, 0o700);
+        // loosened permissions on our own dir are repaired
+        std::fs::set_permissions(&good, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        ensure_private_dir(&good).unwrap();
+        assert_eq!(std::fs::metadata(&good).unwrap().mode() & 0o777, 0o700);
+    }
+
+    /// Regression (review #9): at most MAX_MASTERS live masters; the LRU one is evicted.
+    #[test]
+    fn master_registry_is_capped_lru() {
+        let mk = |i: usize| RemoteSpec { host: format!("h{i}"), ..spec() };
+        let mut r = Registry(Vec::new());
+        for i in 0..MAX_MASTERS {
+            assert!(r.touch(&mk(i)).is_none());
+        }
+        assert!(r.touch(&mk(0)).is_none(), "re-touching an existing master evicts nothing");
+        let ev = r.touch(&mk(100)).expect("over the cap");
+        assert_eq!(ev.host, "h1", "h0 was just used, h1 is the least recently used");
+        assert_eq!(r.0.len(), MAX_MASTERS);
+        r.forget(&mk(2));
+        assert_eq!(r.0.len(), MAX_MASTERS - 1);
+        assert!(r.touch(&mk(101)).is_none());
     }
 
     #[test]

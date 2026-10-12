@@ -22,6 +22,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const REMOTE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Hard cap for buffered stdout (and for a single streamed line).
 pub const MAX_OUTPUT: usize = 64 * 1024 * 1024;
+/// Default cap for the cumulative stdout of one streamed command ([`run_lines`]).
+pub const MAX_TOTAL_OUTPUT: usize = 256 * 1024 * 1024;
 const MAX_STDERR: usize = 64 * 1024;
 /// Process-wide cap on concurrently running git subprocesses.
 pub const MAX_GIT_PROCS: usize = 4;
@@ -33,11 +35,17 @@ pub struct RunOpts {
     pub max_output: usize,
     /// `Some`: run git on that host through ssh instead of locally (`cwd` is then a remote path).
     pub remote: Option<Arc<RemoteSpec>>,
+    /// Cumulative stdout cap of a streamed command (`run_lines*`); exceeding it kills the child and
+    /// yields `Error::TooLarge`. Buffered `run` is governed by `max_output` alone.
+    pub max_total_output: usize,
+    /// Remote only: let the ssh ControlMaster exit with this call (`ControlPersist=no`) instead of
+    /// lingering 120 s (connection tests).
+    pub ephemeral_master: bool,
 }
 
 impl Default for RunOpts {
     fn default() -> Self {
-        RunOpts { timeout: DEFAULT_TIMEOUT, cancel: None, max_output: MAX_OUTPUT, remote: None }
+        RunOpts { timeout: DEFAULT_TIMEOUT, cancel: None, max_output: MAX_OUTPUT, remote: None, max_total_output: MAX_TOTAL_OUTPUT, ephemeral_master: false }
     }
 }
 
@@ -59,8 +67,7 @@ impl Drop for Slot {
 }
 
 impl GitSlots {
-    fn acquire(&'static self, o: &RunOpts) -> Result<Slot> {
-        let deadline = Instant::now() + o.timeout;
+    fn acquire(&'static self, o: &RunOpts, deadline: Instant) -> Result<Slot> {
         let mut g = self.used.lock();
         loop {
             if let Some(c) = &o.cancel {
@@ -124,7 +131,7 @@ impl Proc {
         if let Some(spec) = &o.remote {
             let cwd = cwd.to_str().ok_or_else(|| Error::Invalid(format!("remote path {cwd:?} is not UTF-8")))?;
             let script = exec::git_script(cwd, args)?;
-            let cmd = exec::ssh_command(spec, &exec::wrap_sh(&script))?;
+            let cmd = exec::ssh_command(spec, &exec::wrap_sh(&script), !o.ephemeral_master)?;
             let desc = format!("git {} (on {})", args.join(" "), spec.name);
             return Proc::start(cmd, desc, true, stdin_data, o);
         }
@@ -147,12 +154,14 @@ impl Proc {
             }
         }
         exec::check_no_nul(script)?;
-        let cmd = exec::ssh_command(spec, &exec::wrap_sh(script))?;
+        let cmd = exec::ssh_command(spec, &exec::wrap_sh(script), !o.ephemeral_master)?;
         Proc::start(cmd, format!("{desc} (on {})", spec.name), true, stdin_data, o)
     }
 
     fn start(mut cmd: Command, desc: String, remote: bool, stdin_data: Option<Vec<u8>>, o: &RunOpts) -> Result<Proc> {
-        let slot = git_slots().acquire(o)?;
+        // one absolute deadline for the whole call: slot wait and runtime share it
+        let deadline = Instant::now() + o.timeout;
+        let slot = git_slots().acquire(o, deadline)?;
         cmd.process_group(0)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -179,7 +188,6 @@ impl Proc {
         let watchdog = {
             let (child, done, why) = (child.clone(), done.clone(), why.clone());
             let cancel = o.cancel.clone();
-            let deadline = Instant::now() + o.timeout;
             let h = thread::spawn(move || {
                 while !done.load(Ordering::Acquire) {
                     let reason = if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -373,17 +381,19 @@ pub fn run_lines_ok(
     let mut rd = BufReader::with_capacity(64 * 1024, p.take_stdout());
     let mut buf = Vec::new();
     let mut stopped = false;
+    let mut total = 0usize;
     loop {
         buf.clear();
         // a single line is bounded too (a huge minified blob in a diff must not exhaust memory)
         match (&mut rd).take(o.max_output as u64 + 1).read_until(b'\n', &mut buf) {
             Ok(0) => break,
             Ok(_) => {
-                if buf.len() > o.max_output {
+                total = total.saturating_add(buf.len());
+                if buf.len() > o.max_output || total > o.max_total_output {
                     p.kill();
                     drop(rd);
                     let _ = p.finish(&[-1, 128 + 9, 141]);
-                    return Err(Error::TooLarge { cmd: p_desc(args), limit: o.max_output });
+                    return Err(Error::TooLarge { cmd: p_desc(args), limit: if buf.len() > o.max_output { o.max_output } else { o.max_total_output } });
                 }
                 if buf.last() == Some(&b'\n') {
                     buf.pop();
@@ -413,4 +423,61 @@ fn p_desc(args: &[&str]) -> String {
 
 pub fn is_hex40(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review #6: the timeout is one absolute deadline for slot wait + runtime (it used to restart
+    /// after the wait, allowing ~2x). This is the only lib unit test that touches the slot pool.
+    #[test]
+    fn timeout_covers_slot_wait_plus_runtime() {
+        let o = RunOpts { timeout: Duration::from_millis(700), ..RunOpts::default() };
+        let far = Instant::now() + Duration::from_secs(30);
+        // hold every slot ourselves, free one after 0.4 s
+        let mut held: Vec<Slot> = (0..MAX_GIT_PROCS).map(|_| git_slots().acquire(&o, far).unwrap()).collect();
+        let one = held.pop().unwrap();
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            drop(one);
+        });
+        let t0 = Instant::now();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("0.5"); // would end at ~0.9 s: after the 0.7 s budget, before a restarted budget
+        let mut p = Proc::start(cmd, "sleep".into(), false, None, &o).unwrap();
+        let waited = t0.elapsed();
+        // like `collect`: read to EOF (the watchdog kills the group at the deadline), then reap
+        let _ = std::io::copy(&mut p.take_stdout(), &mut std::io::sink());
+        let e = p.finish(&[]).unwrap_err();
+        let total = t0.elapsed();
+        releaser.join().unwrap();
+        drop(held);
+        assert!(waited >= Duration::from_millis(350), "slot was free too early: {waited:?}");
+        assert!(matches!(e, Error::Timeout(_)), "{e:?}");
+        assert!(total < Duration::from_millis(700 + 250), "{total:?}");
+    }
+
+    /// Review #3: the cumulative cap applies across lines, not per line.
+    #[test]
+    fn total_output_budget_is_cumulative() {
+        let dir = std::env::temp_dir();
+        // `git --list-cmds=main` prints many short lines (a few KiB in total)
+        let small = RunOpts { max_total_output: 200, ..RunOpts::default() };
+        let mut n = 0;
+        let e = run_lines(&dir, &["--list-cmds=main,nohelpers"], &small, |_| {
+            n += 1;
+            true
+        })
+        .unwrap_err();
+        assert!(matches!(e, Error::TooLarge { limit: 200, .. }), "{e:?}");
+        assert!(n > 3, "streamed some lines first ({n})");
+        let mut total = 0;
+        run_lines(&dir, &["--list-cmds=main,nohelpers"], &RunOpts::default(), |l| {
+            total += l.len();
+            true
+        })
+        .unwrap();
+        assert!(total > 200);
+    }
 }

@@ -137,7 +137,8 @@ fn map_timeout(e: Error, spec: &RemoteSpec) -> Error {
 /// One ssh round trip: remote hostname, `$HOME` and git version.
 pub fn test_connection(spec: &RemoteSpec, timeout: Duration) -> Result<RemoteInfo> {
     spec.validate()?;
-    let o = RunOpts { timeout, max_output: 64 * 1024, remote: Some(Arc::new(spec.clone())), ..RunOpts::default() };
+    // ephemeral: a connection test must not leave a ControlMaster behind (cap on live masters)
+    let o = RunOpts { timeout, max_output: 64 * 1024, remote: Some(Arc::new(spec.clone())), ephemeral_master: true, ..RunOpts::default() };
     // `printf '%s\n'` (not the bare `%s`) so $HOME and the git version are on separate lines
     let script = "(hostname 2>/dev/null || uname -n); printf '%s\\n' \"$HOME\"; git --version";
     let t0 = Instant::now();

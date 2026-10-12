@@ -15,6 +15,35 @@ const LOG_FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s";
 /// Entries kept by [`Repo::list_files`] on a remote repository.
 const MAX_REMOTE_FILES: usize = 200_000;
 
+/// `Repo::log` / `file_history` / `line_history` never return more commits than this.
+pub const MAX_LOG_LIMIT: usize = 20_000;
+/// Cap on the summed size of the commit metadata one `log`/`file_history` call may hold.
+const MAX_LOG_META_BYTES: usize = 64 * 1024 * 1024;
+/// Author / e-mail / subject / decoration fields longer than this are cut (with `…`).
+const MAX_META_FIELD: usize = 4096;
+
+// exit codes of the remote `read_worktree_file` guard script
+const RC_SYMLINK: i32 = 90;
+const RC_NOT_REGULAR: i32 = 91;
+const RC_TOO_BIG: i32 = 92;
+const RC_ESCAPE: i32 = 93;
+const RC_MISSING: i32 = 94;
+
+fn clip(s: &str) -> String {
+    if s.len() <= MAX_META_FIELD {
+        return s.to_string();
+    }
+    let mut n = MAX_META_FIELD;
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    format!("{}…", &s[..n])
+}
+
+fn commit_bytes(c: &CommitMeta) -> usize {
+    64 + c.sha.len() + c.author.len() + c.email.len() + c.subject.len() + c.parents.iter().map(|p| p.len() + 24).sum::<usize>() + c.refs.iter().map(|r| r.len() + 24).sum::<usize>()
+}
+
 /// Per-call overrides for [`Repo::git_output`]; the default inherits the handle's settings.
 #[derive(Clone, Debug, Default)]
 pub struct GitCall {
@@ -185,6 +214,13 @@ impl Repo {
         self
     }
 
+    /// Cap on the cumulative stdout of one streamed command (log, search, ...; default 256 MiB);
+    /// exceeding it kills git and yields `Error::TooLarge`.
+    pub fn with_max_total_output(mut self, bytes: usize) -> Repo {
+        self.opts.max_total_output = bytes;
+        self
+    }
+
     /// Setting the flag kills in-flight git subprocesses of this handle (→ `Error::Cancelled`).
     pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Repo {
         self.opts.cancel = Some(cancel);
@@ -285,12 +321,13 @@ impl Repo {
         if q.limit == 0 {
             return Ok(Vec::new());
         }
+        let limit = q.limit.min(MAX_LOG_LIMIT);
         let mut args: Vec<String> = if q.path_is_pathspec { Vec::new() } else { vec!["--literal-pathspecs".into()] };
         args.extend(["log".into(), LOG_FORMAT.into(), "--no-show-signature".into()]);
         if q.skip > 0 {
             args.push(format!("--skip={}", q.skip));
         }
-        args.push(format!("--max-count={}", q.limit));
+        args.push(format!("--max-count={limit}"));
         if q.first_parent {
             args.push("--first-parent".into());
         }
@@ -318,13 +355,23 @@ impl Repo {
             args.push(p.clone());
         }
         let v: Vec<&str> = args.iter().map(String::as_str).collect();
-        let mut out = Vec::with_capacity(q.limit.min(1024));
+        let mut out = Vec::with_capacity(limit.min(1024));
+        let mut meta_bytes = 0usize;
+        let mut over_budget = false;
         let res = git::run_lines(&self.root, &v, &self.opts, |line| {
             if let Some(c) = parse_commit_line(line) {
+                meta_bytes += commit_bytes(&c);
+                if meta_bytes > MAX_LOG_META_BYTES {
+                    over_budget = true;
+                    return false;
+                }
                 out.push(c);
             }
-            out.len() < q.limit
+            out.len() < limit
         });
+        if over_budget {
+            return Err(Error::TooLarge { cmd: "git log".into(), limit: MAX_LOG_META_BYTES });
+        }
         match res {
             Ok(()) => Ok(out),
             Err(Error::Git { .. }) if q.rev.is_none() && !q.all_refs && self.run(&["rev-parse", "--verify", "-q", "HEAD"]).is_err() => {
@@ -340,6 +387,7 @@ impl Repo {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let limit = limit.min(MAX_LOG_LIMIT);
         let mut args: Vec<String> =
             vec!["--literal-pathspecs".into(), "log".into(), LOG_FORMAT.into(), format!("--max-count={limit}")];
         match line_range {
@@ -360,12 +408,22 @@ impl Repo {
         }
         let v: Vec<&str> = args.iter().map(String::as_str).collect();
         let mut out = Vec::new();
+        let mut meta_bytes = 0usize;
+        let mut over_budget = false;
         git::run_lines(&self.root, &v, &self.opts, |line| {
             if let Some(c) = parse_commit_line(line) {
+                meta_bytes += commit_bytes(&c);
+                if meta_bytes > MAX_LOG_META_BYTES {
+                    over_budget = true;
+                    return false;
+                }
                 out.push(c);
             }
             out.len() < limit
         })?;
+        if over_budget {
+            return Err(Error::TooLarge { cmd: "git log".into(), limit: MAX_LOG_META_BYTES });
+        }
         Ok(out)
     }
 
@@ -377,6 +435,7 @@ impl Repo {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let limit = limit.min(MAX_LOG_LIMIT);
         if s == 0 || e < s {
             return Err(Error::Invalid(format!("invalid line range {s}-{e}")));
         }
@@ -565,8 +624,16 @@ impl Repo {
         self.run(&["cat-file", "blob", &spec])
     }
 
-    /// Reads a working-tree file (rejects absolute paths and `..`). Remote: `cat` over ssh,
-    /// capped by the handle's output limit (→ `Error::TooLarge`).
+    /// Reads a working-tree file (rejects absolute paths and `..`).
+    ///
+    /// Remote: one ssh round trip runs a guard script first and `cat`s only a plain regular file that
+    /// lives under the real (symlink-resolved) repository root and is at most the handle's output
+    /// limit: a final symlink → `Error::Invalid("symlink: <target>")` (content is never read),
+    /// a symlinked intermediate directory leaving the repository → `Error::Invalid`, FIFOs/devices/
+    /// directories → `Error::Invalid("not a regular file")`, too big → `Error::TooLarge`, missing →
+    /// `Error::Io(NotFound)`. Limit: the check and the `cat` are separate steps on the remote, so a
+    /// concurrent writer on the remote can still swap the file for a symlink in between (TOCTOU);
+    /// closing that needs openat2/O_NOFOLLOW helpers on the remote, which plain `sh` lacks.
     pub fn read_worktree_file(&self, path: &str) -> Result<Vec<u8>> {
         let p = Path::new(path);
         if p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_))) {
@@ -574,15 +641,35 @@ impl Repo {
         }
         if let Some(spec) = self.remote() {
             let root = self.root.to_str().ok_or_else(|| Error::Invalid("remote root is not UTF-8".into()))?;
-            let script = format!("cd {} && exec cat -- {}", crate::remote::exec::quote_path(root), crate::remote::exec::shquote(path));
-            return git::run_remote_script(spec, &script, "cat file", None, &self.opts, &[])
-                .map(|(b, _)| b)
-                .map_err(|e| match e {
-                    Error::Git { stderr, .. } if stderr.contains("No such file or directory") => {
-                        Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, stderr))
-                    }
-                    o => o,
-                });
+            crate::remote::exec::check_no_nul(path)?;
+            let script = format!(
+                "cd {root} || exit 97; rr=$(pwd -P) || exit 97; f=./{rel}; \\
+                 if [ -L \"$f\" ]; then readlink \"$f\"; exit {SYMLINK}; fi; \\
+                 [ -e \"$f\" ] || exit {MISSING}; \\
+                 d=$(dirname \"$f\"); rd=$(cd -P \"$d\" 2>/dev/null && pwd -P) || exit {MISSING}; \\
+                 case \"$rd\" in \"$rr\"|\"$rr\"/*) ;; *) exit {ESCAPE};; esac; \\
+                 [ -f \"$f\" ] || exit {NOT_REGULAR}; \\
+                 [ -z \"$(find \"$f\" -prune -size +{cap}c 2>/dev/null)\" ] || exit {TOO_BIG}; \\
+                 exec cat -- \"$f\"",
+                root = crate::remote::exec::quote_path(root),
+                rel = crate::remote::exec::shquote(path),
+                cap = self.opts.max_output,
+                SYMLINK = RC_SYMLINK,
+                MISSING = RC_MISSING,
+                ESCAPE = RC_ESCAPE,
+                NOT_REGULAR = RC_NOT_REGULAR,
+                TOO_BIG = RC_TOO_BIG,
+            );
+            let ok = [RC_SYMLINK, RC_MISSING, RC_ESCAPE, RC_NOT_REGULAR, RC_TOO_BIG];
+            let (out, code) = git::run_remote_script(spec, &script, "read file", None, &self.opts, &ok)?;
+            return match code {
+                0 => Ok(out),
+                RC_SYMLINK => Err(Error::Invalid(format!("symlink: {}", lossy(&out).trim_end_matches('\n')))),
+                RC_MISSING => Err(Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{path}: no such file")))),
+                RC_ESCAPE => Err(Error::Invalid(format!("{path}: reaches outside the repository through a symlink"))),
+                RC_NOT_REGULAR => Err(Error::Invalid(format!("{path}: not a regular file"))),
+                _ => Err(Error::TooLarge { cmd: format!("read {path}"), limit: self.opts.max_output }),
+            };
         }
         Ok(std::fs::read(self.root.join(p))?)
     }
@@ -702,11 +789,11 @@ fn parse_commit_line(line: &[u8]) -> Option<CommitMeta> {
     Some(CommitMeta {
         sha: sha.to_string(),
         parents: parents.split(' ').filter(|p| !p.is_empty()).map(str::to_string).collect(),
-        author: author.to_string(),
-        email: email.to_string(),
+        author: clip(author),
+        email: clip(email),
         time,
-        subject: subject.to_string(),
-        refs: deco.split(", ").filter(|d| !d.is_empty()).map(str::to_string).collect(),
+        subject: clip(subject),
+        refs: clip(deco).split(", ").filter(|d| !d.is_empty()).map(str::to_string).collect(),
     })
 }
 
