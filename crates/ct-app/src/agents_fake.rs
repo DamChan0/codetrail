@@ -234,6 +234,9 @@ impl RunService for FakeRuns {
     fn set_max_concurrent(&self, n: usize) {
         self.log.lock().push(format!("max {n}"));
     }
+    fn set_limits(&self, max_rss_mb: u64, max_runtime_min: u64, max_total_rss_mb: u64) {
+        self.log.lock().push(format!("limits {max_rss_mb} {max_runtime_min} {max_total_rss_mb}"));
+    }
     fn shutdown(&self) {
         let ids: Vec<String> = self.infos.lock().iter().filter(|r| r.state.is_active()).map(|r| r.id.clone()).collect();
         for id in ids {

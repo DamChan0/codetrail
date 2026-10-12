@@ -114,7 +114,7 @@ pub fn fmt_mb(kb: u64) -> String {
 impl App {
     /// Every 2 s while focused; nothing at all while unfocused.
     pub fn res_tick(&mut self, ctx: &egui::Context) {
-        if self.smoke.is_some() {
+        if self.smoke.is_some() || !self.settings.status_monitor {
             return;
         }
         if !ctx.input(|i| i.focused) {
@@ -175,7 +175,7 @@ mod tests {
 impl App {
     /// "RAM 143 MB · CPU 0%", plus children and the runs subtotal when there are any.
     pub fn resource_label(&self, ui: &mut egui::Ui, th: &crate::theme::Theme, font: egui::FontId) {
-        let Some(s) = self.res.sample else { return };
+        let Some(s) = self.res.sample.filter(|_| self.settings.status_monitor) else { return };
         let narrow = ui.ctx().screen_rect().width() < 1000.0;
         let tint = |lvl: u8| match lvl {
             2 => crate::widgets::level_color(th, crate::widgets::Level::Error),

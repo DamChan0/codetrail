@@ -90,6 +90,13 @@ impl RunService for RealRuns {
     fn set_max_concurrent(&self, n: usize) {
         self.0.set_max_concurrent(n);
     }
+    fn set_limits(&self, max_rss_mb: u64, max_runtime_min: u64, max_total_rss_mb: u64) {
+        let mut l = self.0.limits();
+        l.max_rss_mb = max_rss_mb;
+        l.max_runtime_min = max_runtime_min;
+        self.0.set_limits(l);
+        self.0.set_max_total_rss_mb(max_total_rss_mb);
+    }
     fn shutdown(&self) {
         self.0.shutdown_all();
     }

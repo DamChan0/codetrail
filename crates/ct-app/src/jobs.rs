@@ -39,6 +39,9 @@ pub enum JobKind {
     RunFinish,
     RunReview,
     Browse,
+    RemoteTest,
+    RemoteBrowse,
+    Discover,
     Status,
     Resources,
 }

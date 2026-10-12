@@ -14,9 +14,12 @@ mod jobs;
 mod currentui;
 mod projectapp;
 mod railsplit;
+mod remote_backend;
+mod remoteapp;
 mod resmon;
 mod proc;
 mod projects;
+mod settingspage;
 mod timetravel;
 mod worktree;
 mod wtapp;
@@ -34,7 +37,7 @@ use std::process::ExitCode;
 
 const VERSION: &str = concat!("codetrail ", env!("CARGO_PKG_VERSION"), " (", env!("CT_GIT_SHA"), " ", env!("CT_BUILD_DATE"), ")");
 
-const USAGE: &str = "codetrail [REPO]\n       codetrail <install|hook|note|record|ask|export> ...\n       codetrail --smoke REPO --screenshot OUT.png [--scene commit|split|search|why|light|settings|runs|runs-stream|accounts|model-picker|new-run|project-picker|folder-browser|worktree|current-dirty|current-clean|history-time-travel|mode-sticky|resources] [--size WxH] [--query TEXT]";
+const USAGE: &str = "codetrail [REPO]\n       codetrail <install|hook|note|record|ask|export> ...\n       codetrail --smoke REPO --screenshot OUT.png [--scene commit|split|search|why|light|settings|settings-page|runs|runs-stream|accounts|model-picker|new-run|project-picker|folder-browser|remote-settings|remote-picker|remote-commit|worktree|current-dirty|current-clean|history-time-travel|mode-sticky|resources] [--size WxH] [--query TEXT]";
 
 struct Args {
     repo: Option<PathBuf>,
@@ -57,7 +60,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--screenshot" => shot = Some(PathBuf::from(val("--screenshot")?)),
             "--scene" => {
                 scene = val("--scene")?;
-                if !["commit", "split", "search", "why", "light", "settings", "runs", "runs-stream", "accounts", "model-picker", "new-run", "project-picker", "folder-browser", "worktree", "current-dirty", "current-clean", "history-time-travel", "mode-sticky", "resources"].contains(&scene.as_str()) {
+                if !["commit", "split", "search", "why", "light", "settings", "settings-page", "runs", "runs-stream", "accounts", "model-picker", "new-run", "project-picker", "folder-browser", "remote-settings", "remote-picker", "remote-commit", "worktree", "current-dirty", "current-clean", "history-time-travel", "mode-sticky", "resources"].contains(&scene.as_str()) {
                     return Err(format!("unknown scene {scene:?}"));
                 }
             }
@@ -123,19 +126,29 @@ fn main() -> ExitCode {
             if let Some(b) = tb {
                 banners.push((widgets::Level::Warn, b));
             }
-            let (settings, sb) = if smoke.is_some() { (settings::Settings::default(), None) } else { settings::Settings::load(&settings::Settings::path()) };
+            let (mut settings, sb) = if smoke.is_some() { (settings::Settings::default(), None) } else { settings::Settings::load(&settings::Settings::path()) };
+            // Remote smoke scenes run against `CT_SSH_BIN` (the fake ssh): the "remote" is this machine.
+            let smoke_scene = smoke.as_ref().map(|s| s.1.clone()).unwrap_or_default();
+            if smoke_scene.starts_with("remote-") {
+                settings.remotes = remote_backend::smoke_remotes();
+            }
             if let Some(b) = sb {
                 banners.push((widgets::Level::Warn, b));
             }
             // No path argument: reopen the last project that still exists; none -> the app opens the picker.
-            let repo_arg = repo_arg.clone().or_else(|| settings.recent.first().map(|r| PathBuf::from(&r.path))).unwrap_or_default();
+            let smoke_remote = (smoke_scene == "remote-commit").then(|| settings.remotes[0].clone());
+            let last = settings.recent.first().filter(|_| settings.startup == settings::Startup::Last && repo_arg.is_none());
+            let remote = last.and_then(|r| r.remote.as_deref()).and_then(|n| settings.remotes.iter().find(|s| s.name == n).cloned());
+            // A remote recent whose remote was deleted is not opened (the picker shows instead).
+            let last = last.filter(|r| r.remote.is_none() || remote.is_some());
+            let repo_arg = repo_arg.clone().or_else(|| last.map(|r| PathBuf::from(&r.path))).unwrap_or_default();
             let choice = fonts::discover();
             let note = fonts::install(&cc.egui_ctx, &choice);
             let th = theme::Theme { file: theme_file.clone(), ui_font: settings.ui_font_size, code_font: settings.code_font_size };
             th.apply(&cc.egui_ctx);
             let svc: std::sync::Arc<dyn agents::AgentService> = if smoke.is_some() { std::sync::Arc::new(agents_fake::FakeAgents::seeded()) } else { std::sync::Arc::new(agents_real::RealAgents) };
             let smoke = smoke.map(|(out, scene, query)| app::Smoke { scene, out, query, started: std::time::Instant::now(), stable: 0, settled_at: None, requested: false, prepared: false });
-            Ok(Box::new(app::App::new(cc.egui_ctx.clone(), repo_arg, theme_file, settings, banners, note, smoke, svc)))
+            Ok(Box::new(app::App::new_with(cc.egui_ctx.clone(), repo_arg, remote.or(smoke_remote), theme_file, settings, banners, note, smoke, svc)))
         }),
     );
     match res {

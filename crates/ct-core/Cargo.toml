@@ -14,6 +14,9 @@ nucleo-matcher.workspace = true
 rayon.workspace = true
 parking_lot.workspace = true
 libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

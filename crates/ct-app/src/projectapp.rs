@@ -93,11 +93,24 @@ impl App {
     /// (accounts, models, runs service and its bridge) is process-wide and carried over, so runs
     /// of the previous repo keep running.
     pub fn switch_project(&mut self, path: PathBuf) {
-        let mut fresh = App::new(self.ctx.clone(), path, self.th.file.clone(), self.settings.clone(), std::mem::take(&mut self.banners), std::mem::take(&mut self.fonts_note), self.smoke.take(), self.ag.svc.clone());
+        self.switch_to(path, None);
+    }
+
+    /// [`App::switch_project`] for a local path or a remote project. The old remote's ssh
+    /// ControlMaster is closed (off the UI thread) unless the new project uses the same host.
+    pub fn switch_to(&mut self, path: PathBuf, remote: Option<ct_core::remote::RemoteSpec>) {
+        if let Some(old) = self.remote.take().filter(|o| remote.as_ref() != Some(o)) {
+            let be = self.rs.backend();
+            std::thread::Builder::new().name("ct-remote-close".into()).spawn(move || be.close(&old)).ok();
+        }
+        let mut fresh = App::new_with(self.ctx.clone(), path, remote, self.th.file.clone(), self.settings.clone(), std::mem::take(&mut self.banners), std::mem::take(&mut self.fonts_note), self.smoke.take(), self.ag.svc.clone());
         std::mem::swap(&mut fresh.ag, &mut self.ag);
         fresh.rail = self.rail;
         fresh.insp_open = self.insp_open;
         fresh.settings_open = self.settings_open;
+        fresh.settings_section = self.settings_section;
+        fresh.rs.backend = self.rs.backend.take();
+        fresh.rs.status = std::mem::take(&mut self.rs.status);
         fresh.ag.new_run = None;
         fresh.ag.confirm = None;
         fresh.ag.runs.selected = None;
@@ -109,8 +122,13 @@ impl App {
         self.settings_dirty_at = Some(std::time::Instant::now());
     }
 
-    pub fn pj_forget(&mut self, path: &str) {
-        remove(&mut self.settings.recent, path);
+    pub fn pj_record_remote_open(&mut self, remote: &str, path: &str) {
+        touch_at(&mut self.settings.recent, Some(remote), path, now_ms());
+        self.settings_dirty_at = Some(std::time::Instant::now());
+    }
+
+    pub fn pj_forget(&mut self, remote: Option<&str>, path: &str) {
+        remove(&mut self.settings.recent, remote, path);
         self.settings_dirty_at = Some(std::time::Instant::now());
     }
 
@@ -125,7 +143,11 @@ impl App {
         let home = home_dir();
         let root = self.current_root();
         let name = root.as_deref().map(crate::app::short_repo_name).unwrap_or_else(|| "No project".to_string());
-        let full = root.as_deref().map(|r| abbrev_home(r, &home));
+        let full = match (&self.remote, &root) {
+            (Some(spec), Some(r)) => Some(crate::remote_backend::chip_label(spec, &r.to_string_lossy())),
+            (None, Some(r)) => Some(abbrev_home(r, &home)),
+            _ => None,
+        };
         let avail = ui.available_width();
         let r = widgets::chip(ui, &th, if narrow { "" } else { "Project" }, &name, true, (avail * 0.4).clamp(120.0, 260.0));
         let r = match &root {
@@ -136,13 +158,28 @@ impl App {
             self.pj_toggle_popover();
         }
         self.pj.chip_rect = Some(r.rect);
+        if let Some(spec) = &self.remote {
+            let (col, tip) = if let Some(e) = &self.rs.conn_lost {
+                (widgets::level_color(&th, Level::Error), format!("Connection lost: {e}"))
+            } else if self.repo.is_none() {
+                (th.muted(), "Connecting…".to_string())
+            } else {
+                (th.p().diff.add.fg.0, format!("Connected to {}", spec.target()))
+            };
+            let (rect, resp) = ui.allocate_exact_size(vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 4.0, col);
+            resp.on_hover_text(tip);
+            if !narrow {
+                widgets::badge(ui, &th, "remote", th.accent());
+            }
+        }
         if let Some(s) = self.wt.summary.as_ref().filter(|s| s.dirty()) {
             let (rect, resp) = ui.allocate_exact_size(vec2(12.0, 12.0), egui::Sense::hover());
             ui.painter().circle_filled(rect.center(), 4.0, th.warn());
             resp.on_hover_text(format!("Uncommitted changes: {}", s.text()));
         }
         if let Some(full) = full {
-            let room = ui.available_width() - if narrow { 360.0 } else { 520.0 };
+            let room = ui.available_width() - if narrow { 360.0 } else { 520.0 } - if self.remote.is_some() { 48.0 } else { 0.0 };
             if room >= 70.0 {
                 let chars = (room / 7.0) as usize;
                 let g = widgets::fit(ui, &shorten_path(&full, chars), widgets::small_font(&th), th.muted(), room);
@@ -162,7 +199,8 @@ impl App {
         let anchor = self.pj.chip_rect.map(|r| r.left_bottom() + vec2(0.0, 6.0)).unwrap_or(pos2(12.0, 56.0));
         let cur = self.current_root().map(|p| p.to_string_lossy().into_owned());
         let width = 380.0_f32.min(ctx.screen_rect().width() - 24.0);
-        let (mut open_path, mut forget, mut browse) = (None::<String>, None::<String>, false);
+        let cur_remote = self.remote.as_ref().map(|r| r.name.clone());
+        let (mut open_path, mut forget, mut browse) = (None::<(Option<String>, String)>, None::<(Option<String>, String)>, false);
         let area = egui::Area::new(egui::Id::new("project_pop")).order(egui::Order::Foreground).fixed_pos(anchor).show(ctx, |ui| {
             egui::Frame::new().fill(th.raised()).stroke(egui::Stroke::new(1.0, th.border())).corner_radius(th.radius()).inner_margin(egui::Margin::same(12)).shadow(egui::Shadow { offset: [0, 4], blur: 16, spread: 0, color: egui::Color32::from_black_alpha(90) }).show(ui, |ui| {
                 ui.set_width(width);
@@ -173,20 +211,31 @@ impl App {
                 }
                 ScrollArea::vertical().max_height(300.0).auto_shrink([true, true]).show(ui, |ui| {
                     for rp in &self.settings.recent {
-                        let (resp, rect) = widgets::list_row(ui, &th, 44.0, cur.as_deref() == Some(rp.path.as_str()));
+                        let (resp, rect) = widgets::list_row(ui, &th, 44.0, cur.as_deref() == Some(rp.path.as_str()) && cur_remote == rp.remote);
                         let x = Rect::from_center_size(pos2(rect.max.x - 12.0, rect.center().y), vec2(24.0, 24.0));
                         let x_resp = ui.interact(x, ui.id().with(("forget", &rp.path)), egui::Sense::click());
-                        let top = Rect::from_min_max(rect.min + vec2(0.0, 5.0), pos2(rect.max.x - 32.0, rect.min.y + 24.0));
-                        let bot = Rect::from_min_max(pos2(rect.min.x, rect.min.y + 24.0), pos2(rect.max.x - 32.0, rect.max.y - 4.0));
+                        let mut top_right = rect.max.x - 32.0;
                         let p = Path::new(&rp.path);
+                        let sub = match &rp.remote {
+                            Some(host) => {
+                                let g = widgets::galley(ui, host, widgets::small_font(&th), th.accent());
+                                top_right -= g.size().x + 14.0;
+                                widgets::paint_badge(ui.painter(), &th, pos2(top_right, rect.min.y + 14.0), host, th.accent());
+                                top_right -= 8.0;
+                                rp.path.clone()
+                            }
+                            None => abbrev_home(p, &home),
+                        };
+                        let top = Rect::from_min_max(rect.min + vec2(0.0, 5.0), pos2(top_right, rect.min.y + 24.0));
+                        let bot = Rect::from_min_max(pos2(rect.min.x, rect.min.y + 24.0), pos2(rect.max.x - 32.0, rect.max.y - 4.0));
                         widgets::paint_text_fit(ui, top, &crate::app::short_repo_name(p), widgets::ui_font(&th), th.fg());
-                        widgets::paint_text_fit(ui, bot, &abbrev_home(p, &home), widgets::small_font(&th), th.muted());
+                        widgets::paint_text_fit(ui, bot, &sub, widgets::small_font(&th), th.muted());
                         let col = if x_resp.hovered() { th.fg() } else { th.muted() };
                         widgets::paint_icon(ui.painter(), x.center(), Icon::Close, col);
                         if x_resp.on_hover_text("Remove from recent projects").clicked() {
-                            forget = Some(rp.path.clone());
+                            forget = Some((rp.remote.clone(), rp.path.clone()));
                         } else if resp.on_hover_text(&rp.path).clicked() {
-                            open_path = Some(rp.path.clone());
+                            open_path = Some((rp.remote.clone(), rp.path.clone()));
                         }
                     }
                 });
@@ -196,16 +245,13 @@ impl App {
                 }
             });
         });
-        if let Some(p) = forget {
-            self.pj_forget(&p);
+        if let Some((r, p)) = forget {
+            self.pj_forget(r.as_deref(), &p);
         }
         if browse {
             self.pj_open_browser();
-        } else if let Some(p) = open_path {
-            if let Err(e) = self.pj_open(PathBuf::from(&p)) {
-                self.flash(e);
-                self.pj_forget(&p);
-            }
+        } else if let Some((r, p)) = open_path {
+            self.pj_open_recent(r.as_deref(), &p);
         } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) || (ctx.input(|i| i.pointer.any_click()) && !area.response.contains_pointer() && !self.pj.chip_rect.is_some_and(|r| ctx.input(|i| i.pointer.interact_pos().is_some_and(|p| r.contains(p))))) {
             self.pj.popover = false;
         }
@@ -219,7 +265,38 @@ impl App {
         let home = home_dir();
         let (mut go, mut open, mut cancel) = (None::<PathBuf>, None::<PathBuf>, false);
         let err = self.pj.open_error.clone();
+        let names: Vec<String> = self.settings.remotes.iter().map(|r| r.name.clone()).collect();
+        let mut rp = self.rs.picker.take();
+        let mut src = rp.as_ref().and_then(|p| names.iter().position(|n| *n == p.spec.name)).map_or(0, |i| i + 1);
+        let before = src;
+        let mut pick = crate::remoteapp::PickAct::default();
         crate::agentui::dialog(&th, ctx, "Open folder", 560.0, |ui| {
+            if !names.is_empty() {
+                let mut labels: Vec<&str> = vec!["Local"];
+                labels.extend(names.iter().map(String::as_str));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Source").color(th.muted()));
+                    if labels.len() <= 4 {
+                        widgets::segmented(ui, &th, &labels, &mut src);
+                    } else {
+                        egui::ComboBox::from_id_salt("pick_source").selected_text(labels[src]).show_ui(ui, |ui| {
+                            for (i, l) in labels.iter().enumerate() {
+                                ui.selectable_value(&mut src, i, *l);
+                            }
+                        });
+                    }
+                });
+            }
+            if let Some(p) = rp.as_mut().filter(|_| src == before) {
+                if let Some(e) = &err {
+                    widgets::banner(ui, &th, Level::Error, e, None, false);
+                }
+                crate::remoteapp::remote_picker_ui(ui, &th, p, &mut pick);
+                return;
+            }
+            if src != before {
+                return;
+            }
             // Breadcrumbs: every ancestor is a button.
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
@@ -303,10 +380,35 @@ impl App {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             cancel = true;
         }
+        if pick.cancel {
+            cancel = true;
+        }
+        self.rs.picker = rp;
         if cancel {
+            self.rs.picker = None;
+            self.jobs.cancel(JobKind::RemoteBrowse);
             return;
         }
         self.pj.browser = Some(b);
+        if src != before {
+            match src.checked_sub(1).and_then(|i| names.get(i)).and_then(|n| self.remote_spec(n)) {
+                Some(spec) => self.pj_remote_pick(spec),
+                None => self.pj_remote_local(),
+            }
+            return;
+        }
+        if let Some((path, known)) = pick.go {
+            self.pj.open_error = None;
+            self.pj_remote_go(path, known);
+        }
+        if let Some(path) = pick.open {
+            if let Some(spec) = self.rs.picker.as_ref().map(|p| p.spec.clone()) {
+                if let Err(e) = self.pj_open_remote(spec, path) {
+                    self.pj.open_error = Some(e);
+                }
+            }
+            return;
+        }
         if let Some(p) = open {
             if let Err(e) = self.pj_open(p) {
                 self.pj.open_error = Some(e);

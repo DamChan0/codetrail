@@ -218,6 +218,8 @@ pub trait RunService: Send + Sync {
     /// (base_sha, head_sha) of the run's result.
     fn comparison(&self, id: &str) -> Result<(String, String), String>;
     fn set_max_concurrent(&self, n: usize);
+    /// `(per-run RSS MiB, per-run runtime min, global RSS budget MiB)`; 0 disables the first two.
+    fn set_limits(&self, max_rss_mb: u64, max_runtime_min: u64, max_total_rss_mb: u64);
     /// App quit: abort every active run (staged kill) and wait for them; queued runs stay queued.
     fn shutdown(&self);
 }

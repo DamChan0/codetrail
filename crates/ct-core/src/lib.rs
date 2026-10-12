@@ -3,10 +3,13 @@
 mod diffparse;
 pub(crate) mod git;
 mod repo;
+pub mod remote;
 mod search;
 mod types;
 
 pub use git::{git_slots, GitSlots, MAX_GIT_PROCS};
+pub use remote::RemoteErrorKind;
+pub use repo::GitCall;
 pub use search::{search_content, FileIndex};
 pub use types::*;
 
@@ -32,6 +35,8 @@ pub enum Error {
     Search(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{}", remote::describe(.kind, .detail))]
+    Remote { kind: RemoteErrorKind, detail: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

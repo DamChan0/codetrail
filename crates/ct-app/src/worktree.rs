@@ -2,14 +2,9 @@
 //! vs the old side) but not untracked ones. This module adds untracked, non-ignored files as
 //! added files, and computes the cheap live summary shown in the Commits rail and the header.
 
-use ct_core::{Comparison, DiffFile, DiffLine, DiffOpts, DiffSet, FileKind, FileStat, Hunk, LineKind, Repo, Status, Treeish};
-use crate::proc::run_bounded;
+use ct_core::{Comparison, DiffFile, DiffLine, DiffOpts, DiffSet, FileKind, FileStat, GitCall, Hunk, LineKind, Repo, Status, Treeish};
 use std::hash::{Hash, Hasher};
-use std::path::Path;
-use std::process::Command;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Largest untracked file whose lines are listed; bigger ones are shown as added without a body.
 const MAX_UNTRACKED_BYTES: u64 = 2 * 1024 * 1024;
@@ -104,7 +99,7 @@ fn status_of(c: char) -> Status {
 }
 
 /// Membership from the status records, counts from the matching numstat diff (0/0 if unknown).
-pub fn group(root: &Path, entries: &[Entry], staged: &DiffSet, unstaged: &DiffSet) -> Groups {
+pub fn group(repo: &Repo, entries: &[Entry], staged: &DiffSet, unstaged: &DiffSet) -> Groups {
     let stat = |set: &DiffSet, e: &Entry, st: char| {
         set.files.iter().find(|f| f.path == e.path).cloned().unwrap_or_else(|| FileStat {
             path: e.path.clone(),
@@ -122,7 +117,7 @@ pub fn group(root: &Path, entries: &[Entry], staged: &DiffSet, unstaged: &DiffSe
     let mut g = Groups::default();
     for e in entries {
         if e.x == '?' {
-            g.untracked.push(untracked_stat(root, &e.path));
+            g.untracked.push(untracked_stat(repo, &e.path));
             continue;
         }
         if e.x != '.' {
@@ -156,34 +151,30 @@ pub fn is_worktree(c: &Comparison) -> bool {
     c.new == Treeish::Worktree
 }
 
-const GIT_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// `git -C root --no-optional-locks <args>`: never takes the index lock, bounded in time.
-fn git(root: &Path, args: &[&str], cancel: Option<&AtomicBool>) -> Result<Vec<u8>, String> {
-    let mut c = Command::new("git");
-    c.arg("-C").arg(root).arg("--no-optional-locks").args(args);
-    let o = run_bounded(c, GIT_TIMEOUT, cancel)?;
-    if !o.ok {
-        return Err(o.stderr.trim().to_string());
-    }
-    Ok(o.stdout)
+/// `git status`/`ls-files` through the repository handle (local or ssh), never taking the index
+/// lock; bounded by the handle's timeout, its cancel flag and the process-wide git slots.
+fn git(repo: &Repo, args: &[&str]) -> Result<Vec<u8>, String> {
+    repo.git_output(args, &GitCall::default()).map_err(|e| e.to_string())
 }
 
-pub fn untracked(root: &Path) -> Result<Vec<String>, String> {
-    let out = git(root, &["ls-files", "--others", "--exclude-standard", "-z"], None)?;
+pub fn untracked(repo: &Repo) -> Result<Vec<String>, String> {
+    let out = git(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
     Ok(out.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect())
 }
 
-/// One `git status --porcelain=v2` call: the entries plus a change signature (entries and the
-/// size/mtime of every listed file). No diff work.
-fn status(root: &Path, head: &str, cancel: Option<&AtomicBool>) -> Result<(u64, Vec<Entry>), String> {
-    let out = git(root, &["status", "--porcelain=v2", "-z", "-uall"], cancel)?;
+/// One `git status --porcelain=v2` call: the entries plus a change signature (entries and, for a
+/// local repository, the size/mtime of every listed file). No diff work.
+fn status(repo: &Repo, head: &str) -> Result<(u64, Vec<Entry>), String> {
+    let out = git(repo, &["status", "--porcelain=v2", "-z", "-uall"])?;
     let entries = parse_status_v2(&out);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     head.hash(&mut h);
     for e in &entries {
         (&e.path, e.x, e.y).hash(&mut h);
-        if let Ok(m) = std::fs::metadata(root.join(&e.path)) {
+        if repo.is_remote() {
+            continue;
+        }
+        if let Ok(m) = std::fs::metadata(repo.root.join(&e.path)) {
             m.len().hash(&mut h);
             m.modified().ok().hash(&mut h);
         }
@@ -191,8 +182,31 @@ fn status(root: &Path, head: &str, cancel: Option<&AtomicBool>) -> Result<(u64, 
     Ok((h.finish(), entries))
 }
 
-fn read_untracked(root: &Path, rel: &str) -> (FileKind, Vec<String>, bool, bool) {
-    let abs = root.join(rel);
+fn split_lines(bytes: &[u8]) -> (FileKind, Vec<String>, bool, bool) {
+    if bytes.contains(&0) {
+        return (FileKind::Binary, Vec::new(), false, false);
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let no_nl = !text.is_empty() && !text.ends_with('\n');
+    let lines = text.split('\n').map(str::to_string).collect::<Vec<_>>();
+    let lines = if text.ends_with('\n') || text.is_empty() { lines[..lines.len() - 1].to_vec() } else { lines };
+    (FileKind::Text, lines, no_nl, true)
+}
+
+/// Reads an untracked file's lines. `fetch_remote = false` skips the ssh round trip for a remote
+/// repository (used for list statistics, where one `cat` per file would be a request storm).
+fn read_untracked(repo: &Repo, rel: &str, fetch_remote: bool) -> (FileKind, Vec<String>, bool, bool) {
+    if repo.is_remote() {
+        if !fetch_remote {
+            return (FileKind::Text, Vec::new(), false, false);
+        }
+        return match repo.read_worktree_file(rel) {
+            Ok(b) if b.len() as u64 <= MAX_UNTRACKED_BYTES => split_lines(&b),
+            Ok(_) => (FileKind::Binary, Vec::new(), false, false),
+            Err(_) => (FileKind::Text, Vec::new(), false, false),
+        };
+    }
+    let abs = repo.root.join(rel);
     let Ok(meta) = std::fs::symlink_metadata(&abs) else { return (FileKind::Text, Vec::new(), false, false) };
     if meta.file_type().is_symlink() {
         return (FileKind::Symlink, Vec::new(), false, false);
@@ -204,34 +218,27 @@ fn read_untracked(root: &Path, rel: &str) -> (FileKind, Vec<String>, bool, bool)
         return (FileKind::Binary, Vec::new(), false, false);
     }
     let Ok(bytes) = std::fs::read(&abs) else { return (FileKind::Text, Vec::new(), false, false) };
-    if bytes.contains(&0) {
-        return (FileKind::Binary, Vec::new(), false, false);
-    }
-    let text = String::from_utf8_lossy(&bytes);
-    let no_nl = !text.is_empty() && !text.ends_with('\n');
-    let lines = text.split('\n').map(str::to_string).collect::<Vec<_>>();
-    let lines = if text.ends_with('\n') || text.is_empty() { lines[..lines.len() - 1].to_vec() } else { lines };
-    (FileKind::Text, lines, no_nl, true)
+    split_lines(&bytes)
 }
 
 /// Text lines of a working-tree file (None for binary / unreadable / oversized files).
-pub fn plain_lines(root: &Path, rel: &str) -> Option<Vec<String>> {
-    let (kind, lines, _, ok) = read_untracked(root, rel);
+pub fn plain_lines(repo: &Repo, rel: &str) -> Option<Vec<String>> {
+    let (kind, lines, _, ok) = read_untracked(repo, rel, true);
     (kind == FileKind::Text && ok).then_some(lines)
 }
 
-pub fn untracked_stat(root: &Path, rel: &str) -> FileStat {
-    let (kind, lines, _, _) = read_untracked(root, rel);
+pub fn untracked_stat(repo: &Repo, rel: &str) -> FileStat {
+    let (kind, lines, _, _) = read_untracked(repo, rel, false);
     FileStat { path: rel.to_string(), old_path: None, status: Status::Added, similarity: None, add: lines.len() as u32, del: 0, binary: kind == FileKind::Binary, kind, old_mode: None, new_mode: Some(0o100644) }
 }
 
 /// Appends untracked files (as `Added`) to a worktree diff set.
 pub fn add_untracked(repo: &Repo, set: &mut DiffSet) -> Result<(), String> {
-    for rel in untracked(&repo.root)? {
+    for rel in untracked(repo)? {
         if set.files.iter().any(|f| f.path == rel) {
             continue;
         }
-        set.files.push(untracked_stat(&repo.root, &rel));
+        set.files.push(untracked_stat(repo, &rel));
     }
     set.files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(())
@@ -242,8 +249,8 @@ pub fn file_diff(repo: &Repo, c: &Comparison, path: &str, o: &DiffOpts) -> Resul
     match repo.file_diff(c, path, o) {
         Ok(f) => Ok(f),
         Err(e) => {
-            if is_worktree(c) && untracked(&repo.root).is_ok_and(|u| u.iter().any(|p| p == path)) {
-                Ok(untracked_file(&repo.root, path))
+            if is_worktree(c) && untracked(repo).is_ok_and(|u| u.iter().any(|p| p == path)) {
+                Ok(untracked_file(repo, path))
             } else {
                 Err(e.to_string())
             }
@@ -251,8 +258,8 @@ pub fn file_diff(repo: &Repo, c: &Comparison, path: &str, o: &DiffOpts) -> Resul
     }
 }
 
-fn untracked_file(root: &Path, rel: &str) -> DiffFile {
-    let (kind, lines, no_nl, _) = read_untracked(root, rel);
+fn untracked_file(repo: &Repo, rel: &str) -> DiffFile {
+    let (kind, lines, no_nl, _) = read_untracked(repo, rel, true);
     let n = lines.len();
     let hunks = if n == 0 {
         Vec::new()
@@ -271,8 +278,8 @@ fn untracked_file(root: &Path, rel: &str) -> DiffFile {
 
 /// Live summary of everything uncommitted: staged + unstaged vs HEAD, plus untracked files.
 /// The numstat/diff work only runs when the cheap signature differs from `prev`.
-pub fn summary(repo: &Repo, head: &str, prev: Option<&Summary>, cancel: Option<&AtomicBool>) -> Result<Summary, String> {
-    let (sig, entries) = status(&repo.root, head, cancel)?;
+pub fn summary(repo: &Repo, head: &str, prev: Option<&Summary>) -> Result<Summary, String> {
+    let (sig, entries) = status(repo, head)?;
     if let Some(p) = prev.filter(|p| p.sig == sig) {
         return Ok(p.clone());
     }
@@ -291,13 +298,15 @@ pub fn summary(repo: &Repo, head: &str, prev: Option<&Summary>, cancel: Option<&
         del: set.files.iter().map(|f| f.del).sum(),
         untracked: set.files.len() - tracked,
         sig,
-        groups: Arc::new(group(&repo.root, &entries, &staged, &unstaged)),
+        groups: Arc::new(group(repo, &entries, &staged, &unstaged)),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::process::Command;
 
     fn git(dir: &Path, args: &[&str]) {
         let o = Command::new("git").current_dir(dir).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args).output().unwrap();
@@ -354,12 +363,12 @@ mod tests {
     #[test]
     fn summary_counts_everything_and_signature_tracks_content() {
         let (d, repo, head) = dirty_repo();
-        let s = summary(&repo, &head, None, None).unwrap();
+        let s = summary(&repo, &head, None).unwrap();
         assert_eq!((s.files, s.add, s.del, s.untracked), (4, 5, 1, 1));
         assert_eq!(s.text(), "4 files +5 −1");
-        assert_eq!(summary(&repo, &head, None, None).unwrap(), s, "stable while nothing changes");
+        assert_eq!(summary(&repo, &head, None).unwrap(), s, "stable while nothing changes");
         std::fs::write(d.path().join("n"), "new1\nnew2\nnew3 longer\n").unwrap();
-        assert_ne!(summary(&repo, &head, None, None).unwrap().sig, s.sig);
+        assert_ne!(summary(&repo, &head, None).unwrap().sig, s.sig);
     }
 
     #[test]
@@ -370,7 +379,7 @@ mod tests {
         git(d.path(), &["add", "."]);
         git(d.path(), &["commit", "-q", "-m", "i"]);
         let repo = Repo::open(d.path()).unwrap();
-        let s = summary(&repo, &repo.head().unwrap(), None, None).unwrap();
+        let s = summary(&repo, &repo.head().unwrap(), None).unwrap();
         assert!(!s.dirty());
         assert_eq!(s.text(), "clean");
     }

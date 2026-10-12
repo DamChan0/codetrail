@@ -59,7 +59,7 @@ impl App {
         let (token, head, timeout, prev) = (self.wt.token, self.head.clone(), self.git_timeout(), self.wt.summary.clone());
         self.jobs.spawn(JobKind::Status, move |c| {
             let repo = repo.with_timeout(timeout).with_cancel(c.cancel.clone());
-            c.finish(Msg::Status { token, res: worktree::summary(&repo, &head, prev.as_ref(), Some(&c.cancel)) });
+            c.finish(Msg::Status { token, res: worktree::summary(&repo, &head, prev.as_ref()) });
         });
     }
 
@@ -77,21 +77,45 @@ impl App {
         if self.wt.paused {
             return;
         }
+        // A remote poll is one ssh round trip: 10 s apart, doubled per consecutive failure, never
+        // while another one is in flight, and not at all while the link is known to be down
+        // (the banner's Retry restarts it).
+        let remote = self.remote.is_some();
+        let interval = if remote { crate::remote_backend::remote_poll_interval(self.rs.poll_fails) } else { self.wt.interval };
+        if remote && (self.repo.is_none() || self.rs.conn_lost.is_some()) {
+            return;
+        }
         let busy = self.wt.inflight_since.is_some_and(|t| t.elapsed() < STUCK);
-        if !busy && (regained || self.wt.last.elapsed() >= self.wt.interval) {
+        let due = if remote { self.wt.last.elapsed() >= interval } else { regained || self.wt.last.elapsed() >= interval };
+        if !busy && due {
             self.request_status();
         }
-        ctx.request_repaint_after(self.wt.interval.saturating_sub(self.wt.last.elapsed()).max(Duration::from_millis(100)));
+        ctx.request_repaint_after(interval.saturating_sub(self.wt.last.elapsed()).max(Duration::from_millis(100)));
     }
 
     pub fn wt_handle(&mut self, token: u64, res: Result<Summary, String>) {
         if token != self.wt.token {
             return;
         }
-        if let Some(t) = self.wt.inflight_since.take() {
-            self.wt.record_poll(t.elapsed());
+        let t = self.wt.inflight_since.take();
+        if self.remote.is_none() {
+            if let Some(t) = t {
+                self.wt.record_poll(t.elapsed());
+            }
         }
-        let Ok(s) = res else { return };
+        let s = match res {
+            Ok(s) => {
+                self.rs.poll_fails = 0;
+                s
+            }
+            Err(e) => {
+                if self.remote.is_some() {
+                    self.rs.poll_fails = self.rs.poll_fails.saturating_add(1);
+                    self.rs_note_error(&e);
+                }
+                return;
+            }
+        };
         let changed = self.wt.summary.as_ref().map(|o| o.sig) != Some(s.sig);
         self.wt.summary = Some(s);
         if changed && matches!(self.target, Some(TargetSel::Worktree)) && self.range.is_none() {
@@ -347,7 +371,7 @@ mod tests {
     fn groups_split_staged_unstaged_untracked_with_rename_and_delete() {
         let d = mixed_repo();
         let r = ct_core::Repo::open(d.path()).unwrap();
-        let s = crate::worktree::summary(&r, &r.head().unwrap(), None, None).unwrap();
+        let s = crate::worktree::summary(&r, &r.head().unwrap(), None).unwrap();
         let g = &s.groups;
         assert_eq!(names(&g.staged), [("both".into(), 'M'), ("gone_staged".into(), 'D'), ("new_name".into(), 'R')]);
         assert_eq!(g.staged.iter().find(|f| f.path == "new_name").unwrap().old_path.as_deref(), Some("old_name"));

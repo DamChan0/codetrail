@@ -2,6 +2,7 @@
 
 use crate::agents::Backend;
 use crate::projects::{normalize, RecentProject, MAX_RECENT};
+use ct_core::remote::RemoteSpec;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,27 @@ pub enum ViewMode {
     Edit,
 }
 
+pub const MAX_REMOTES: usize = 32;
+
+/// Drops invalid and duplicate-name remotes (first wins) and caps the list.
+pub fn sanitize_remotes(list: Vec<RemoteSpec>) -> Vec<RemoteSpec> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<RemoteSpec> = list.into_iter().filter(|r| r.validate().is_ok() && seen.insert(r.name.clone())).collect();
+    out.truncate(MAX_REMOTES);
+    out
+}
+
+/// What the app opens when started without a path argument.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Startup {
+    /// Reopen the most recent project that still exists.
+    #[default]
+    Last,
+    /// Always start at the project picker.
+    Picker,
+}
+
 /// `[agent]` table: the one backend/model/thinking selection shared by Ask AI and new runs.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -24,11 +46,17 @@ pub struct AgentCfg {
     pub model: Option<String>,
     pub thinking: Option<String>,
     pub max_concurrent: usize,
+    /// Per-run RSS limit in MiB; 0 = unlimited.
+    pub max_rss_mb: u64,
+    /// Per-run wall-clock limit in minutes; 0 = unlimited.
+    pub max_runtime_min: u64,
+    /// Budget over the RSS of all running runs, MiB.
+    pub max_total_rss_mb: u64,
 }
 
 impl Default for AgentCfg {
     fn default() -> Self {
-        AgentCfg { backend: Backend::Pi, provider: None, model: None, thinking: None, max_concurrent: 3 }
+        AgentCfg { backend: Backend::Pi, provider: None, model: None, thinking: None, max_concurrent: 3, max_rss_mb: 3072, max_runtime_min: 120, max_total_rss_mb: 6144 }
     }
 }
 
@@ -50,6 +78,13 @@ pub struct Settings {
     pub files_split: Option<f32>,
     pub inspector_width: f32,
     pub view_mode: ViewMode,
+    /// Wrap long lines in the editor.
+    pub wrap: bool,
+    pub startup: Startup,
+    /// Show app/run memory and CPU in the status bar.
+    pub status_monitor: bool,
+    /// SSH remotes (`[[remotes]]`), unique names, at most [`MAX_REMOTES`].
+    pub remotes: Vec<RemoteSpec>,
     /// Recently opened projects, most recent first (at most 12).
     pub recent: Vec<RecentProject>,
 }
@@ -70,6 +105,10 @@ impl Default for Settings {
             files_split: None,
             inspector_width: 360.0,
             view_mode: ViewMode::Diff,
+            wrap: false,
+            startup: Startup::Last,
+            status_monitor: true,
+            remotes: Vec::new(),
             recent: Vec::new(),
         }
     }
@@ -91,6 +130,10 @@ impl Settings {
         self.ask_timeout_secs = self.ask_timeout_secs.clamp(5, 3600);
         self.git_timeout_secs = self.git_timeout_secs.clamp(1, 600);
         self.agent.max_concurrent = self.agent.max_concurrent.clamp(1, 8);
+        self.agent.max_rss_mb = self.agent.max_rss_mb.min(262_144);
+        self.agent.max_runtime_min = self.agent.max_runtime_min.min(1440);
+        self.agent.max_total_rss_mb = self.agent.max_total_rss_mb.clamp(512, 262_144);
+        self.remotes = sanitize_remotes(std::mem::take(&mut self.remotes));
         self.recent.truncate(MAX_RECENT);
         self
     }
@@ -139,6 +182,46 @@ mod tests {
     }
 
     #[test]
+    fn remotes_round_trip_and_invalid_or_duplicate_entries_are_dropped() {
+        use ct_core::remote::Transport;
+        let spec = |name: &str, host: &str| RemoteSpec { name: name.into(), host: host.into(), user: Some("me".into()), port: Some(2222), identity_file: Some("/k/id".into()), transport: Transport::TailscaleNc, trust_new_host: true };
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        let mut s = Settings::default();
+        s.remotes = vec![spec("a", "a.example"), RemoteSpec { user: None, port: None, identity_file: None, transport: Transport::Ssh, trust_new_host: false, ..spec("b", "10.0.0.2") }];
+        s.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[[remotes]]") && text.contains("transport = \"tailscale_nc\""), "{text}");
+        assert_eq!(Settings::load(&p), (s.clone(), None));
+        let mut bad = s.clone();
+        bad.remotes = vec![spec("a", "ok.example"), spec("a", "dup.example"), spec("x", "-oProxyCommand=evil"), spec("y", "has space")];
+        for i in 0..40 {
+            bad.remotes.push(spec(&format!("n{i}"), "h.example"));
+        }
+        let clean = bad.sanitize();
+        assert_eq!(clean.remotes.len(), MAX_REMOTES);
+        assert_eq!(clean.remotes[0].host, "ok.example", "first of two same-named remotes wins");
+        assert!(clean.remotes.iter().all(|r| r.name != "x" && r.name != "y"));
+    }
+
+    #[test]
+    fn legacy_recents_without_remote_field_load_and_local_entries_stay_string_compatible() {
+        let d = tempfile::tempdir().unwrap();
+        let live = d.path().join("live");
+        std::fs::create_dir(&live).unwrap();
+        let p = d.path().join("config.toml");
+        std::fs::write(&p, format!("[[recent]]\npath = \"{}\"\nopened_ms = 5\n\n[[recent]]\npath = \"/srv/app\"\nopened_ms = 7\nremote = \"box\"\n", live.display())).unwrap();
+        let (s, b) = Settings::load(&p);
+        assert!(b.is_none());
+        assert_eq!(s.recent.len(), 2);
+        assert_eq!(s.recent[0].remote.as_deref(), Some("box"));
+        assert_eq!(s.recent[1].remote, None);
+        s.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text.matches("remote =").count(), 1, "local entries do not grow a remote key: {text}");
+    }
+
+    #[test]
     fn corrupt_file_rolls_back_to_defaults_with_banner() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("config.toml");
@@ -165,7 +248,7 @@ mod tests {
         std::fs::create_dir(&live).unwrap();
         let p = d.path().join("config.toml");
         let mut s = Settings::default();
-        s.recent = vec![RecentProject { path: "/gone/for/good".into(), opened_ms: 9 }, RecentProject { path: live.to_string_lossy().into_owned(), opened_ms: 5 }];
+        s.recent = vec![RecentProject::local("/gone/for/good".into(), 9), RecentProject::local(live.to_string_lossy().into_owned(), 5)];
         s.save(&p).unwrap();
         let (l, b) = Settings::load(&p);
         assert!(b.is_none());

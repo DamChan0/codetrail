@@ -51,6 +51,12 @@ impl App {
     pub fn centre_ui(&mut self, ui: &mut Ui) {
         let th = self.th.clone();
         let m = th.m().clone();
+        if let Some(e) = self.rs.conn_lost.clone() {
+            ui.add_space(m.space[2]);
+            if widgets::banner(ui, &th, Level::Error, &format!("Connection lost — {e}"), Some("Retry"), false) == widgets::BannerAction::Action {
+                self.rs_retry();
+            }
+        }
         if let Loadable::Failed(e) = &self.open_state {
             ui.add_space(m.space[2]);
             widgets::banner(ui, &th, Level::Error, &format!("Cannot open repository: {e}"), None, false);
@@ -107,7 +113,8 @@ impl App {
                         ViewMode::Blame => 1,
                         ViewMode::Edit => 2,
                     };
-                    if widgets::segmented(ui, &th, &["Diff", "Blame", "Edit"], &mut i) {
+                    let off = [None, None, self.remote.as_ref().map(|_| crate::app::REMOTE_RO.to_string())];
+                    if widgets::segmented_gated(ui, &th, &["Diff", "Blame", "Edit"], &off, &mut i, th.m().button_pad_x) {
                         self.set_view_pref([ViewMode::Diff, ViewMode::Blame, ViewMode::Edit][i]);
                     }
                     if let Some(note) = self.view_note {
@@ -535,8 +542,10 @@ impl App {
         let mut out_cursor: Option<usize> = None;
         let mut scroll_rect: Option<Rect> = None;
         let th2 = th.clone();
-        ScrollArea::both().id_salt("editor_scroll").auto_shrink([false, false]).show(ui, |ui| {
-            let mut layouter = |ui: &Ui, text: &str, _wrap: f32| -> Arc<egui::Galley> {
+        let wrap_on = self.settings.wrap;
+        let area = if wrap_on { ScrollArea::vertical() } else { ScrollArea::both() };
+        area.id_salt("editor_scroll").auto_shrink([false, false]).show(ui, |ui| {
+            let mut layouter = |ui: &Ui, text: &str, wrap: f32| -> Arc<egui::Galley> {
                 let job = match &cache {
                     Some((k, j)) if *k == key => j.clone(),
                     _ => {
@@ -558,10 +567,12 @@ impl App {
                         job
                     }
                 };
+                let mut job = job;
+                job.wrap.max_width = if wrap_on { wrap } else { f32::INFINITY };
                 ui.fonts(|f| f.layout_job(job))
             };
-            let te = egui::TextEdit::multiline(&mut e.text).id(id).font(FontId::monospace(th.code_font)).code_editor().desired_width(f32::INFINITY).desired_rows(30).interactive(editable || true).layouter(&mut layouter).frame(false).margin(egui::Margin::symmetric(12, 8));
-            let out = if editable { te.show(ui) } else { egui::TextEdit::multiline(&mut e.text.as_str()).id(id).font(FontId::monospace(th.code_font)).code_editor().desired_width(f32::INFINITY).desired_rows(30).layouter(&mut layouter).frame(false).margin(egui::Margin::symmetric(12, 8)).show(ui) };
+            let te = egui::TextEdit::multiline(&mut e.text).id(id).font(FontId::monospace(th.code_font)).code_editor().desired_width(if wrap_on { ui.available_width() } else { f32::INFINITY }).desired_rows(30).interactive(editable || true).layouter(&mut layouter).frame(false).margin(egui::Margin::symmetric(12, 8));
+            let out = if editable { te.show(ui) } else { egui::TextEdit::multiline(&mut e.text.as_str()).id(id).font(FontId::monospace(th.code_font)).code_editor().desired_width(if wrap_on { ui.available_width() } else { f32::INFINITY }).desired_rows(30).layouter(&mut layouter).frame(false).margin(egui::Margin::symmetric(12, 8)).show(ui) };
             if let Some(cr) = out.cursor_range {
                 out_cursor = Some(cr.primary.ccursor.index);
                 if goto.is_some() {
@@ -601,7 +612,8 @@ impl App {
                 InspTab::Blame => 1,
                 InspTab::Ask => 2,
             };
-            if widgets::segmented(ui, &th, &["Why", "Blame", "Ask AI"], &mut i) {
+            let off = [None, None, self.remote.as_ref().map(|_| format!("Ask AI: {}", crate::app::REMOTE_NO_AGENT))];
+            if widgets::segmented_gated(ui, &th, &["Why", "Blame", "Ask AI"], &off, &mut i, th.m().button_pad_x) {
                 self.insp = [InspTab::Why, InspTab::Blame, InspTab::Ask][i];
             }
         });
@@ -808,7 +820,7 @@ impl App {
         let busy = matches!(self.ask.phase, AskPhase::Building | AskPhase::Running);
         ui.horizontal(|ui| {
             ui.add_space(m.space[2]);
-            if Btn::new("Ask AI").icon(Icon::Spark).kind(BtnKind::Primary).enabled(self.selection.is_some() && !busy).show(ui, &th).on_hover_text("Ctrl+L").clicked() {
+            if Btn::new("Ask AI").icon(Icon::Spark).kind(BtnKind::Primary).enabled(self.selection.is_some() && !busy && self.remote.is_none()).show(ui, &th).on_hover_text(if self.remote.is_some() { crate::app::REMOTE_NO_AGENT } else { "Ctrl+L" }).clicked() {
                 self.start_ask();
             }
             if busy && Btn::new("Cancel").show(ui, &th).clicked() {
@@ -951,9 +963,33 @@ impl App {
                     self.th.file.active = crate::theme::Mode::Light;
                     self.th.apply(&self.ctx);
                 }
-                "settings" => self.settings_open = true,
+                "settings" | "settings-page" => {
+                    let q = self.smoke.as_ref().map(|s| s.query.clone()).unwrap_or_default();
+                    self.settings_open_section(crate::settingspage::Section::parse(&q).unwrap_or_default());
+                }
+                "remote-settings" => {
+                    let q = self.smoke.as_ref().map(|s| s.query.clone()).unwrap_or_default();
+                    let info = |h: &str, ms| crate::remoteapp::Status::Ok(ct_core::remote::RemoteInfo { hostname: h.into(), home: "/home/dev".into(), git_version: "git version 2.43.0".into(), latency_ms: ms });
+                    self.rs.status.insert("dev-box".into(), info("dev-box", 38));
+                    self.rs.status.insert("build-server".into(), crate::remoteapp::Status::Failed(ct_core::remote::describe(&ct_core::RemoteErrorKind::HostKeyUnknown, "Host key verification failed.")));
+                    if q == "form" {
+                        self.rs_form_edit("build-server");
+                        if let Some(f) = &mut self.rs.form {
+                            f.f.trust_new_host = true;
+                            f.test = Some(Err(ct_core::remote::describe(&ct_core::RemoteErrorKind::AuthFailed, "Permission denied (publickey)")));
+                        }
+                    }
+                    self.settings_open_section(crate::settingspage::Section::Remotes);
+                }
+                "remote-picker" => {
+                    let q = self.smoke.as_ref().map(|s| s.query.clone()).unwrap_or_default();
+                    self.pj_open_browser();
+                    if let Some(spec) = self.remote_spec("dev-box") {
+                        self.pj_remote_pick_at(spec, if q.is_empty() { "~" } else { &q });
+                    }
+                }
                 "accounts" => {
-                    self.settings_open = true;
+                    self.settings_open_section(crate::settingspage::Section::Agents);
                     self.ag.how_open = Some("claude".into());
                     let mut lu = crate::agentvm::LoginUi::new("github-copilot");
                     lu.apply(crate::agents::LoginEvent::OpenUrl("https://github.com/login/device".into()));
@@ -987,7 +1023,7 @@ impl App {
                     let h = crate::projects::home_dir();
                     for (i, p) in ["/tmp/ct-demo", "project/penny-procmon", "project/codetrail", "work/clients/acme/services/billing-gateway-with-a-very-long-name"].iter().enumerate() {
                         let path = if p.starts_with('/') { std::path::PathBuf::from(p) } else { h.join(p) };
-                        self.settings.recent.push(crate::projects::RecentProject { path: path.to_string_lossy().into_owned(), opened_ms: now - 1000 * (i as i64 + 1) });
+                        self.settings.recent.push(crate::projects::RecentProject::local(path.to_string_lossy().into_owned(), now - 1000 * (i as i64 + 1)));
                     }
                     self.pj.popover = true;
                 }
@@ -1028,7 +1064,7 @@ impl App {
         if scene == "model-picker" && !self.insp_open && !self.smoke.as_ref().is_some_and(|s| s.requested) {
             self.insp_open = true;
         }
-        let browser_ready = scene != "folder-browser" || self.pj.browser.as_ref().is_some_and(|b| b.listing.ready().is_some());
+        let browser_ready = (scene != "folder-browser" || self.pj.browser.as_ref().is_some_and(|b| b.listing.ready().is_some())) && (scene != "remote-picker" || self.rs.picker.as_ref().is_some_and(|p| p.listing.ready().is_some()));
         let ag_scene = matches!(scene.as_str(), "runs" | "runs-stream" | "accounts" | "model-picker" | "new-run");
         let ag_ready = !ag_scene || (self.ag.accounts.ready().is_some() && !self.ag.models.is_loading() && (self.ag.runs_svc.ready().is_some() || !matches!(scene.as_str(), "runs" | "runs-stream" | "new-run")));
         if scene == "runs-stream" && self.ag.runs_svc.ready().is_some() && self.centre != Centre::Run {

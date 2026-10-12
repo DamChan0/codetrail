@@ -298,3 +298,124 @@ impl FileIndex {
             .collect()
     }
 }
+
+/// Hit cap for a remote content search (the search stops and reports `aborted`).
+pub const REMOTE_MAX_HITS: u64 = 50_000;
+
+/// ripgrep-style glob → git pathspec (`!g` excludes; a glob without `/` matches at any depth).
+fn glob_pathspec(g: &str) -> Result<String> {
+    let (neg, body) = match g.strip_prefix('!') {
+        Some(b) => (true, b),
+        None => (false, g),
+    };
+    let body = body.strip_prefix('/').unwrap_or(body);
+    if body.is_empty() || body.contains('\0') {
+        return Err(Error::Search(format!("invalid glob {g:?}")));
+    }
+    let body = if body.contains('/') { body.to_string() } else { format!("**/{body}") };
+    Ok(format!(":({}glob){body}", if neg { "exclude," } else { "" }))
+}
+
+/// Remote content search: `git grep -n -I -z` over ssh, streamed through the bounded channel.
+///
+/// Differences from the local walker: `regex` is POSIX ERE (`-E`), not Rust regex syntax (match
+/// ranges are computed locally and are empty if the pattern is not valid Rust regex); only text
+/// files tracked by git or untracked-but-not-ignored are searched (`--untracked`); binary files are
+/// skipped (`-I`); `globs` become pathspecs (`:(glob)`, `:(exclude,glob)`); `files_searched` is not
+/// known (0); at most [`REMOTE_MAX_HITS`] hits.
+pub(crate) fn search_remote(
+    repo: &crate::Repo,
+    q: &SearchQuery,
+    cancel: Arc<AtomicBool>,
+    tx: SyncSender<SearchHit>,
+) -> Result<SearchStats> {
+    if q.pattern.is_empty() {
+        return Err(Error::Invalid("empty search pattern".into()));
+    }
+    if q.pattern.contains('\0') || q.pattern.contains('\n') {
+        return Err(Error::Search("pattern must be a single line without NUL".into()));
+    }
+    // only used to locate match ranges inside lines git already selected
+    let matcher = RegexMatcherBuilder::new().case_insensitive(!q.case_sensitive).fixed_strings(!q.regex).build(&q.pattern).ok();
+    let mut args: Vec<String> =
+        ["grep", "-n", "-I", "-z", "--no-color", "--no-textconv", "--untracked", if q.regex { "-E" } else { "-F" }].map(String::from).to_vec();
+    if !q.case_sensitive {
+        args.push("-i".into());
+    }
+    args.extend(["-e".into(), q.pattern.clone()]);
+    if !q.globs.is_empty() {
+        args.push("--".into());
+        for g in &q.globs {
+            args.push(glob_pathspec(g)?);
+        }
+    }
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut o = repo.opts.clone();
+    o.cancel = Some(cancel.clone());
+    let sh = Shared {
+        cancel,
+        stop: AtomicBool::new(false),
+        aborted: AtomicBool::new(false),
+        files_searched: AtomicU64::new(0),
+        files_matched: AtomicU64::new(0),
+        matches: AtomicU64::new(0),
+        bytes: AtomicU64::new(0),
+        first_hit_us: AtomicU64::new(u64::MAX),
+        start: Instant::now(),
+    };
+    let mut last_path = String::new();
+    let res = crate::git::run_lines_ok(&repo.root, &argv, &o, &[1], |line| {
+        if sh.should_stop() {
+            return false;
+        }
+        // path \0 line \0 text
+        let mut it = line.splitn(3, |&b| b == 0);
+        let (Some(path), Some(ln), Some(text)) = (it.next(), it.next(), it.next()) else { return true };
+        let Some(ln) = std::str::from_utf8(ln).ok().and_then(|s| s.parse::<u32>().ok()) else { return true };
+        let path = String::from_utf8_lossy(path).into_owned();
+        let mut text = text;
+        if text.last() == Some(&b'\r') {
+            text = &text[..text.len() - 1];
+        }
+        let text = String::from_utf8_lossy(text).into_owned();
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        if let Some(m) = &matcher {
+            let _ = grep_matcher::Matcher::find_iter(m, text.as_bytes(), |mm| {
+                ranges.push((mm.start() as u32, mm.end() as u32));
+                true
+            });
+        }
+        sh.bytes.fetch_add((path.len() + text.len()) as u64, Ordering::Relaxed);
+        if path != last_path {
+            sh.files_matched.fetch_add(1, Ordering::Relaxed);
+            last_path = path.clone();
+        }
+        let hit = SearchHit { path, line: ln, col: ranges.first().map(|r| r.0 + 1).unwrap_or(1), text, ranges };
+        if !send(&tx, hit, &sh) {
+            return false;
+        }
+        let n = sh.matches.fetch_add(1, Ordering::Relaxed) + 1;
+        let us = sh.start.elapsed().as_micros() as u64;
+        let _ = sh.first_hit_us.compare_exchange(u64::MAX, us, Ordering::Relaxed, Ordering::Relaxed);
+        if n >= REMOTE_MAX_HITS {
+            sh.aborted.store(true, Ordering::Relaxed);
+            return false;
+        }
+        true
+    });
+    match res {
+        Ok(()) | Err(Error::Cancelled) => {}
+        Err(e) => return Err(e),
+    }
+    let first = sh.first_hit_us.load(Ordering::Relaxed);
+    Ok(SearchStats {
+        files_searched: 0,
+        files_matched: sh.files_matched.load(Ordering::Relaxed),
+        matches: sh.matches.load(Ordering::Relaxed),
+        bytes_searched: sh.bytes.load(Ordering::Relaxed),
+        elapsed_ms: sh.start.elapsed().as_millis() as u64,
+        first_hit_ms: (first != u64::MAX).then_some(first / 1000),
+        cancelled: sh.cancel.load(Ordering::Relaxed),
+        aborted: sh.aborted.load(Ordering::Relaxed),
+    })
+}

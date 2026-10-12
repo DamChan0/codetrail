@@ -403,14 +403,6 @@ impl App {
                 self.ag_runtime_setup();
             }
         }
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Max concurrent runs").color(th.muted()));
-            let mut n = self.settings.agent.max_concurrent;
-            if ui.add(egui::DragValue::new(&mut n).range(1..=8)).changed() {
-                self.ag_set_max_concurrent(n);
-            }
-        });
     }
 
     fn login_ui(&mut self, ui: &mut Ui) {

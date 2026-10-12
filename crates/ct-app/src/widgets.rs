@@ -183,6 +183,10 @@ impl<'a> Btn<'a> {
         self.selected = s;
         self
     }
+    pub fn min_width(mut self, w: f32) -> Self {
+        self.min_width = w;
+        self
+    }
 
     /// Button width for this label (also used by layout code that right-aligns buttons).
     pub fn width(&self, ui: &Ui, th: &Theme) -> f32 {
@@ -453,6 +457,8 @@ pub fn banner(ui: &mut Ui, th: &Theme, level: Level, text: &str, action: Option<
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = m.space[1];
+            // A horizontal layout extends text by default; banner text must wrap at `w`.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             let reserve = action.map_or(0.0, |a| Btn::new(a).compact().width(ui, th) + m.space[1]) + if dismissable { m.control_height_compact + m.space[1] } else { 0.0 };
             let w = (ui.available_width() - reserve).max(60.0);
             let mut job = LayoutJob::default();

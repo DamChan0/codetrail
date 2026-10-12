@@ -198,6 +198,9 @@ pub enum Msg {
     Resources { sample: crate::resmon::Sample, runs: Vec<(String, crate::agents::Resource)> },
     Status { token: u64, res: Result<crate::worktree::Summary, String> },
     Browse { token: u64, res: Result<crate::projects::Listing, String> },
+    RemoteTest { token: u64, res: Result<ct_core::remote::RemoteInfo, String> },
+    RemoteBrowse { token: u64, res: Result<crate::remoteapp::RemoteListing, String> },
+    Peers(Result<Vec<ct_core::remote::discover::TailnetPeer>, String>),
     Accounts { accounts: Vec<crate::agents::Account>, runtime: crate::agents::RuntimeStatus },
     RuntimeProgress(String),
     RuntimeDone(Result<(), String>),
@@ -212,6 +215,9 @@ pub enum Msg {
     RunFinished { what: &'static str, res: Result<String, String> },
     RunReview { res: Result<(String, String), String> },
 }
+
+pub const REMOTE_RO: &str = "remote repositories are read-only";
+pub const REMOTE_NO_AGENT: &str = "not available for remote repositories (agents run on this machine)";
 
 // ---------------------------------------------------------------- panel state
 
@@ -392,6 +398,9 @@ pub struct App {
     pub ctx: egui::Context,
 
     pub repo_arg: PathBuf,
+    /// Set when the project lives on an ssh remote (`repo_arg` is then a remote path). Read-only.
+    pub remote: Option<ct_core::remote::RemoteSpec>,
+    pub rs: crate::remoteapp::RemoteUi,
     pub repo: Option<Repo>,
     pub open_state: Loadable<()>,
     pub head: String,
@@ -445,6 +454,7 @@ pub struct App {
     pub history: HistoryState,
     pub ask: AskState,
     pub settings_open: bool,
+    pub settings_section: crate::settingspage::Section,
     pub settings_dirty_at: Option<Instant>,
     pub status_msg: Option<(String, Instant)>,
     pub smoke: Option<Smoke>,
@@ -456,7 +466,13 @@ pub fn short_repo_name(p: &std::path::Path) -> String {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(ctx: egui::Context, repo_arg: PathBuf, theme_file: ThemeFile, settings: Settings, banners: Vec<(crate::widgets::Level, String)>, fonts_note: String, smoke: Option<Smoke>, svc: Arc<dyn crate::agents::AgentService>) -> App {
+        App::new_with(ctx, repo_arg, None, theme_file, settings, banners, fonts_note, smoke, svc)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with(ctx: egui::Context, repo_arg: PathBuf, remote: Option<ct_core::remote::RemoteSpec>, theme_file: ThemeFile, settings: Settings, banners: Vec<(crate::widgets::Level, String)>, fonts_note: String, smoke: Option<Smoke>, svc: Arc<dyn crate::agents::AgentService>) -> App {
         let th = Theme { file: theme_file, ui_font: settings.ui_font_size, code_font: settings.code_font_size };
         let rc = ctx.clone();
         let jobs = Jobs::new(move || rc.request_repaint());
@@ -479,6 +495,8 @@ impl App {
             jobs,
             ctx,
             repo_arg,
+            remote,
+            rs: Default::default(),
             repo: None,
             open_state: Loadable::Idle,
             head: String::new(),
@@ -527,6 +545,7 @@ impl App {
             blame: BlameState::default(),
             history: HistoryState::default(),
             settings_open: false,
+            settings_section: crate::settingspage::Section::default(),
             settings_dirty_at: None,
             status_msg: None,
             smoke,
@@ -593,18 +612,25 @@ impl App {
     pub fn open_repo(&mut self) {
         self.open_state = Loadable::Loading;
         let path = self.repo_arg.clone();
+        let remote = self.remote.clone();
         let timeout = self.git_timeout();
         self.jobs.spawn(JobKind::Open, move |c| {
             let res = (|| -> Result<Opened, String> {
-                let repo = Repo::open(&path).map_err(|e| e.to_string())?.with_timeout(timeout);
+                let repo = match &remote {
+                    Some(spec) => Repo::open_remote(spec, &path.to_string_lossy()),
+                    None => Repo::open(&path),
+                }
+                .map_err(|e| e.to_string())?
+                .with_timeout(timeout)
+                .with_cancel(c.cancel.clone());
                 let head = repo.head().unwrap_or_default();
                 let refs = repo.refs().map_err(|e| e.to_string())?;
                 let head_name = refs.iter().find(|r| r.is_head).map(|r| r.name.clone()).unwrap_or_else(|| "(detached)".into());
-                let (store, store_note) = match Store::open(&store_dir(&repo.root, &repo.common_dir)) {
+                let (store, store_note) = match open_store(&repo) {
                     Ok(s) => (Some(Arc::new(s)), None),
-                    Err(e) => (None, Some(e.to_string())),
+                    Err(e) => (None, Some(e)),
                 };
-                let dirty = crate::worktree::summary(&repo, &head, None, None).ok();
+                let dirty = crate::worktree::summary(&repo, &head, None).ok();
                 Ok(Opened { repo, head, head_name, refs, store, store_note, dirty })
             })();
             c.finish(Msg::Opened(res));
@@ -788,6 +814,7 @@ impl App {
             ViewMode::Blame => (ViewMode::Blame, None),
             ViewMode::Edit if deleted => (ViewMode::Diff, Some("deleted file")),
             ViewMode::Edit if binary => (ViewMode::Diff, Some("binary file")),
+            ViewMode::Edit if self.remote.is_some() => (ViewMode::Blame, Some(REMOTE_RO)),
             ViewMode::Edit if !at_head => (ViewMode::Blame, Some("read-only: historical revision")),
             ViewMode::Edit => (ViewMode::Edit, None),
         };
@@ -801,6 +828,10 @@ impl App {
 
     /// The user picked a mode in the switch (or Ctrl+E): store it and apply it to the open file.
     pub fn set_view_pref(&mut self, mode: ViewMode) {
+        if mode == ViewMode::Edit && self.remote.is_some() {
+            self.flash("Remote repositories are read-only.");
+            return;
+        }
         self.tt_discard();
         if self.settings.view_mode != mode {
             self.settings.view_mode = mode;
@@ -951,11 +982,11 @@ impl App {
         self.search.selected = None;
         self.search.started = Some(Instant::now());
         let query = SearchQuery { pattern: q, regex: self.search.regex, case_sensitive: self.search.case, globs: self.search.globs.split_whitespace().map(String::from).collect() };
-        let root = repo.root.clone();
+        let search_repo = repo.clone();
         self.jobs.spawn(JobKind::Search, move |c| {
             let (tx, rx) = sync_channel::<SearchHit>(1024);
             let cancel = c.cancel.clone();
-            let h = std::thread::spawn(move || ct_core::search_content(&root, &query, cancel, tx));
+            let h = std::thread::spawn(move || search_repo.search_content(&query, cancel, tx));
             let mut batch: Vec<SearchHit> = Vec::new();
             let mut sent = 0usize;
             let mut stopped = false;
@@ -1022,6 +1053,10 @@ impl App {
 
     pub fn open_editor(&mut self, path: &str, line: Option<u32>) {
         let Some(repo) = self.repo.clone() else { return };
+        if repo.is_remote() {
+            self.load_blame(path, line.map(|l| l as usize));
+            return;
+        }
         self.tt_discard();
         self.centre = Centre::Editor;
         if let Some(e) = &mut self.editor {
@@ -1135,7 +1170,7 @@ impl App {
             };
             let res = repo.blame(&target, &p, None).map_err(|e| e.to_string()).or_else(|e| {
                 // Untracked / newly added files have no history: show the plain text with an empty gutter.
-                match (&target, crate::worktree::plain_lines(&repo.root, &p)) {
+                match (&target, crate::worktree::plain_lines(&repo, &p)) {
                     (Treeish::Worktree, Some(lines)) => Ok(crate::timetravel::plain_blame(&p, lines)),
                     _ => Err(e),
                 }
@@ -1172,6 +1207,10 @@ impl App {
     // ------------------------------------------------------------ Ask AI
 
     pub fn start_ask(&mut self) {
+        if self.remote.is_some() {
+            self.flash(format!("Ask AI: {REMOTE_NO_AGENT}"));
+            return;
+        }
         let (Some(repo), Some(sel)) = (self.repo.clone(), self.selection.clone()) else {
             self.flash("Select lines first, then Ask AI.");
             return;
@@ -1255,7 +1294,11 @@ impl App {
         match msg {
             Msg::Opened(res) => match res {
                 Ok(o) => {
-                    self.pj_record_open(&o.repo.root);
+                    match self.remote.clone() {
+                        Some(spec) => self.pj_record_remote_open(&spec.name, &self.repo_arg.to_string_lossy().into_owned()),
+                        None => self.pj_record_open(&o.repo.root),
+                    }
+                    self.rs.conn_lost = None;
                     self.repo = Some(o.repo);
                     self.head = o.head;
                     self.head_name = o.head_name;
@@ -1273,7 +1316,10 @@ impl App {
                     self.request_log(false);
                     self.request_files();
                 }
-                Err(e) => self.open_state = Loadable::Failed(e),
+                Err(e) => {
+                    self.rs_note_error(&e);
+                    self.open_state = Loadable::Failed(e);
+                }
             },
             Msg::Log { token, append, res } => {
                 if token != self.commit_token {
@@ -1298,7 +1344,10 @@ impl App {
                             }
                         }
                     }
-                    Err(e) => self.commits_err = Some(e),
+                    Err(e) => {
+                        self.rs_note_error(&e);
+                        self.commits_err = Some(e);
+                    }
                 }
             }
             Msg::Diff { res } => match res {
@@ -1454,6 +1503,9 @@ impl App {
                 };
             }
             Msg::Browse { token, res } => self.pj_handle(token, res),
+            Msg::RemoteTest { token, res } => self.rs_test_done(token, res),
+            Msg::RemoteBrowse { token, res } => self.pj_remote_handle(token, res),
+            Msg::Peers(res) => self.rs_peers_done(res),
             Msg::Status { token, res } => self.wt_handle(token, res),
             Msg::Resources { sample, runs } => self.res_handle(sample, runs),
             other => self.ag_handle(other),
@@ -1475,6 +1527,29 @@ pub fn short_ref(r: &str) -> String {
 
 pub fn large_diff(p: &Prepared) -> bool {
     p.model.lines.len() > LARGE_DIFF_LINES
+}
+
+/// The reason store of `repo`. Remote: a read-only view of the cached copy of the remote log
+/// (`<cache>/<hash>/log.ct`) laid out the way `Store::open` expects (`<dir>/codetrail/log.ct`).
+fn open_store(repo: &Repo) -> Result<Store, String> {
+    if !repo.is_remote() {
+        return Store::open(&store_dir(&repo.root, &repo.common_dir)).map_err(|e| e.to_string());
+    }
+    let cached = repo.fetch_records_cache().map_err(|e| e.to_string())?;
+    let view = match cached.as_deref().and_then(std::path::Path::parent) {
+        Some(dir) => dir.join("view"),
+        None => std::env::temp_dir().join(format!("codetrail-no-records-{}", std::process::id())),
+    };
+    if let Some(log) = &cached {
+        let target = view.join("codetrail");
+        std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+        let link = target.join("log.ct");
+        if std::fs::read_link(&link).map_or(true, |t| &t != log) {
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(log, &link).map_err(|e| e.to_string())?;
+        }
+    }
+    Store::open(&view).map_err(|e| e.to_string())
 }
 
 /// Where records live: exactly the dir the hook/CLI use (`ct_agent::gitx::find_repo`), so linked

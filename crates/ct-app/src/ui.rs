@@ -2,7 +2,7 @@
 
 use crate::app::*;
 use crate::widgets::{self, Btn, BtnKind, Icon, Level};
-use crate::theme::{self, Hex};
+use crate::theme;
 use egui::{pos2, vec2, Align, Color32, FontId, Key, Layout, Modifiers, Rect, RichText, ScrollArea, Ui};
 use crate::jobs::JobKind;
 use std::time::{Duration, Instant};
@@ -46,6 +46,12 @@ pub const COMMANDS: [(Cmd, &str, &str); 14] = [
 ];
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(spec) = self.remote.take() {
+            self.rs.backend().close(&spec);
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump();
         self.ag_close_requested(ctx);
@@ -94,6 +100,27 @@ impl eframe::App for App {
             });
         }
 
+        if self.settings_open {
+            if Self::settings_wide(ctx) {
+                self.settings_nav_panel(ctx);
+            }
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(th.sunken())).show(ctx, |ui| self.settings_page(ui));
+        } else {
+            self.main_panes(ctx, &th);
+        }
+
+        self.base_popover(ctx);
+        self.palette_ui(ctx);
+        self.ask_preview_window(ctx);
+        self.agent_windows(ctx);
+        self.project_popover(ctx);
+        self.folder_browser(ctx);
+        self.smoke_tick(ctx);
+    }
+}
+
+impl App {
+    fn main_panes(&mut self, ctx: &egui::Context, th: &crate::theme::Theme) {
         let narrow = ctx.screen_rect().width() < 1000.0;
         let init_id = egui::Id::new("narrow_init");
         if ctx.data(|d| d.get_temp::<bool>(init_id)).is_none() {
@@ -123,19 +150,8 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(th.sunken())).show(ctx, |ui| self.centre_ui(ui));
-
-        self.base_popover(ctx);
-        self.palette_ui(ctx);
-        self.ask_preview_window(ctx);
-        self.settings_window(ctx);
-        self.agent_windows(ctx);
-        self.project_popover(ctx);
-        self.folder_browser(ctx);
-        self.smoke_tick(ctx);
     }
-}
 
-impl App {
     pub fn persist_settings(&mut self) {
         if self.smoke.is_some() {
             return;
@@ -245,6 +261,7 @@ impl App {
             hit(CMD, Key::S, Cmd::Save);
             hit(CMD, Key::L, Cmd::AskAi);
             hit(CMD, Key::G, Cmd::GotoLine);
+            hit(CMD, Key::Comma, Cmd::Settings);
         });
         for c in cmds {
             self.run_cmd(c);
@@ -330,7 +347,7 @@ impl App {
                     self.settings.split_view = v == 1;
                     self.settings_dirty_at = Some(Instant::now());
                 }
-                if ui.ctx().screen_rect().width() >= 1000.0 && widgets::Btn::new("Ask AI").icon(Icon::Spark).kind(BtnKind::Primary).enabled(self.selection.is_some()).show(ui, &th).on_hover_text("Ctrl+L").clicked() {
+                if ui.ctx().screen_rect().width() >= 1000.0 && widgets::Btn::new("Ask AI").icon(Icon::Spark).kind(BtnKind::Primary).enabled(self.selection.is_some() && self.remote.is_none()).show(ui, &th).on_hover_text(if self.remote.is_some() { crate::app::REMOTE_NO_AGENT } else { "Ctrl+L" }).clicked() {
                     self.start_ask();
                 }
                 if widgets::Btn::new("Inspector").kind(BtnKind::Ghost).selected(self.insp_open).show(ui, &th).clicked() {
@@ -404,7 +421,8 @@ impl App {
             let runs_label = if badge > 0 { format!("Runs {badge}") } else { "Runs".to_string() };
             let dirty = self.wt.summary.as_ref().map_or(0, |s| s.files);
             let cur_label = if dirty > 0 { format!("Current {dirty}") } else { "Current".to_string() };
-            if widgets::segmented_gated(ui, &th, &["Commits", &cur_label, "Search", "Files", &runs_label], &[], &mut i, 5.0) {
+            let off = [None, None, None, None, self.remote.as_ref().map(|_| format!("Runs: {}", crate::app::REMOTE_NO_AGENT))];
+            if widgets::segmented_gated(ui, &th, &["Commits", &cur_label, "Search", "Files", &runs_label], &off, &mut i, 5.0) {
                 self.rail = [RailTab::Commits, RailTab::Current, RailTab::Search, RailTab::Files, RailTab::Runs][i];
                 if self.rail == RailTab::Current && dirty > 0 && !matches!(self.target, Some(TargetSel::Worktree)) {
                     self.select_worktree();
@@ -1077,142 +1095,6 @@ impl App {
         }
     }
 
-    // ------------------------------------------------------------ settings
-
-    fn settings_window(&mut self, ctx: &egui::Context) {
-        if !self.settings_open {
-            return;
-        }
-        let th = self.th.clone();
-        let m = th.m().clone();
-        let mut open = true;
-        let mut changed_theme = false;
-        let mut changed_settings = false;
-        let mut reset = false;
-        // Fixed size + anchor: an auto-sized, resizable window whose rows use right-to-left layouts
-        // re-measures its own width from the previous frame and grows every frame.
-        let win_w = (ctx.screen_rect().width() - 32.0).clamp(280.0, 420.0);
-        let win_h = (ctx.screen_rect().height() - 120.0).clamp(240.0, 720.0);
-        egui::Window::new("Settings").id(egui::Id::new("settings_window")).open(&mut open).collapsible(false).resizable(false).fixed_size(vec2(win_w, win_h)).anchor(egui::Align2::RIGHT_TOP, vec2(-16.0, 56.0)).frame(egui::Frame::new().fill(th.raised()).stroke(egui::Stroke::new(1.0, th.border())).corner_radius(th.radius()).inner_margin(egui::Margin::same(16)).shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(110) })).show(ctx, |ui| {
-            ui.spacing_mut().item_spacing = vec2(8.0, 10.0);
-            let sv = ui.visuals_mut();
-            sv.widgets.inactive.bg_fill = th.border();
-            sv.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, th.muted());
-            sv.widgets.hovered.bg_fill = th.border();
-            sv.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, th.fg());
-            sv.widgets.active.fg_stroke = egui::Stroke::new(1.0, th.accent());
-            sv.selection.bg_fill = th.accent();
-            ScrollArea::vertical().max_height(win_h - 32.0).auto_shrink([false, false]).show(ui, |ui| {
-                widgets::heading(ui, &th, "Appearance");
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Theme").color(th.muted()));
-                    let mut i = usize::from(!self.th.file.is_dark());
-                    if widgets::segmented(ui, &th, &["Dark", "Light"], &mut i) {
-                        self.th.file.active = if i == 0 { theme::Mode::Dark } else { theme::Mode::Light };
-                        changed_theme = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("UI font size").color(th.muted()));
-                    if ui.add(egui::Slider::new(&mut self.settings.ui_font_size, 11.0..=18.0).step_by(1.0)).changed() {
-                        changed_settings = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Code font size").color(th.muted()));
-                    if ui.add(egui::Slider::new(&mut self.settings.code_font_size, 10.0..=20.0).step_by(1.0)).changed() {
-                        changed_settings = true;
-                    }
-                });
-                ui.add_space(4.0);
-                widgets::heading(ui, &th, "Colors");
-                let mut edit = |ui: &mut Ui, label: &str, h: &mut Hex| -> bool {
-                    let mut c = h.0;
-                    let mut ch = false;
-                    ui.horizontal(|ui| {
-                        ui.set_min_height(m.control_height);
-                        if ui.color_edit_button_srgba(&mut c).changed() {
-                            *h = Hex(Color32::from_rgb(c.r(), c.g(), c.b()));
-                            ch = true;
-                        }
-                        ui.label(RichText::new(label).color(th.fg()));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new(h.to_hex()).font(widgets::mono_font(&th)).color(th.muted()));
-                        });
-                    });
-                    ch
-                };
-                {
-                    let p = self.th.file.palette_mut();
-                    changed_theme |= edit(ui, "Background", &mut p.bg.base);
-                    changed_theme |= edit(ui, "Raised surface", &mut p.bg.raised);
-                    changed_theme |= edit(ui, "Sunken surface", &mut p.bg.sunken);
-                    changed_theme |= edit(ui, "Text", &mut p.fg.primary);
-                    changed_theme |= edit(ui, "Muted text", &mut p.fg.muted);
-                    changed_theme |= edit(ui, "Accent", &mut p.accent);
-                    changed_theme |= edit(ui, "Border", &mut p.border);
-                    changed_theme |= edit(ui, "Added line", &mut p.diff.add.bg);
-                    changed_theme |= edit(ui, "Added word", &mut p.diff.add.word);
-                    changed_theme |= edit(ui, "Removed line", &mut p.diff.del.bg);
-                    changed_theme |= edit(ui, "Removed word", &mut p.diff.del.word);
-                    changed_theme |= edit(ui, "AI badge", &mut p.ai_badge);
-                    changed_theme |= edit(ui, "Warning", &mut p.warn);
-                }
-                let ratio = theme::contrast(self.th.fg(), self.th.bg());
-                let (lvl, msg) = if ratio >= 4.5 { (Level::Info, format!("Text contrast {ratio:.1}:1")) } else { (Level::Warn, format!("Text contrast {ratio:.1}:1 is below the 4.5:1 minimum for readable text.")) };
-                widgets::banner(ui, &th, lvl, &msg, None, false);
-                ui.add_space(4.0);
-                self.accounts_section(ui);
-                ui.add_space(4.0);
-                widgets::heading(ui, &th, "Behaviour");
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut self.settings.ask_preview, "Preview the prompt before asking AI").changed() {
-                        changed_settings = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Ask AI timeout (s)").color(th.muted()));
-                    if ui.add(egui::DragValue::new(&mut self.settings.ask_timeout_secs).range(10..=1800)).changed() {
-                        changed_settings = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Tab width").color(th.muted()));
-                    if ui.add(egui::DragValue::new(&mut self.settings.tab_width).range(1..=8)).changed() {
-                        changed_settings = true;
-                    }
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if Btn::new("Reset colors").show(ui, &th).clicked() {
-                        reset = true;
-                    }
-                    let p = theme::theme_path();
-                    ui.label(RichText::new(format!("Saved to {}", p.display())).font(widgets::small_font(&th)).color(th.muted()));
-                });
-            });
-        });
-        if reset {
-            let mode = self.th.file.active;
-            self.th.file = theme::ThemeFile { active: mode, ..Default::default() };
-            changed_theme = true;
-        }
-        if changed_settings {
-            self.settings = std::mem::take(&mut self.settings).sanitize();
-            self.th.ui_font = self.settings.ui_font_size;
-            self.th.code_font = self.settings.code_font_size;
-            changed_theme = true;
-            self.diff_cache_invalidate();
-        }
-        if changed_theme {
-            self.th.apply(ctx);
-            self.settings_dirty_at = Some(Instant::now());
-        }
-        if !open {
-            self.settings_open = false;
-        }
-    }
-
     pub fn diff_cache_invalidate(&mut self) {
         if self.prepared.ready().is_some() {
             self.request_file_diff();
@@ -1258,40 +1140,12 @@ fn fuzzy_galley(ui: &Ui, name: &str, font: &FontId, th: &crate::theme::Theme, hi
 }
 
 #[cfg(test)]
-mod settings_window_tests {
+pub mod settings_window_tests {
     use super::*;
     use crate::agents_fake::FakeAgents;
 
     pub fn test_app(ctx: &egui::Context) -> App {
         let (th, _) = theme::ThemeFile::load(std::path::Path::new("/nonexistent/theme.toml"));
         App::new(ctx.clone(), std::path::PathBuf::from("/nonexistent"), th, crate::settings::Settings::default(), Vec::new(), String::new(), None, std::sync::Arc::new(FakeAgents::new()))
-    }
-
-    fn frame(ctx: &egui::Context, app: &mut App, size: egui::Vec2) {
-        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)), ..Default::default() };
-        let _ = ctx.run(input, |ctx| app.settings_window(ctx));
-    }
-
-    fn rects(ctx: &egui::Context) -> Vec<Rect> {
-        ctx.memory(|m| m.areas().visible_layer_ids().into_iter().filter(|l| l.order == egui::Order::Middle).filter_map(|l| m.area_rect(l.id)).collect())
-    }
-
-    #[test]
-    fn settings_window_is_single_and_size_stable_across_frames() {
-        for size in [vec2(1440.0, 900.0), vec2(720.0, 760.0)] {
-            let ctx = egui::Context::default();
-            let mut app = test_app(&ctx);
-            app.settings_open = true;
-            let mut seen = Vec::new();
-            for _ in 0..40 {
-                frame(&ctx, &mut app, size);
-                seen.push(rects(&ctx));
-            }
-            let last = seen.last().unwrap();
-            assert_eq!(last.len(), 1, "exactly one settings window at {size:?}: {last:?}");
-            assert_eq!(seen[10], seen[39], "window rect must be stable after settling at {size:?}");
-            let r = last[0];
-            assert!(r.width() <= size.x && r.height() <= size.y, "window {r:?} fits the screen {size:?}");
-        }
     }
 }

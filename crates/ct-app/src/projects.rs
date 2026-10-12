@@ -10,26 +10,41 @@ pub struct RecentProject {
     pub path: String,
     /// Unix milliseconds of the last open.
     pub opened_ms: i64,
+    /// Name of the `[[remotes]]` entry when `path` lives on that host; absent for local projects
+    /// (and for every entry written before remotes existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+}
+
+impl RecentProject {
+    pub fn local(path: String, opened_ms: i64) -> Self {
+        RecentProject { path, opened_ms, remote: None }
+    }
 }
 
 /// Records `path` as opened now: most recent first, de-duplicated, capped at `MAX_RECENT`.
 pub fn touch(list: &mut Vec<RecentProject>, path: &Path, now_ms: i64) {
-    let p = path.to_string_lossy().into_owned();
-    list.retain(|r| r.path != p);
-    list.insert(0, RecentProject { path: p, opened_ms: now_ms });
+    touch_at(list, None, &path.to_string_lossy(), now_ms);
+}
+
+/// Same as [`touch`] for a project on the named remote (`None` = local).
+pub fn touch_at(list: &mut Vec<RecentProject>, remote: Option<&str>, path: &str, now_ms: i64) {
+    list.retain(|r| !(r.path == path && r.remote.as_deref() == remote));
+    list.insert(0, RecentProject { path: path.to_string(), opened_ms: now_ms, remote: remote.map(str::to_string) });
     list.truncate(MAX_RECENT);
 }
 
-pub fn remove(list: &mut Vec<RecentProject>, path: &str) {
-    list.retain(|r| r.path != path);
+pub fn remove(list: &mut Vec<RecentProject>, remote: Option<&str>, path: &str) {
+    list.retain(|r| !(r.path == path && r.remote.as_deref() == remote));
 }
 
 /// Most recent first, capped. Used on load; `exists` is injected so tests need no filesystem.
 pub fn normalize(list: Vec<RecentProject>, exists: &dyn Fn(&Path) -> bool) -> Vec<RecentProject> {
-    let mut l: Vec<RecentProject> = list.into_iter().filter(|r| exists(Path::new(&r.path))).collect();
+    // Remote paths cannot be checked without a connection: they stay until the user forgets them.
+    let mut l: Vec<RecentProject> = list.into_iter().filter(|r| r.remote.is_some() || exists(Path::new(&r.path))).collect();
     l.sort_by(|a, b| b.opened_ms.cmp(&a.opened_ms));
     let mut seen = std::collections::HashSet::new();
-    l.retain(|r| seen.insert(r.path.clone()));
+    l.retain(|r| seen.insert((r.remote.clone(), r.path.clone())));
     l.truncate(MAX_RECENT);
     l
 }
@@ -128,7 +143,7 @@ pub fn list_dir(p: &Path) -> Result<Listing, String> {
 
 /// Where the folder browser starts: the last project's parent when it exists, else `$HOME`.
 pub fn browser_start(recent: &[RecentProject], home: &Path) -> PathBuf {
-    recent.first().and_then(|r| Path::new(&r.path).parent().map(Path::to_path_buf)).filter(|p| p.is_dir()).unwrap_or_else(|| home.to_path_buf())
+    recent.iter().find(|r| r.remote.is_none()).and_then(|r| Path::new(&r.path).parent().map(Path::to_path_buf)).filter(|p| p.is_dir()).unwrap_or_else(|| home.to_path_buf())
 }
 
 /// Breadcrumb segments: (label, absolute path).
@@ -151,7 +166,7 @@ mod tests {
     use super::*;
 
     fn rp(p: &str, t: i64) -> RecentProject {
-        RecentProject { path: p.into(), opened_ms: t }
+        RecentProject::local(p.into(), t)
     }
 
     #[test]
@@ -165,7 +180,7 @@ mod tests {
         touch(&mut l, Path::new("/p/5"), 99);
         assert_eq!(l[0], rp("/p/5", 99));
         assert_eq!(l.iter().filter(|r| r.path == "/p/5").count(), 1);
-        remove(&mut l, "/p/5");
+        remove(&mut l, None, "/p/5");
         assert!(l.iter().all(|r| r.path != "/p/5"));
     }
 
@@ -175,6 +190,29 @@ mod tests {
         let out = normalize(l, &|p| p != Path::new("/gone"));
         assert_eq!(out.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), ["/b", "/a"]);
         assert_eq!(out[1].opened_ms, 3, "newest duplicate wins");
+    }
+
+    #[test]
+    fn remote_entries_keep_their_host_survive_normalize_and_dedup_per_host() {
+        let mut l = Vec::new();
+        touch_at(&mut l, Some("box"), "/srv/app", 1);
+        touch_at(&mut l, None, "/srv/app", 2);
+        touch_at(&mut l, Some("other"), "/srv/app", 3);
+        touch_at(&mut l, Some("box"), "/srv/app", 4);
+        assert_eq!(l.len(), 3, "same path on different hosts are different projects");
+        assert_eq!(l[0].remote.as_deref(), Some("box"));
+        let out = normalize(l.clone(), &|_| false);
+        assert_eq!(out.len(), 2, "only remote entries survive a missing local path: {out:?}");
+        assert!(out.iter().all(|r| r.remote.is_some()));
+        remove(&mut l, Some("box"), "/srv/app");
+        assert!(l.iter().all(|r| r.remote.as_deref() != Some("box")));
+        assert_eq!(l.len(), 2);
+    }
+
+    #[test]
+    fn browser_start_ignores_remote_recents() {
+        let l = vec![RecentProject { path: "/srv/x/y".into(), opened_ms: 9, remote: Some("box".into()) }];
+        assert_eq!(browser_start(&l, Path::new("/home/me")), Path::new("/home/me"));
     }
 
     #[test]

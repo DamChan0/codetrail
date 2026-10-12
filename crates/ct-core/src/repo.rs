@@ -1,14 +1,30 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::diffparse::{parse_patch, parse_raw_numstat, to_stats, RawEntry};
 use crate::git::{self, is_hex40, RunOpts};
 use crate::*;
+use crate::remote::RemoteSpec;
 
 const LOG_FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s";
+
+/// Entries kept by [`Repo::list_files`] on a remote repository.
+const MAX_REMOTE_FILES: usize = 200_000;
+
+/// Per-call overrides for [`Repo::git_output`]; the default inherits the handle's settings.
+#[derive(Clone, Debug, Default)]
+pub struct GitCall {
+    pub timeout: Option<Duration>,
+    pub cancel: Option<Arc<AtomicBool>>,
+    pub max_output: Option<usize>,
+    pub stdin: Option<Vec<u8>>,
+    /// Extra exit codes treated as success.
+    pub ok_codes: Vec<i32>,
+}
 
 /// Resolved side of a comparison.
 enum Side {
@@ -65,6 +81,96 @@ impl Repo {
             common_dir: PathBuf::from(common),
             opts,
         })
+    }
+
+    /// Opens a repository on a remote host (git over ssh, read-only). `path` is a remote path
+    /// (a leading `~` expands remotely) inside the working tree. Root/git dir in the returned
+    /// handle are remote paths. Per-call timeout defaults to 60 s.
+    pub fn open_remote(spec: &RemoteSpec, path: &str) -> Result<Repo> {
+        spec.validate()?;
+        if path.trim().is_empty() {
+            return Err(Error::Invalid("empty remote path".into()));
+        }
+        let opts = RunOpts { timeout: git::REMOTE_TIMEOUT, remote: Some(Arc::new(spec.clone())), ..RunOpts::default() };
+        let out = git::run(
+            Path::new(path),
+            &["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir"],
+            None,
+            &opts,
+        )
+        .map_err(|e| match e {
+            Error::Git { stderr, .. } if stderr.contains("work tree") => {
+                Error::Invalid(format!("{path}: bare repositories are not supported"))
+            }
+            other => other,
+        })?;
+        let text = lossy(&out);
+        let mut l = text.lines();
+        let (root, git_dir, common) = match (l.next(), l.next(), l.next()) {
+            (Some(a), Some(b), Some(c)) => (a, b, c),
+            _ => return Err(Error::Remote { kind: RemoteErrorKind::NotARepo, detail: path.to_string() }),
+        };
+        Ok(Repo { root: PathBuf::from(root), git_dir: PathBuf::from(git_dir), common_dir: PathBuf::from(common), opts })
+    }
+
+    /// True for repositories opened with [`Repo::open_remote`].
+    pub fn is_remote(&self) -> bool {
+        self.opts.remote.is_some()
+    }
+
+    pub fn remote(&self) -> Option<&RemoteSpec> {
+        self.opts.remote.as_deref()
+    }
+
+    /// Runs `git <args>` in the repository root (locally, or on the remote through ssh) under the
+    /// same slot limiter / timeout / kill / output cap as every other call, returning stdout.
+    /// Intended for callers that need a git command ct-core has no wrapper for.
+    pub fn git_output(&self, args: &[&str], call: &GitCall) -> Result<Vec<u8>> {
+        let mut o = self.opts.clone();
+        if let Some(t) = call.timeout {
+            o.timeout = t;
+        }
+        if let Some(c) = &call.cancel {
+            o.cancel = Some(c.clone());
+        }
+        if let Some(m) = call.max_output {
+            o.max_output = m;
+        }
+        git::run_ok(&self.root, args, call.stdin.clone(), &o, &call.ok_codes).map(|(b, _)| b)
+    }
+
+    /// Content search dispatch: local → the ripgrep-engine walker, remote → `git grep` over ssh
+    /// (see `search::search_remote` for the differences).
+    pub fn search_content(&self, q: &SearchQuery, cancel: Arc<AtomicBool>, tx: SyncSender<SearchHit>) -> Result<SearchStats> {
+        if self.is_remote() {
+            crate::search::search_remote(self, q, cancel, tx)
+        } else {
+            crate::search::search_content(&self.root, q, cancel, tx)
+        }
+    }
+
+    /// Path of a readable copy of this repository's AI-change log (`<git_dir>/codetrail/log.ct`).
+    /// Local: the file itself (`None` if it does not exist). Remote: a cached copy under
+    /// `$XDG_CACHE_HOME/codetrail/remote/<hash>/log.ct` (default `~/.cache/...`), re-downloaded
+    /// only when the remote size/mtime changed; at most 64 MiB; at most 8 cache dirs kept (LRU).
+    pub fn fetch_records_cache(&self) -> Result<Option<PathBuf>> {
+        if self.is_remote() {
+            self.fetch_records_cache_at(&crate::remote::cache::default_root()?)
+        } else {
+            let p = self.git_dir.join("codetrail").join("log.ct");
+            Ok(p.is_file().then_some(p))
+        }
+    }
+
+    /// [`Repo::fetch_records_cache`] with an explicit cache root (tests, embedding).
+    pub fn fetch_records_cache_at(&self, cache_root: &Path) -> Result<Option<PathBuf>> {
+        match self.remote() {
+            None => self.fetch_records_cache(),
+            Some(spec) => {
+                let gd = self.git_dir.to_str().ok_or_else(|| Error::Invalid("remote git dir is not UTF-8".into()))?;
+                crate::remote::cache::fetch(spec, gd, &self.opts, cache_root)
+            }
+        }
     }
 
     /// Timeout applied to every git subprocess of this handle (default 30 s).
@@ -162,17 +268,15 @@ impl Repo {
         Ok(v)
     }
 
-    /// Tracked files plus untracked non-ignored files that exist on disk.
+    /// Tracked files plus untracked non-ignored files that exist on disk (remote: at most
+    /// 200 000 entries).
     pub fn list_files(&self) -> Result<Vec<String>> {
         let out = self.run(&["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--deduplicate"])?;
         let del = self.run(&["ls-files", "-z", "--deleted"])?;
         let deleted: std::collections::HashSet<&[u8]> =
             del.split(|&b| b == 0).filter(|s| !s.is_empty()).collect();
-        Ok(out
-            .split(|&b| b == 0)
-            .filter(|s| !s.is_empty() && !deleted.contains(s))
-            .map(lossy)
-            .collect())
+        let it = out.split(|&b| b == 0).filter(|s| !s.is_empty() && !deleted.contains(s)).map(lossy);
+        Ok(if self.is_remote() { it.take(MAX_REMOTE_FILES).collect() } else { it.collect() })
     }
 
     // ───────────────────────────────── log ───────────────────────────────────
@@ -461,11 +565,24 @@ impl Repo {
         self.run(&["cat-file", "blob", &spec])
     }
 
-    /// Reads a working-tree file (rejects absolute paths and `..`).
+    /// Reads a working-tree file (rejects absolute paths and `..`). Remote: `cat` over ssh,
+    /// capped by the handle's output limit (→ `Error::TooLarge`).
     pub fn read_worktree_file(&self, path: &str) -> Result<Vec<u8>> {
         let p = Path::new(path);
         if p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_))) {
             return Err(Error::Invalid(format!("path {path:?} escapes the repository")));
+        }
+        if let Some(spec) = self.remote() {
+            let root = self.root.to_str().ok_or_else(|| Error::Invalid("remote root is not UTF-8".into()))?;
+            let script = format!("cd {} && exec cat -- {}", crate::remote::exec::quote_path(root), crate::remote::exec::shquote(path));
+            return git::run_remote_script(spec, &script, "cat file", None, &self.opts, &[])
+                .map(|(b, _)| b)
+                .map_err(|e| match e {
+                    Error::Git { stderr, .. } if stderr.contains("No such file or directory") => {
+                        Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, stderr))
+                    }
+                    o => o,
+                });
         }
         Ok(std::fs::read(self.root.join(p))?)
     }

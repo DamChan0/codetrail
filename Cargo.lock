@@ -533,8 +533,11 @@ dependencies = [
  "nucleo-matcher",
  "parking_lot",
  "rayon",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "xxhash-rust",
 ]
 
 [[package]]

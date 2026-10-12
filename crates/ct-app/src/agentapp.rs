@@ -292,6 +292,10 @@ impl App {
     }
 
     pub fn ag_new_run_dialog(&mut self) {
+        if self.remote.is_some() {
+            self.flash(format!("Runs: {}", crate::app::REMOTE_NO_AGENT));
+            return;
+        }
         let base = if self.head_name.is_empty() || self.head_name == "(detached)" { "HEAD".to_string() } else { self.head_name.clone() };
         self.ag.new_run = Some(NewRun { prompt: String::new(), base_ref: base, isolate: true, focus: true });
         self.ag_ensure_models();
@@ -333,6 +337,13 @@ impl App {
         self.settings_dirty_at = Some(Instant::now());
         if let Some(rs) = self.run_svc() {
             rs.set_max_concurrent(self.settings.agent.max_concurrent);
+        }
+    }
+
+    pub fn ag_apply_limits(&mut self) {
+        let a = self.settings.agent.clone();
+        if let Some(rs) = self.run_svc() {
+            rs.set_limits(a.max_rss_mb, a.max_runtime_min, a.max_total_rss_mb);
         }
     }
 
@@ -467,6 +478,8 @@ impl App {
                 Ok((rs, list)) => {
                     self.ag.runs.set_list(list);
                     self.runs_bridge(rs.clone());
+                    let a = &self.settings.agent;
+                    rs.set_limits(a.max_rss_mb, a.max_runtime_min, a.max_total_rss_mb);
                     self.ag.runs_svc = Loadable::Ready(rs);
                 }
                 Err(e) => self.ag.runs_svc = Loadable::Failed(e),
