@@ -285,8 +285,8 @@ impl Repo {
         if q.limit == 0 {
             return Ok(Vec::new());
         }
-        let mut args: Vec<String> =
-            vec!["--literal-pathspecs".into(), "log".into(), LOG_FORMAT.into(), "--no-show-signature".into()];
+        let mut args: Vec<String> = if q.path_is_pathspec { Vec::new() } else { vec!["--literal-pathspecs".into()] };
+        args.extend(["log".into(), LOG_FORMAT.into(), "--no-show-signature".into()]);
         if q.skip > 0 {
             args.push(format!("--skip={}", q.skip));
         }

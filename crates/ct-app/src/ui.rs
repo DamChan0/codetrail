@@ -165,6 +165,9 @@ impl App {
     }
 
     fn debounce(&mut self, ctx: &egui::Context) {
+        self.filter_sync();
+        self.filter_follow(ctx);
+        self.narrow_tick(ctx);
         if let Some(t) = self.commit_filter_at {
             if t.elapsed() > Duration::from_millis(300) {
                 self.commit_filter_at = None;
@@ -465,6 +468,7 @@ impl App {
             }
         });
         ui.add_space(m.space[1]);
+        self.narrow_chip(ui);
         let total = ui.max_rect().height();
         let nfiles = self.diffset.ready().map_or(0, |s| s.files.len());
         let files_h = crate::railsplit::files_height(self.settings.files_split, nfiles, total);
@@ -503,8 +507,8 @@ impl App {
             }
         }
         if self.commits.is_empty() {
-            let q = !self.commit_filter_applied.0.trim().is_empty();
-            widgets::empty_state(ui, &th, if q { "No matching commits" } else { "No commits yet" }, if q { "Try another term, or switch between Message and Author." } else { "Make a commit and it will show up here." });
+            let q = !self.commit_filter_applied.0.trim().is_empty() || self.narrow_applied.is_some();
+            widgets::empty_state(ui, &th, if q { "No matching commits" } else { "No commits yet" }, if q { "Try another term, switch between Message and Author, or turn off narrowing by files." } else { "Make a commit and it will show up here." });
             return;
         }
         let n = self.commits.len();
@@ -580,65 +584,7 @@ impl App {
                     self.request_diff();
                 }
             }
-            Loadable::Ready(set) => {
-                let (add, del): (u32, u32) = set.files.iter().fold((0, 0), |a, f| (a.0 + f.add, a.1 + f.del));
-                ui.horizontal(|ui| {
-                    ui.add_space(m.space[2]);
-                    ui.label(RichText::new(format!("{} {}", set.files.len(), if set.files.len() == 1 { "file" } else { "files" })).font(widgets::ui_font(&th)).color(th.fg()));
-                    ui.label(RichText::new(format!("+{add}")).font(widgets::mono_font(&th)).color(th.c(th.p().diff.add.fg)));
-                    ui.label(RichText::new(format!("−{del}")).font(widgets::mono_font(&th)).color(th.c(th.p().diff.del.fg)));
-                });
-                ui.add_space(m.space[0]);
-                if set.files.is_empty() {
-                    widgets::empty_state(ui, &th, "No changes", "This comparison has no differences.");
-                    return;
-                }
-                let mut pick: Option<String> = None;
-                let row_h = 28.0;
-                let sel = self.file_sel.clone();
-                let mut flt = std::mem::take(&mut self.files_filter);
-                if set.files.len() > crate::railsplit::FILTER_MIN_FILES {
-                    ui.horizontal(|ui| {
-                        ui.add_space(m.space[2]);
-                        let w = ui.available_width() - m.space[2];
-                        let r = ui.add_sized([w, m.control_height_compact], egui::TextEdit::singleline(&mut flt).hint_text("Filter files").desired_width(w).margin(vec2(8.0, 4.0)));
-                        if r.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
-                            flt.clear();
-                        }
-                    });
-                } else {
-                    flt.clear();
-                }
-                let needle = flt.to_lowercase();
-                let shown: Vec<usize> = (0..set.files.len()).filter(|i| needle.is_empty() || set.files[*i].path.to_lowercase().contains(&needle)).collect();
-                if shown.is_empty() {
-                    widgets::empty_state(ui, &th, "No matching files", "Clear the filter to see all changes.");
-                }
-                ScrollArea::vertical().id_salt("files_changed").auto_shrink([false, false]).show_rows(ui, row_h, shown.len(), |ui, range| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for i in range {
-                        let f = &set.files[shown[i]];
-                        let (resp, rect) = widgets::list_row(ui, &th, row_h, sel.as_deref() == Some(f.path.as_str()));
-                        let (letter, col) = status_style(&th, f.status);
-                        let lr = Rect::from_min_size(pos2(rect.min.x, rect.min.y), vec2(14.0, row_h));
-                        ui.painter().text(lr.center(), egui::Align2::CENTER_CENTER, letter, widgets::mono_font(&th), col);
-                        let stat = if f.binary { "bin".to_string() } else { format!("+{} −{}", f.add, f.del) };
-                        let sw = widgets::paint_text_right(ui, rect, &stat, widgets::small_font(&th), th.muted());
-                        widgets::paint_text_fit(ui, Rect::from_min_max(pos2(rect.min.x + 22.0, rect.min.y), pos2(rect.max.x - sw - 8.0, rect.max.y)), &f.path, widgets::ui_font(&th), th.fg());
-                        if resp.clicked() {
-                            pick = Some(f.path.clone());
-                        }
-                        resp.on_hover_text(&f.path);
-                    }
-                });
-                self.files_filter = flt;
-                if let Some(p) = pick {
-                    if self.centre == Centre::Run {
-                        self.centre = Centre::Diff;
-                    }
-                    self.open_file_diff(&p);
-                }
-            }
+            Loadable::Ready(_) => self.files_ready_ui(ui),
         }
     }
 

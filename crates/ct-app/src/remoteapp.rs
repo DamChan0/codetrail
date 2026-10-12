@@ -57,6 +57,7 @@ pub struct RemotePicker {
     pub listing: Loadable<RemoteListing>,
     pub token: u64,
     pub error: Option<String>,
+    pub auto: crate::autocomplete::Auto,
 }
 
 #[derive(Default)]
@@ -278,7 +279,7 @@ impl App {
     }
 
     pub fn pj_remote_pick_at(&mut self, spec: RemoteSpec, path: &str) {
-        self.rs.picker = Some(RemotePicker { spec, cwd: path.into(), input: path.into(), listing: Loadable::Loading, token: 0, error: None });
+        self.rs.picker = Some(RemotePicker { spec, cwd: path.into(), input: path.into(), listing: Loadable::Loading, token: 0, error: None, auto: Default::default() });
         self.pj.open_error = None;
         self.pj_remote_go(path.into(), None);
     }
@@ -313,6 +314,7 @@ impl App {
             Ok(l) => {
                 p.cwd = l.path.clone();
                 p.input = l.path.clone();
+                p.auto.close();
                 p.error = None;
                 p.listing = Loadable::Ready(l);
             }
@@ -688,8 +690,8 @@ pub fn remote_picker_ui(ui: &mut Ui, th: &crate::theme::Theme, p: &mut RemotePic
             act.go = Some(("~".into(), None));
         }
         let w = (ui.available_width() - 8.0).max(120.0);
-        let r = ui.add(egui::TextEdit::singleline(&mut p.input).hint_text("Type a remote path, e.g. ~/projects/app").desired_width(w).margin(vec2(8.0, 6.0)).font(widgets::mono_font(th)));
-        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !p.input.trim().is_empty() {
+        let f = crate::autocomplete::path_field(ui, th, &mut p.input, &mut p.auto, "remote", "Type a remote path, e.g. ~/projects/app", w, false);
+        if f.submit && !p.input.trim().is_empty() {
             act.go = Some((p.input.trim().to_string(), None));
         }
     });
@@ -790,6 +792,37 @@ mod tests {
         assert_eq!((parent_of("~"), parent_of("/")), (None, None));
         assert_eq!(join_remote("~", "a"), "~/a");
         assert_eq!(join_remote("/", "a"), "/a");
+    }
+
+    #[test]
+    fn remote_autocomplete_makes_one_list_call_per_parent_not_one_per_keystroke() {
+        let be = ScriptedRemote::with(&[("~", &[("code", false)]), ("~/code/", &[("app", true), ("apps-old", false), ("docs", false)])]);
+        let mut app = app_with(Path::new(""), None, Some(be.clone()));
+        app.pj_open_browser();
+        app.pj_remote_pick(spec("box", "box.example"));
+        pump_until(&mut app, "home listing", |a| a.rs.picker.as_ref().unwrap().listing.ready().is_some());
+        let ctx = egui::Context::default();
+        let baseline = be.calls.lock().len();
+        let past = Instant::now() - Duration::from_secs(1);
+        let edit = |app: &mut App, text: &str, at: Instant| app.rs.picker.as_mut().unwrap().auto.edit(text, at);
+        edit(&mut app, "~/code/a", past);
+        let t = Instant::now();
+        while app.rs.picker.as_ref().unwrap().auto.matches.is_empty() {
+            assert!(t.elapsed() < Duration::from_secs(10), "no answer");
+            app.pj_complete_poll(&ctx);
+            app.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let names: Vec<String> = app.rs.picker.as_ref().unwrap().auto.matches.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(names, ["app", "apps-old"]);
+        for text in ["~/code/ap", "~/code/app", "~/code/apps", "~/code/d"] {
+            edit(&mut app, text, Instant::now());
+            app.pj_complete_poll(&ctx);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        app.pump();
+        assert_eq!(be.calls.lock().len() - baseline, 1, "{:?}", be.calls.lock());
+        assert_eq!(app.rs.picker.as_ref().unwrap().auto.matches.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["docs"]);
     }
 
     #[test]

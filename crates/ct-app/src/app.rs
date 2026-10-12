@@ -199,6 +199,8 @@ pub enum Msg {
     Status { token: u64, res: Result<crate::worktree::Summary, String> },
     Browse { token: u64, res: Result<crate::projects::Listing, String> },
     RemoteTest { token: u64, res: Result<ct_core::remote::RemoteInfo, String> },
+    Filtered { current: bool, key: (u64, u64), out: crate::filterapp::FilterOut },
+    Complete { remote: bool, token: u64, parent: String, children: Option<Vec<crate::autocomplete::Child>> },
     RemoteBrowse { token: u64, res: Result<crate::remoteapp::RemoteListing, String> },
     Peers(Result<Vec<ct_core::remote::discover::TailnetPeer>, String>),
     Accounts { accounts: Vec<crate::agents::Account>, runtime: crate::agents::RuntimeStatus },
@@ -385,7 +387,18 @@ pub struct App {
     /// Why the shown mode differs from the stored preference (e.g. "read-only revision").
     pub view_note: Option<&'static str>,
     pub wt_view: crate::worktree::WtView,
-    pub files_filter: String,
+    pub flt_commits: crate::filter::RailFilter,
+    pub flt_current: crate::filter::RailFilter,
+    /// Filter results of the Commits-tab file list and the Current-tab row list.
+    pub shown_files: crate::filter::Shown<Vec<usize>>,
+    pub shown_wt: crate::filter::Shown<Vec<crate::currentui::Row>>,
+    /// Bumped whenever `diffset` receives new data (cache key of `shown_files`).
+    pub diff_rev: u64,
+    /// "Only commits touching these files" (off by default).
+    pub narrow: bool,
+    /// Pathspec the commit list is currently narrowed by.
+    pub narrow_applied: Option<String>,
+    pub narrow_at: Option<Instant>,
     pub res: crate::resmon::ResState,
     pub wt: crate::wtapp::WtState,
     pub pj: crate::projectapp::ProjectState,
@@ -430,7 +443,6 @@ pub struct App {
     pub diffset: Loadable<DiffSet>,
     pub diff_opts: DiffOpts,
     pub file_sel: Option<String>,
-    pub file_filter: String,
     pub prepared: Loadable<Box<Prepared>>,
     pub show_large: bool,
     pub diff_sel: Option<RowSel>,
@@ -482,7 +494,14 @@ impl App {
             tt_cache: Default::default(),
             view_note: None,
             wt_view: Default::default(),
-            files_filter: String::new(),
+            flt_commits: Default::default(),
+            flt_current: Default::default(),
+            shown_files: Default::default(),
+            shown_wt: Default::default(),
+            diff_rev: 0,
+            narrow: false,
+            narrow_applied: None,
+            narrow_at: None,
             res: Default::default(),
             wt: Default::default(),
             ag: crate::agentapp::AgentState::new(svc),
@@ -523,7 +542,6 @@ impl App {
             cur: None,
             diffset: Loadable::Idle,
             file_sel: None,
-            file_filter: String::new(),
             prepared: Loadable::Idle,
             show_large: false,
             diff_sel: None,
@@ -647,10 +665,11 @@ impl App {
         self.commit_token += 1;
         let token = self.commit_token;
         let (text, mode) = self.commit_filter_applied.clone();
+        let narrow = self.narrow_applied.clone();
         let skip = if append { self.commits.len() } else { 0 };
         let timeout = self.git_timeout();
         self.jobs.spawn(JobKind::Log, move |c| {
-            let mut q = LogQuery { skip, limit: PAGE, all_refs: true, ..Default::default() };
+            let mut q = LogQuery { skip, limit: PAGE, all_refs: true, path: narrow, path_is_pathspec: true, ..Default::default() };
             if !text.trim().is_empty() {
                 if mode == 0 {
                     q.message = Some(text.trim().to_string());
@@ -1309,6 +1328,7 @@ impl App {
                     self.wt.last = Instant::now();
                     let dirty = o.dirty.as_ref().is_some_and(|s| s.dirty());
                     self.wt.summary = o.dirty;
+                    self.wt.rev += 1;
                     if dirty && self.target.is_none() {
                         self.rail = RailTab::Current;
                         self.select_worktree();
@@ -1352,9 +1372,11 @@ impl App {
             }
             Msg::Diff { res } => match res {
                 Ok((set, cur)) => {
-                    let keep = self.file_sel.clone().filter(|p| set.files.iter().any(|f| &f.path == p));
-                    let first = set.files.first().map(|f| f.path.clone());
+                    let flt = self.active_filter();
+                    let keep = self.file_sel.clone().filter(|p| flt.matches(p) && set.files.iter().any(|f| &f.path == p));
+                    let first = set.files.iter().find(|f| flt.matches(&f.path)).map(|f| f.path.clone());
                     self.cur = Some(cur);
+                    self.diff_rev += 1;
                     self.diffset = Loadable::Ready(set);
                     if keep.is_some() && self.wt.quiet_gen == self.cmp_gen {
                         // Live refresh: same file stays open; selection and scroll are untouched.
@@ -1505,6 +1527,8 @@ impl App {
             Msg::Browse { token, res } => self.pj_handle(token, res),
             Msg::RemoteTest { token, res } => self.rs_test_done(token, res),
             Msg::RemoteBrowse { token, res } => self.pj_remote_handle(token, res),
+            Msg::Filtered { current, key, out } => self.filter_done(current, key, out),
+            Msg::Complete { remote, token, parent, children } => self.pj_complete_handle(remote, token, &parent, children),
             Msg::Peers(res) => self.rs_peers_done(res),
             Msg::Status { token, res } => self.wt_handle(token, res),
             Msg::Resources { sample, runs } => self.res_handle(sample, runs),

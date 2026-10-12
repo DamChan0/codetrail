@@ -158,6 +158,10 @@ impl App {
                 widgets::empty_state(ui, &th, "No changes", "This comparison has no differences. Pick another commit or change the base.");
                 return;
             }
+            Loadable::Ready(_) if self.filter_hides_everything() => {
+                widgets::empty_state(ui, &th, "No matching files", "The filter in the left rail matches none of the changed files.");
+                return;
+            }
             Loadable::Ready(_) => {}
         }
         match &self.prepared {
@@ -1007,6 +1011,16 @@ impl App {
                 }
                 // Opens on "Working tree changes" by itself when the repo is dirty.
                 "worktree" | "current-dirty" => {}
+                "filter-current-many" => {
+                    self.flt_current.text = self.smoke.as_ref().map(|s| s.query.clone()).unwrap_or_default();
+                }
+                "filter-commits" => {
+                    let q = self.smoke.as_ref().map(|s| s.query.clone()).filter(|q| !q.is_empty()).unwrap_or_else(|| "g.txt".into());
+                    self.rail = RailTab::Commits;
+                    self.flt_commits.text = q;
+                    self.narrow = true;
+                    self.narrow_at = Some(Instant::now());
+                }
                 "current-clean" => self.rail = RailTab::Current,
                 "history-time-travel" => {
                     self.insp_open = true;
@@ -1026,6 +1040,13 @@ impl App {
                         self.settings.recent.push(crate::projects::RecentProject::local(path.to_string_lossy().into_owned(), now - 1000 * (i as i64 + 1)));
                     }
                     self.pj.popover = true;
+                }
+                "folder-autocomplete" => {
+                    let q = self.smoke.as_ref().map(|s| s.query.clone()).filter(|q| !q.is_empty()).unwrap_or_else(|| "/tmp/ct-demo/".into());
+                    self.pj_open_browser();
+                    if let Some(parent) = std::path::Path::new(&q).parent() {
+                        self.pj_browse(parent.to_path_buf());
+                    }
                 }
                 "folder-browser" => {
                     self.pj_open_browser();
@@ -1064,7 +1085,15 @@ impl App {
         if scene == "model-picker" && !self.insp_open && !self.smoke.as_ref().is_some_and(|s| s.requested) {
             self.insp_open = true;
         }
-        let browser_ready = (scene != "folder-browser" || self.pj.browser.as_ref().is_some_and(|b| b.listing.ready().is_some())) && (scene != "remote-picker" || self.rs.picker.as_ref().is_some_and(|p| p.listing.ready().is_some()));
+        if scene == "folder-autocomplete" {
+            let q = self.smoke.as_ref().map(|s| s.query.clone()).filter(|q| !q.is_empty()).unwrap_or_else(|| "/tmp/ct-demo/".into());
+            if let Some(b) = self.pj.browser.as_mut().filter(|b| b.listing.ready().is_some() && !b.auto.open) {
+                b.input = q.clone();
+                b.auto.edit(&q, Instant::now() - Duration::from_secs(1));
+            }
+        }
+        let filter_ready = scene != "filter-commits" || (self.narrow_applied.is_some() && !self.commits_loading && self.narrow_at.is_none());
+        let browser_ready = filter_ready && (scene != "folder-autocomplete" || self.pj.browser.as_ref().is_some_and(|b| b.auto.visible())) && (scene != "folder-browser" || self.pj.browser.as_ref().is_some_and(|b| b.listing.ready().is_some())) && (scene != "remote-picker" || self.rs.picker.as_ref().is_some_and(|p| p.listing.ready().is_some()));
         let ag_scene = matches!(scene.as_str(), "runs" | "runs-stream" | "accounts" | "model-picker" | "new-run");
         let ag_ready = !ag_scene || (self.ag.accounts.ready().is_some() && !self.ag.models.is_loading() && (self.ag.runs_svc.ready().is_some() || !matches!(scene.as_str(), "runs" | "runs-stream" | "new-run")));
         if scene == "runs-stream" && self.ag.runs_svc.ready().is_some() && self.centre != Centre::Run {

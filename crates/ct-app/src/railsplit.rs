@@ -4,7 +4,6 @@ pub const MIN_FRAC: f32 = 0.15;
 pub const MAX_FRAC: f32 = 0.75;
 /// Files above this count get the larger default share.
 pub const MANY_FILES: usize = 6;
-pub const FILTER_MIN_FILES: usize = 8;
 
 pub fn clamp(frac: f32) -> f32 {
     if frac.is_finite() { frac.clamp(MIN_FRAC, MAX_FRAC) } else { 0.25 }

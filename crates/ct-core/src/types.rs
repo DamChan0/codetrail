@@ -67,6 +67,8 @@ pub struct LogQuery {
     pub limit: usize,
     /// Only commits touching this path (repo-relative).
     pub path: Option<String>,
+    /// `path` is a git pathspec (globs, `:(icase)` magic) instead of a literal path.
+    pub path_is_pathspec: bool,
     /// Literal, case-insensitive author substring (name or email).
     pub author: Option<String>,
     /// Literal, case-insensitive commit message substring.
@@ -82,6 +84,7 @@ impl Default for LogQuery {
             skip: 0,
             limit: 200,
             path: None,
+            path_is_pathspec: false,
             author: None,
             message: None,
             first_parent: false,

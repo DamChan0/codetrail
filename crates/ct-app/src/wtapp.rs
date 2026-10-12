@@ -27,11 +27,13 @@ pub struct WtState {
     pub slow_streak: u32,
     /// Auto-refresh off (repo too slow); only manual refresh / save / apply update the status.
     pub paused: bool,
+    /// Bumped when `summary` holds different changes (cache key of the Current list).
+    pub rev: u64,
 }
 
 impl Default for WtState {
     fn default() -> Self {
-        WtState { summary: None, token: 0, last: Instant::now(), was_focused: false, quiet_gen: 0, inflight_since: None, interval: POLL, slow_streak: 0, paused: false }
+        WtState { summary: None, token: 0, last: Instant::now(), was_focused: false, quiet_gen: 0, inflight_since: None, interval: POLL, slow_streak: 0, paused: false, rev: 0 }
     }
 }
 
@@ -117,6 +119,9 @@ impl App {
             }
         };
         let changed = self.wt.summary.as_ref().map(|o| o.sig) != Some(s.sig);
+        if changed {
+            self.wt.rev += 1;
+        }
         self.wt.summary = Some(s);
         if changed && matches!(self.target, Some(TargetSel::Worktree)) && self.range.is_none() {
             self.wt.quiet_gen = u64::MAX; // consumed by request_diff

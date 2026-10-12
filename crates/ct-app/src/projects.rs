@@ -141,6 +141,26 @@ pub fn list_dir(p: &Path) -> Result<Listing, String> {
     Ok(Listing { dir: p.to_path_buf(), kind, entries })
 }
 
+/// Sub-folders of `p` including hidden ones (one `read_dir`, at most `MAX_CHILDREN`), for path
+/// autocomplete. `None` when `p` is not a readable directory or the job was cancelled.
+pub fn list_children(p: &Path, cancel: &std::sync::atomic::AtomicBool) -> Option<Vec<crate::autocomplete::Child>> {
+    use std::sync::atomic::Ordering;
+    let mut v = Vec::new();
+    for e in std::fs::read_dir(p).ok()?.filter_map(|e| e.ok()) {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        if e.path().is_dir() {
+            v.push(crate::autocomplete::Child { is_git: is_git_dir(&e.path()), name: e.file_name().to_string_lossy().into_owned() });
+            if v.len() >= crate::autocomplete::MAX_CHILDREN {
+                break;
+            }
+        }
+    }
+    v.sort_by_key(|c| c.name.to_lowercase());
+    Some(v)
+}
+
 /// Where the folder browser starts: the last project's parent when it exists, else `$HOME`.
 pub fn browser_start(recent: &[RecentProject], home: &Path) -> PathBuf {
     recent.iter().find(|r| r.remote.is_none()).and_then(|r| Path::new(&r.path).parent().map(Path::to_path_buf)).filter(|p| p.is_dir()).unwrap_or_else(|| home.to_path_buf())

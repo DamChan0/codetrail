@@ -17,6 +17,7 @@ pub struct Browser {
     pub error: Option<String>,
     pub token: u64,
     pub focus: bool,
+    pub auto: crate::autocomplete::Auto,
 }
 
 #[derive(Default)]
@@ -36,7 +37,7 @@ impl App {
     pub fn pj_open_browser(&mut self) {
         self.pj.popover = false;
         let start = browser_start(&self.settings.recent, &home_dir());
-        self.pj.browser = Some(Browser { cwd: start.clone(), input: abbrev_home(&start, &home_dir()), listing: Loadable::Loading, error: None, token: 0, focus: true });
+        self.pj.browser = Some(Browser { cwd: start.clone(), input: abbrev_home(&start, &home_dir()), listing: Loadable::Loading, error: None, token: 0, focus: true, auto: Default::default() });
         self.pj.open_error = None;
         self.pj_browse(start);
     }
@@ -54,6 +55,40 @@ impl App {
         });
     }
 
+    /// Starts the one due autocomplete listing (local `read_dir` or remote `list_dir`) on a worker.
+    pub fn pj_complete_poll(&mut self, ctx: &egui::Context) {
+        let remote = self.rs.picker.is_some();
+        let auto = match (&mut self.rs.picker, &mut self.pj.browser) {
+            (Some(p), _) => &mut p.auto,
+            (None, Some(b)) => &mut b.auto,
+            _ => return,
+        };
+        match auto.poll(std::time::Instant::now()) {
+            crate::autocomplete::Poll::Idle => {}
+            crate::autocomplete::Poll::Wait(d) => ctx.request_repaint_after(d),
+            crate::autocomplete::Poll::Request { parent, token } => {
+                let spec = self.rs.picker.as_ref().map(|p| p.spec.clone());
+                let be = self.rs.backend();
+                self.jobs.spawn(JobKind::Complete, move |c| {
+                    let children = match &spec {
+                        Some(spec) => be.list_dir(spec, &parent, Some(c.cancel.clone())).ok().map(|v| v.into_iter().take(crate::autocomplete::MAX_CHILDREN).map(|e| crate::autocomplete::Child { name: e.name, is_git: e.is_git_repo }).collect()),
+                        None => list_children(&expand_tilde(&parent, &home_dir()), &c.cancel),
+                    };
+                    c.finish(Msg::Complete { remote, token, parent, children });
+                });
+            }
+        }
+    }
+
+    pub fn pj_complete_handle(&mut self, remote: bool, token: u64, parent: &str, children: Option<Vec<crate::autocomplete::Child>>) {
+        let auto = match (remote, &mut self.rs.picker, &mut self.pj.browser) {
+            (true, Some(p), _) => &mut p.auto,
+            (false, None, Some(b)) => &mut b.auto,
+            _ => return,
+        };
+        auto.arrived(token, parent, children);
+    }
+
     pub fn pj_handle(&mut self, token: u64, res: Result<Listing, String>) {
         let Some(b) = &mut self.pj.browser else { return };
         if token != b.token {
@@ -63,6 +98,7 @@ impl App {
             Ok(l) => {
                 b.cwd = l.dir.clone();
                 b.input = abbrev_home(&l.dir, &home_dir());
+                b.auto.close();
                 b.error = None;
                 b.listing = Loadable::Ready(l);
             }
@@ -318,13 +354,9 @@ impl App {
                     go = Some(home.clone());
                 }
                 let w = (ui.available_width() - 8.0).max(120.0);
-                let te = egui::TextEdit::singleline(&mut b.input).hint_text("Type a path, e.g. ~/projects/app").desired_width(w).margin(vec2(8.0, 6.0)).font(widgets::mono_font(&th));
-                let r = ui.add(te);
-                if b.focus {
-                    r.request_focus();
-                    b.focus = false;
-                }
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let grab = std::mem::take(&mut b.focus);
+                let f = crate::autocomplete::path_field(ui, &th, &mut b.input, &mut b.auto, "local", "Type a path, e.g. ~/projects/app", w, grab);
+                if f.submit {
                     go = Some(expand_tilde(&b.input, &home));
                 }
             });
@@ -387,9 +419,11 @@ impl App {
         if cancel {
             self.rs.picker = None;
             self.jobs.cancel(JobKind::RemoteBrowse);
+            self.jobs.cancel(JobKind::Complete);
             return;
         }
         self.pj.browser = Some(b);
+        self.pj_complete_poll(ctx);
         if src != before {
             match src.checked_sub(1).and_then(|i| names.get(i)).and_then(|n| self.remote_spec(n)) {
                 Some(spec) => self.pj_remote_pick(spec),
@@ -506,5 +540,46 @@ mod tests {
         app.pj_handle(first, Ok(stale));
         let b = app.pj.browser.as_ref().unwrap();
         assert_ne!(b.cwd, Path::new("/"), "older token must not move the browser");
+    }
+
+    #[test]
+    fn autocomplete_lists_the_typed_parent_in_the_background_and_filters_in_memory() {
+        let d = tempfile::tempdir().unwrap();
+        repo(d.path(), "alpha", "a.txt");
+        std::fs::create_dir(d.path().join("Alps")).unwrap();
+        std::fs::create_dir(d.path().join(".hid")).unwrap();
+        std::fs::create_dir(d.path().join("beta")).unwrap();
+        std::fs::write(d.path().join("file.txt"), "x").unwrap();
+        let mut app = app_for(d.path().to_path_buf());
+        let ctx = egui::Context::default();
+        app.pj_open_browser();
+        let root = d.path().display().to_string();
+        let now = Instant::now() - Duration::from_secs(1);
+        app.pj.browser.as_mut().unwrap().auto.edit(&format!("{root}/al"), now);
+        let t = Instant::now();
+        while app.pj.browser.as_ref().unwrap().auto.matches.is_empty() {
+            assert!(t.elapsed() < Duration::from_secs(10), "autocomplete never answered");
+            app.pj_complete_poll(&ctx);
+            app.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let names = |a: &App| a.pj.browser.as_ref().unwrap().auto.matches.iter().map(|c| (c.name.clone(), c.is_git)).collect::<Vec<_>>();
+        assert_eq!(names(&app), [("alpha".to_string(), true), ("Alps".to_string(), false)]);
+        // Same parent: filtering needs no worker (the job generation does not advance).
+        app.pj.browser.as_mut().unwrap().auto.edit(&format!("{root}/."), Instant::now());
+        assert_eq!(names(&app), [(".hid".to_string(), false)]);
+        app.pj.browser.as_mut().unwrap().auto.edit(&format!("{root}/zzz"), Instant::now());
+        assert!(names(&app).is_empty());
+        app.pj_complete_poll(&ctx);
+        // A parent that does not exist yields no suggestions and no error text.
+        app.pj.browser.as_mut().unwrap().auto.edit(&format!("{root}/nope/x"), now);
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(300) {
+            app.pj_complete_poll(&ctx);
+            app.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(names(&app).is_empty());
+        assert!(app.pj.browser.as_ref().unwrap().error.is_none());
     }
 }
