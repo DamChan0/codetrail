@@ -87,6 +87,10 @@ fn parse(args: &[String]) -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
+    // Resource budget: the search pool must not spawn one thread per core (32 on big machines).
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        std::env::set_var("RAYON_NUM_THREADS", "4");
+    }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     // Answered before anything graphical exists: works without DISPLAY and never opens a window.
     match argv.first().map(String::as_str) {
