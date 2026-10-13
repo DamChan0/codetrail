@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0
+
+- **Current tab**: always present; staged / unstaged / untracked groups, per-group diffs, badge with changed-file count.
+- **Line-history time travel**: clicking a history entry shows the file at that revision in the centre pane only (rail selection untouched), with the selected lines highlighted and a Back button; ↑/↓ steps through entries.
+- **Sticky Diff / Blame / Edit mode** across files, commits and tabs (`view_mode` in `config.toml`).
+- **Remote repositories** over SSH, Tailscale-first: Tailscale SSH (no keys), SSH via `tailscale nc`, or key-based SSH; peer discovery and `~/.ssh/config` import; read-only. Per-connection ControlMaster, symlink-safe reads, byte budgets, bounded caches.
+- **Settings page** (General, Appearance, Agents & Accounts, Remotes, Resources & Limits, Shortcuts, About) replaces the settings window; `Ctrl+,`.
+- **File-name filter** in Commits and Current (AND terms, `!exclude`, globs, `ext:`), diff restricted to matches; optional "only commits touching these files".
+- **Folder path autocomplete** in the project picker (local and remote).
+- Panel widths are clamped to the window; one connection banner instead of repeated errors; search thread pool capped at 4.
+- Packaging: `dist/build.sh` (tarball, `.deb`, checksums), `install.sh` / `uninstall.sh`, CI and release workflows.
+
 ## 0.1.0
 
 First release.

@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/banner.jpg" alt="CodeTrail" width="100%"></p>
+
 # codetrail
 
 git 변경을 검토하고, AI 에이전트가 각 줄을 **왜** 바꿨는지 기록해 보여주는 가벼운 데스크톱 뷰어 (Rust + egui, Linux). 영문 원본: [README.md](README.md)

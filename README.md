@@ -1,3 +1,11 @@
+<p align="center"><img src="docs/banner.jpg" alt="CodeTrail — Review every change. Know why it changed." width="100%"></p>
+
+<p align="center">
+<a href="https://github.com/DamChan0/codetrail/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/DamChan0/codetrail?color=5b8def"></a>
+<img alt="platform" src="https://img.shields.io/badge/platform-Linux%20x86__64-555">
+<img alt="license" src="https://img.shields.io/badge/license-MIT-3dd6a0">
+</p>
+
 # codetrail
 
 A lightweight desktop viewer (Rust + egui, Linux) for reviewing git changes, with a record of **why** AI agents changed each line.
@@ -24,7 +32,7 @@ A lightweight desktop viewer (Rust + egui, Linux) for reviewing git changes, wit
 
 ## Install
 
-> The packaging described here is produced by the release scripts under `dist/`. File names and flags are as specified; **this README was written before they were verified** (see [Verification status](#verification-status)).
+Download the tarball or `.deb` from the [latest release](https://github.com/DamChan0/codetrail/releases/latest) and check it with `sha256sum -c SHA256SUMS`.
 
 Tarball:
 
@@ -254,6 +262,6 @@ Crates:
 
 ## Verification status
 
-What was run while writing this document, against `target-m/release/codetrail` in a throw-away repo and `$HOME`: `install --dry-run`, `install --claude`, `install` (all), repeated install (all `unchanged`), `record --path`, `export`, `export --json`, `note`, `record <id>`, `ask --print`, `--smoke … --scene commit`, `--bogus` (usage, exit 2). Everything else is taken from the source code or from other team members' reports. The packaging section (`install.sh`, `uninstall.sh`, the `.tar.gz`/`.deb` names) was written to the specification and **not** run.
+Run while writing and releasing: the `codetrail install` / `hook` / `record` / `note` / `export` / `ask --print` CLI against a throw-away repo and `$HOME`; the tarball install → run → uninstall cycle in a temporary prefix; remote repositories over real OpenSSH (a throw-away local `sshd`) with the GUI under Xvfb. **Not verified:** Tailscale-routed connections (Tailscale SSH was not enabled on the test machine), Korean IME input, ChatGPT/Copilot OAuth completion. Everything else is taken from the source code.
 
 License: MIT.
