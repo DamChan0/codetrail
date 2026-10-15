@@ -65,6 +65,8 @@ impl Default for AgentCfg {
 pub struct Settings {
     pub ui_font_size: f32,
     pub code_font_size: f32,
+    /// Whole-UI zoom (text, panels, icons); Ctrl+Plus / Ctrl+Minus / Ctrl+0 change it too.
+    pub zoom: f32,
     pub tab_width: usize,
     pub split_view: bool,
     pub ask_preview: bool,
@@ -94,6 +96,7 @@ impl Default for Settings {
         Settings {
             ui_font_size: 13.0,
             code_font_size: 13.0,
+            zoom: 1.0,
             tab_width: 4,
             split_view: false,
             ask_preview: true,
@@ -123,6 +126,7 @@ impl Settings {
     pub fn sanitize(mut self) -> Self {
         self.ui_font_size = self.ui_font_size.clamp(9.0, 24.0);
         self.code_font_size = self.code_font_size.clamp(9.0, 28.0);
+        self.zoom = clamp_zoom(self.zoom);
         self.tab_width = self.tab_width.clamp(1, 16);
         self.rail_width = self.rail_width.clamp(240.0, 640.0);
         self.files_split = self.files_split.map(crate::railsplit::clamp);
@@ -159,6 +163,11 @@ impl Settings {
         let s = toml::to_string_pretty(self).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         crate::fsutil::atomic_write(path, s.as_bytes())
     }
+}
+
+/// Zoom in 10% steps (egui's Ctrl+Plus/Minus step), 50%..300%; NaN/inf -> 100%.
+pub fn clamp_zoom(z: f32) -> f32 {
+    if z.is_finite() { (z * 10.0).round().clamp(5.0, 30.0) / 10.0 } else { 1.0 }
 }
 
 #[cfg(test)]

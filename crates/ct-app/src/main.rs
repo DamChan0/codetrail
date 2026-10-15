@@ -124,7 +124,8 @@ fn main() -> ExitCode {
         None => (args.repo, None),
     };
     let size = args.size;
-    let viewport = egui::ViewportBuilder::default().with_inner_size([size.0, size.1]).with_min_inner_size([640.0, 420.0]).with_title("CodeTrail").with_app_id("codetrail");
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icons/codetrail-256.png")).expect("bundled icon is a valid PNG");
+    let viewport = egui::ViewportBuilder::default().with_inner_size([size.0, size.1]).with_min_inner_size([640.0, 420.0]).with_title("CodeTrail").with_app_id("codetrail").with_icon(icon);
     let opts = eframe::NativeOptions { viewport, ..Default::default() };
     let res = eframe::run_native(
         "CodeTrail",
@@ -155,6 +156,7 @@ fn main() -> ExitCode {
             let note = fonts::install(&cc.egui_ctx, &choice);
             let th = theme::Theme { file: theme_file.clone(), ui_font: settings.ui_font_size, code_font: settings.code_font_size };
             th.apply(&cc.egui_ctx);
+            cc.egui_ctx.set_zoom_factor(settings.zoom);
             let svc: std::sync::Arc<dyn agents::AgentService> = if smoke.is_some() { std::sync::Arc::new(agents_fake::FakeAgents::seeded()) } else { std::sync::Arc::new(agents_real::RealAgents) };
             let smoke = smoke.map(|(out, scene, query)| app::Smoke { scene, out, query, started: std::time::Instant::now(), stable: 0, settled_at: None, requested: false, prepared: false });
             Ok(Box::new(app::App::new_with(cc.egui_ctx.clone(), repo_arg, remote.or(smoke_remote), theme_file, settings, banners, note, smoke, svc)))

@@ -178,6 +178,7 @@ The numbers in the last column come from other team members' test reports and we
 | `ui_font_size` | 13 | 9–24 |
 | `code_font_size` | 13 | 9–28 |
 | `tab_width` | 4 | 1–16 |
+| `zoom` | 1.0 | 0.5–3.0, whole-UI scale (`Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0`) |
 | `split_view` | false | side-by-side diff |
 | `ask_preview` | true | show prompt before sending |
 | `ask_timeout_secs` | 180 | 5–3600 |

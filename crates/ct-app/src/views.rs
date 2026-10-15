@@ -700,64 +700,110 @@ impl App {
     fn blame_tab_ui(&mut self, ui: &mut Ui) {
         let th = self.th.clone();
         let Some(sel) = self.selection.clone() else {
-            widgets::empty_state(ui, &th, "Select a line", "Blame details and line history appear here.");
+            widgets::empty_state(ui, &th, "Select a line", "Who changed it last, when, and every commit that touched it appear here.");
             return;
         };
         let line = sel.code_ref.start;
+        let end = sel.code_ref.end.max(line);
         let path = sel.code_ref.path.clone();
         let tt = self.tt.is_some();
-        let hist_path = self.history.path.clone();
-        if !tt && (self.blame.path != path || self.blame.data.ready().is_none()) {
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                ui.add_space(12.0);
-                if Btn::new("Open blame view").icon(Icon::Blame).show(ui, &th).clicked() {
-                    self.open_blame(&path, Some(line as usize));
-                }
-            });
+        // The selection's history loads by itself; not mid-drag, and a newer request cancels the older one.
+        let key_matches = (self.history.path.as_str(), self.history.line, self.history.end) == (path.as_str(), line, end);
+        if !tt && !key_matches && !ui.input(|i| i.pointer.any_down()) {
+            self.request_history(&path, line, end);
         }
-        let info = self.blame.data.ready().filter(|_| !tt && self.blame.path == path).and_then(|d| d.lines.iter().find(|l| l.line_no == line)).cloned();
+        let current = tt || (self.history.path.as_str(), self.history.line, self.history.end) == (path.as_str(), line, end);
+        let hist_path = self.history.path.clone();
         let now = crate::timefmt::now();
-        if let Some(l) = info {
+        let hist = self.history.data.ready().filter(|_| current);
+        // Last change: the blame of the exact line when the blame view has it, else the newest commit
+        // that touched the selection.
+        let blame_line = self.blame.data.ready().filter(|_| !tt && self.blame.path == path).and_then(|d| d.lines.iter().find(|l| l.line_no == line));
+        let last = match blame_line {
+            Some(l) => Some((l.sha.clone(), l.author.clone(), l.time, l.summary.clone())),
+            None => hist.and_then(|v| v.first()).map(|r| (r.commit.sha.clone(), r.commit.author.clone(), r.commit.time, r.commit.subject.clone())),
+        };
+        let stats = hist.filter(|v| !v.is_empty()).map(|v| {
+            let mut authors: Vec<&str> = v.iter().map(|r| r.commit.author.as_str()).collect();
+            authors.sort_unstable();
+            authors.dedup();
+            let oldest = &v[v.len() - 1].commit;
+            let capped = v.len() >= crate::app::HISTORY_LIMIT;
+            let plural = |n: usize, w: &str| if n == 1 { format!("1 {w}") } else { format!("{n} {w}s") };
+            let counts = format!("{}{} · {} · since {}", plural(v.len(), "commit"), if capped { "+" } else { "" }, plural(authors.len(), "author"), crate::timefmt::rel(now, oldest.time));
+            let origin = format!("{} {}  ·  {}", if capped { "Oldest shown" } else { "Introduced in" }, crate::timefmt::short(&oldest.sha), oldest.subject);
+            (counts, origin, crate::timefmt::abs(oldest.time))
+        });
+        let section = |ui: &mut Ui, text: &str| {
             ui.add_space(12.0);
-            let unc = l.sha.bytes().all(|b| b == b'0');
             ui.horizontal(|ui| {
                 ui.add_space(12.0);
-                if unc {
-                    widgets::badge(ui, &th, "Uncommitted", th.warn());
-                } else {
-                    ui.label(RichText::new(crate::timefmt::short(&l.sha)).font(widgets::mono_font(&th)).color(th.accent()));
-                    ui.label(RichText::new(format!("{} · {}", l.author, crate::timefmt::rel(now, l.time))).font(widgets::small_font(&th)).color(th.muted()));
-                }
+                ui.label(RichText::new(text).font(widgets::small_font(&th)).color(th.muted()).strong());
             });
-            if !unc {
-                egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 0)).show(ui, |ui| {
-                    ui.add(egui::Label::new(RichText::new(&l.summary).color(th.fg())).wrap());
-                });
-                ui.add_space(8.0);
+        };
+        section(ui, if line == end { "LAST CHANGE" } else { "LAST CHANGE TO THESE LINES" });
+        match last {
+            Some((sha, author, time, summary)) => {
+                let unc = sha.bytes().all(|b| b == b'0');
                 ui.horizontal(|ui| {
                     ui.add_space(12.0);
-                    if Btn::new("Show commit").show(ui, &th).clicked() {
-                        self.jump_to_commit(&l.sha);
+                    if unc {
+                        widgets::badge(ui, &th, "Uncommitted", th.warn());
+                    } else {
+                        ui.label(RichText::new(crate::timefmt::short(&sha)).font(widgets::mono_font(&th)).color(th.accent()));
+                        ui.label(RichText::new(format!("{author} · {}", crate::timefmt::rel(now, time))).font(widgets::small_font(&th)).color(th.muted())).on_hover_text(crate::timefmt::abs(time));
+                    }
+                });
+                if !unc {
+                    egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 0)).show(ui, |ui| {
+                        ui.add(egui::Label::new(RichText::new(&summary).color(th.fg())).wrap());
+                    });
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    if !unc && Btn::new("Show commit").show(ui, &th).clicked() {
+                        self.jump_to_commit(&sha);
+                    }
+                    if !tt && (self.blame.path != path || self.blame.data.ready().is_none()) && Btn::new("Open blame view").icon(Icon::Blame).show(ui, &th).clicked() {
+                        self.open_blame(&path, Some(line as usize));
                     }
                 });
             }
-        } else if !tt && matches!(self.blame.data, Loadable::Loading) {
-            widgets::skeleton(ui, &th, 2, 24.0);
+            None if matches!(self.history.data, Loadable::Failed(_)) => {}
+            None if hist.is_some_and(|v| v.is_empty()) => {
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    widgets::badge(ui, &th, "Not committed yet", th.warn());
+                });
+            }
+            None => widgets::skeleton(ui, &th, 2, 24.0),
+        }
+        if let Some((counts, origin, when)) = stats {
+            section(ui, "HISTORY");
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.label(RichText::new(counts).color(th.fg()));
+            });
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 0)).show(ui, |ui| {
+                ui.add(egui::Label::new(RichText::new(origin).font(widgets::small_font(&th)).color(th.muted())).wrap()).on_hover_text(when);
+            });
+        }
+        if tt {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.label(RichText::new("↑/↓ step through history · Esc back").font(widgets::small_font(&th)).color(th.muted()));
+            });
         }
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.add_space(12.0);
-            if tt {
-                ui.label(RichText::new("↑/↓ step through history · Esc back").font(widgets::small_font(&th)).color(th.muted()));
-            } else if Btn::new("Follow this line's history").icon(Icon::Commit).show(ui, &th).clicked() {
-                self.request_history(&path, line, sel.code_ref.end.max(line));
-            }
-        });
         ui.separator();
+        if !current {
+            widgets::skeleton(ui, &th, 4, 40.0);
+            return;
+        }
         match &self.history.data {
-            Loadable::Idle => widgets::empty_state(ui, &th, "Line history", "Follow the selected line back through renames and edits."),
-            Loadable::Loading => widgets::skeleton(ui, &th, 4, 40.0),
+            Loadable::Idle | Loadable::Loading => widgets::skeleton(ui, &th, 4, 40.0),
             Loadable::Failed(e) => {
                 widgets::banner(ui, &th, Level::Error, &format!("History failed: {e}"), None, false);
             }

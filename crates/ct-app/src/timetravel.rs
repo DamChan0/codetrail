@@ -467,6 +467,26 @@ mod tests {
     }
 
     #[test]
+    fn files_outside_the_comparison_open_in_the_stored_mode() {
+        let fx = fixture();
+        let mut app = opened(&fx);
+        // The HEAD commit only touches g.txt; other.txt is picked from the Files tab.
+        app.set_view_pref(ViewMode::Blame);
+        settle(&mut app);
+        app.open_file_diff_or_editor("other.txt");
+        settle(&mut app);
+        assert_eq!((app.centre, app.blame.path.as_str()), (Centre::Blame, "other.txt"));
+        app.set_view_pref(ViewMode::Diff);
+        assert_eq!((app.centre, app.view_note), (Centre::Blame, Some("not changed in this comparison")), "no diff exists: Blame with a note");
+        app.set_view_pref(ViewMode::Edit);
+        settle(&mut app);
+        assert_eq!((app.centre, app.editor.as_ref().map(|e| e.path.as_str())), (Centre::Editor, Some("other.txt")));
+        assert!(app.view_note.is_none());
+        app.set_view_pref(ViewMode::Blame);
+        assert_eq!((app.centre, app.blame.path.as_str()), (Centre::Blame, "other.txt"));
+    }
+
+    #[test]
     fn edit_falls_back_on_read_only_targets_without_changing_the_preference() {
         let fx = fixture();
         let mut app = opened(&fx);

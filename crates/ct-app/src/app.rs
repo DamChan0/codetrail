@@ -220,6 +220,8 @@ pub enum Msg {
 
 pub const REMOTE_RO: &str = "remote repositories are read-only";
 pub const REMOTE_NO_AGENT: &str = "not available for remote repositories (agents run on this machine)";
+/// Commits fetched for a line's history (Inspector > Blame); reaching it means "N+".
+pub const HISTORY_LIMIT: usize = 50;
 
 // ---------------------------------------------------------------- panel state
 
@@ -862,14 +864,39 @@ impl App {
         if self.file_sel.is_none() {
             let alt = self.editor.as_ref().map(|e| e.path.clone()).or_else(|| Some(self.blame.path.clone()).filter(|p| !p.is_empty()));
             match (mode, alt) {
-                (ViewMode::Diff, _) => self.centre = Centre::Diff,
-                (ViewMode::Blame, Some(p)) => self.load_blame(&p, None),
-                (ViewMode::Edit, Some(p)) => self.open_editor(&p, None),
+                (ViewMode::Diff, _) if self.centre == Centre::Diff => {}
+                (_, Some(p)) => self.open_file_diff_or_editor(&p),
+                (ViewMode::Diff, None) => self.centre = Centre::Diff,
                 _ => self.flash("Pick a file first (Ctrl+P)."),
             }
             return;
         }
         self.apply_view();
+    }
+
+    /// A file the current comparison does not touch (Files tab, Ctrl+P), shown in the stored mode.
+    /// There is no diff for it, so Diff shows Blame with a note; the preference is not changed.
+    pub fn open_outside_diff(&mut self, path: &str) {
+        self.file_sel = None;
+        self.view_note = None;
+        match self.settings.view_mode {
+            ViewMode::Edit if self.editor.as_ref().is_some_and(|e| e.dirty() && e.path != path) => {
+                let name = self.editor.as_ref().map(|e| e.path.clone()).unwrap_or_default();
+                self.centre = Centre::Editor;
+                self.flash(&format!("Unsaved changes in {name}: save or discard before opening another file."));
+            }
+            ViewMode::Edit => {
+                if self.remote.is_some() {
+                    self.view_note = Some(REMOTE_RO);
+                }
+                self.open_editor(path, None);
+            }
+            ViewMode::Blame => self.load_blame(path, None),
+            ViewMode::Diff => {
+                self.load_blame(path, None);
+                self.view_note = Some("not changed in this comparison");
+            }
+        }
     }
 
     pub fn request_file_diff(&mut self) {
@@ -1209,7 +1236,7 @@ impl App {
         let timeout = self.git_timeout();
         self.jobs.spawn(JobKind::History, move |c| {
             let repo = repo.with_timeout(timeout).with_cancel(c.cancel.clone());
-            let res = repo.line_history(&p, (line, end.max(line)), 50).map_err(|e| e.to_string());
+            let res = repo.line_history(&p, (line, end.max(line)), HISTORY_LIMIT).map_err(|e| e.to_string());
             c.finish(Msg::History { path: p, line, end, res });
         });
     }

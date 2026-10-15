@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- **Files tab** opens a file the current comparison does not touch in the stored Diff / Blame / Edit mode (Diff shows Blame with a "not changed in this comparison" note) instead of always the editor.
+- **Inspector > Blame** loads the selection's history by itself and summarises it: last change (commit, author, date, message), commit / author counts, and the commit that introduced the lines.
+- **Zoom** (`zoom` in `config.toml`, 50–300%): Settings > Appearance, or `Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0`; scales the whole UI and is remembered.
+- The Unified / Side by side switch in the top bar only shows while a diff is on screen.
+- The window uses the CodeTrail icon.
+
 ## 0.2.0
 
 - **Current tab**: always present; staged / unstaged / untracked groups, per-group diffs, badge with changed-file count.

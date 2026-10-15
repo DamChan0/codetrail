@@ -258,6 +258,28 @@ impl App {
                 d.theme = true;
             }
         });
+        let z = self.settings.zoom;
+        let mut nz = z;
+        row(ui, &th, "Zoom", |ui| {
+            ui.horizontal(|ui| {
+                if Btn::new("−").enabled(z > 0.5).show(ui, &th).clicked() {
+                    nz = z - 0.1;
+                }
+                ui.label(RichText::new(format!("{:.0}%", z * 100.0)).color(th.fg()));
+                if Btn::new("+").enabled(z < 3.0).show(ui, &th).clicked() {
+                    nz = z + 0.1;
+                }
+                if Btn::new("Reset").enabled(z != 1.0).show(ui, &th).clicked() {
+                    nz = 1.0;
+                }
+            });
+        });
+        if nz != z {
+            self.settings.zoom = crate::settings::clamp_zoom(nz);
+            ui.ctx().set_zoom_factor(self.settings.zoom);
+            self.settings_dirty_at = Some(Instant::now());
+        }
+        hint(ui, &th, "Scales text and the whole interface. Ctrl+Plus / Ctrl+Minus / Ctrl+0 work anywhere.");
         row(ui, &th, "UI font size", |ui| {
             if ui.add(egui::Slider::new(&mut self.settings.ui_font_size, 11.0..=18.0).step_by(1.0)).changed() {
                 d.settings = true;
@@ -409,6 +431,7 @@ impl App {
         let th = self.th.clone();
         let mut rows: Vec<(String, String)> = crate::ui::COMMANDS.iter().filter(|(_, _, k)| !k.is_empty()).map(|(_, n, k)| (n.to_string(), k.to_string())).collect();
         rows.push(("Settings".into(), "Ctrl+,".into()));
+        rows.push(("Zoom in / out / reset".into(), "Ctrl+Plus / Ctrl+Minus / Ctrl+0".into()));
         rows.push(("Next / previous hunk".into(), "] / [".into()));
         rows.push(("Next / previous commit".into(), "J / K".into()));
         rows.push(("History: step entries (Blame, Follow)".into(), "↑ / ↓".into()));

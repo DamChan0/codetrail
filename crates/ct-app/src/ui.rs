@@ -57,6 +57,15 @@ impl eframe::App for App {
         self.ag_close_requested(ctx);
         self.smoke_prepare();
         self.shortcuts(ctx);
+        // egui's built-in Ctrl+Plus / Ctrl+Minus / Ctrl+0 change the zoom: keep the stored value in step.
+        let z = ctx.zoom_factor();
+        if (z - self.settings.zoom).abs() > 0.001 {
+            self.settings.zoom = crate::settings::clamp_zoom(z);
+            if (z - self.settings.zoom).abs() > 0.001 {
+                ctx.set_zoom_factor(self.settings.zoom);
+            }
+            self.settings_dirty_at = Some(Instant::now());
+        }
         self.debounce(ctx);
         self.wt_tick(ctx);
         self.res_tick(ctx);
@@ -368,10 +377,13 @@ impl App {
                 if widgets::icon_button(ui, &th, Icon::Settings, "Settings").clicked() {
                     self.settings_open = !self.settings_open;
                 }
-                let mut v = usize::from(self.settings.split_view);
-                if widgets::segmented(ui, &th, &["Unified", "Side by side"], &mut v) {
-                    self.settings.split_view = v == 1;
-                    self.settings_dirty_at = Some(Instant::now());
+                // Diff layout only means something while a diff is on screen.
+                if self.centre == Centre::Diff && self.prepared.ready().is_some() {
+                    let mut v = usize::from(self.settings.split_view);
+                    if widgets::segmented(ui, &th, &["Unified", "Side by side"], &mut v) {
+                        self.settings.split_view = v == 1;
+                        self.settings_dirty_at = Some(Instant::now());
+                    }
                 }
                 if ui.ctx().screen_rect().width() >= 1000.0 && widgets::Btn::new("Ask AI").icon(Icon::Spark).kind(BtnKind::Primary).enabled(self.selection.is_some() && self.remote.is_none()).show(ui, &th).on_hover_text(if self.remote.is_some() { crate::app::REMOTE_NO_AGENT } else { "Ctrl+L" }).clicked() {
                     self.start_ask();
@@ -789,7 +801,8 @@ impl App {
         }
     }
 
-    /// Opens `path`: diff when the current comparison touches it, otherwise the editor.
+    /// Opens `path`: its diff when the current comparison touches it, otherwise the file itself in
+    /// the stored view mode (no diff exists there, so Diff falls back to Blame with a note).
     pub fn open_file_diff_or_editor(&mut self, path: &str) {
         let in_diff = self.diffset.ready().is_some_and(|s| s.files.iter().any(|f| f.path == path));
         if in_diff {
@@ -798,7 +811,7 @@ impl App {
             }
             self.open_file_diff(path);
         } else {
-            self.open_editor(path, None);
+            self.open_outside_diff(path);
         }
     }
 
