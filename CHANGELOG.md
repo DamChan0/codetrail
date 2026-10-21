@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+
+- The project picker opens a folder inside a git repository (`.git` in a parent folder), not only the repository root.
+
 ## 0.3.0
 
 - **Files tab** opens a file the current comparison does not touch in the stored Diff / Blame / Edit mode (Diff shows Blame with a "not changed in this comparison" note) instead of always the editor.

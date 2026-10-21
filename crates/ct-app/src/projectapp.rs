@@ -114,7 +114,7 @@ impl App {
     /// Opens `path` as the current project. Only git repositories are accepted.
     pub fn pj_open(&mut self, path: PathBuf) -> Result<(), String> {
         match check_dir(&path)? {
-            DirKind::Plain => return Err(format!("{} is not a git repository (no .git inside).", path.display())),
+            DirKind::Plain => return Err(format!("{} is not inside a git repository (no .git here or in a parent).", path.display())),
             DirKind::Git => {}
         }
         self.pj.browser = None;
@@ -364,7 +364,7 @@ impl App {
             let (text, col) = match (&b.error, &b.listing) {
                 (Some(e), _) => (e.clone(), widgets::level_color(&th, Level::Error)),
                 (None, Loadable::Ready(l)) if l.kind == DirKind::Git => ("Git repository: ready to open.".to_string(), th.p().diff.add.fg.0),
-                (None, Loadable::Ready(_)) => ("Not a git repository. Open a folder that contains .git.".to_string(), th.warn()),
+                (None, Loadable::Ready(_)) => ("Not inside a git repository (no .git here or in a parent).".to_string(), th.warn()),
                 (None, Loadable::Loading) => ("Reading folder…".to_string(), th.muted()),
                 _ => (String::new(), th.muted()),
             };
@@ -523,9 +523,13 @@ mod tests {
         std::fs::create_dir(&plain).unwrap();
         let mut app = app_for(a);
         let e = app.pj_open(plain.clone()).unwrap_err();
-        assert!(e.contains("not a git repository"), "{e}");
+        assert!(e.contains("not inside a git repository"), "{e}");
         assert!(app.pj_open(d.path().join("missing")).unwrap_err().contains("does not exist"));
         assert!(app.repo_arg.ends_with("alpha"), "a refused open keeps the current project");
+        let sub = d.path().join("alpha/sub");
+        std::fs::create_dir(&sub).unwrap();
+        app.pj_open(sub).unwrap();
+        assert!(app.repo_arg.ends_with("alpha/sub"), "a folder inside a repo opens");
     }
 
     #[test]

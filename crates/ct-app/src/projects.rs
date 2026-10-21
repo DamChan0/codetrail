@@ -108,7 +108,8 @@ pub fn check_dir(p: &Path) -> Result<DirKind, String> {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(format!("No permission to read {}.", p.display())),
         Err(e) => Err(format!("Cannot read {}: {e}", p.display())),
         Ok(m) if !m.is_dir() => Err(format!("{} is a file, not a folder.", p.display())),
-        Ok(_) => Ok(if is_git_dir(p) { DirKind::Git } else { DirKind::Plain }),
+        // A folder inside a repository (`.git` in a parent) opens that repository.
+        Ok(_) => Ok(if p.ancestors().any(is_git_dir) { DirKind::Git } else { DirKind::Plain }),
     }
 }
 
@@ -272,6 +273,10 @@ mod tests {
         std::fs::create_dir(&wt).unwrap();
         std::fs::write(wt.join(".git"), "gitdir: /x").unwrap();
         assert_eq!(check_dir(&wt), Ok(DirKind::Git));
+        // sub-folder of a repo (no .git of its own) counts too
+        let sub = repo.join("src/deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(check_dir(&sub), Ok(DirKind::Git));
     }
 
     #[test]
