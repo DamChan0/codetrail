@@ -89,6 +89,8 @@ pub struct Settings {
     pub remotes: Vec<RemoteSpec>,
     /// Recently opened projects, most recent first (at most 12).
     pub recent: Vec<RecentProject>,
+    /// Shortcut overrides (`[keys]`): command name -> `"Ctrl+Shift+F"`, `""` = unbound.
+    pub keys: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -113,6 +115,7 @@ impl Default for Settings {
             status_monitor: true,
             remotes: Vec::new(),
             recent: Vec::new(),
+            keys: Default::default(),
         }
     }
 }

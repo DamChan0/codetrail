@@ -11,6 +11,7 @@ mod fonts;
 mod fsutil;
 mod highlight;
 mod jobs;
+mod keymap;
 mod currentui;
 mod connbanner;
 mod panels;

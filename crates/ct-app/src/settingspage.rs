@@ -5,7 +5,7 @@
 use crate::app::App;
 use crate::settings::{Startup, ViewMode};
 use crate::theme::{self, Hex};
-use crate::widgets::{self, Btn, Level};
+use crate::widgets::{self, Btn, BtnKind, Level};
 use egui::{vec2, Align, Color32, Layout, Rect, RichText, ScrollArea, Ui};
 use std::time::Instant;
 
@@ -428,18 +428,84 @@ impl App {
     // ------------------------------------------------------------ Shortcuts
 
     fn sec_shortcuts(&mut self, ui: &mut Ui) {
+        use crate::keymap;
         let th = self.th.clone();
-        let mut rows: Vec<(String, String)> = crate::ui::COMMANDS.iter().filter(|(_, _, k)| !k.is_empty()).map(|(_, n, k)| (n.to_string(), k.to_string())).collect();
-        rows.push(("Settings".into(), "Ctrl+,".into()));
-        rows.push(("Zoom in / out / reset".into(), "Ctrl+Plus / Ctrl+Minus / Ctrl+0".into()));
-        rows.push(("Next / previous hunk".into(), "] / [".into()));
-        rows.push(("Next / previous commit".into(), "J / K".into()));
-        rows.push(("History: step entries (Blame, Follow)".into(), "↑ / ↓".into()));
-        rows.push(("Back (settings, history view, popovers)".into(), "Esc".into()));
-        hint(ui, &th, "On macOS Ctrl is Cmd. Shortcuts are fixed.");
+        if let Some(c) = self.key_capture {
+            let got = ui.input_mut(|i| {
+                let ev = i.events.iter().find_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, modifiers, .. } if !matches!(key, egui::Key::Tab) => Some((*key, *modifiers)),
+                    _ => None,
+                });
+                if let Some((k, m)) = ev {
+                    i.consume_key(m, k);
+                }
+                ev
+            });
+            match got {
+                Some((egui::Key::Escape, m)) if m.is_none() => self.key_capture = None,
+                Some((k, m)) => {
+                    let sc = keymap::parse(&keymap::format(&egui::KeyboardShortcut::new(m, k)));
+                    match sc.filter(keymap::usable) {
+                        Some(sc) => {
+                            keymap::assign(&mut self.settings.keys, c, Some(sc));
+                            self.settings_dirty_at = Some(Instant::now());
+                            self.key_capture = None;
+                        }
+                        None => self.flash("A shortcut needs Ctrl or Alt (or an F-key)."),
+                    }
+                }
+                None => {}
+            }
+        }
+        hint(ui, &th, "Click a shortcut, then press the new keys (Esc cancels). A key already in use moves to the new command. On macOS Ctrl is Cmd.");
+        let mut act: Option<(crate::ui::Cmd, Option<Option<egui::KeyboardShortcut>>)> = None;
         egui::Frame::new().fill(th.sunken()).stroke(egui::Stroke::new(1.0, th.border())).corner_radius(th.radius()).inner_margin(egui::Margin::symmetric(12, 4)).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            for (name, keys) in &rows {
+            for (c, name, _) in crate::ui::COMMANDS.iter() {
+                let cur = keymap::binding(&self.settings.keys, *c);
+                let overridden = self.settings.keys.contains_key(&keymap::cmd_id(*c));
+                ui.horizontal(|ui| {
+                    ui.set_min_height(th.m().control_height);
+                    ui.label(RichText::new(*name).color(th.fg()));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if overridden && Btn::new("Reset").compact().kind(BtnKind::Ghost).show(ui, &th).on_hover_text("Back to the default").clicked() {
+                            act = Some((*c, None));
+                        }
+                        if cur.is_some() && Btn::new("Clear").compact().kind(BtnKind::Ghost).show(ui, &th).on_hover_text("Unbind").clicked() {
+                            act = Some((*c, Some(None)));
+                        }
+                        let capturing = self.key_capture == Some(*c);
+                        let label = if capturing { "Press keys…".to_string() } else { cur.map(|k| keymap::format(&k)).unwrap_or_else(|| "—".into()) };
+                        if Btn::new(&label).compact().selected(capturing).show(ui, &th).clicked() {
+                            self.key_capture = if capturing { None } else { Some(*c) };
+                        }
+                    });
+                });
+            }
+        });
+        match act {
+            Some((c, None)) => {
+                self.settings.keys.remove(&keymap::cmd_id(c));
+                self.settings_dirty_at = Some(Instant::now());
+            }
+            Some((c, Some(sc))) => {
+                keymap::assign(&mut self.settings.keys, c, sc);
+                self.settings_dirty_at = Some(Instant::now());
+            }
+            None => {}
+        }
+        ui.add_space(12.0);
+        widgets::heading(ui, &th, "Fixed");
+        let rows = [
+            ("Zoom in / out / reset", "Ctrl+Plus / Ctrl+Minus / Ctrl+0"),
+            ("Next / previous hunk", "] / ["),
+            ("Next / previous commit", "J / K"),
+            ("History: step entries (Blame, Follow)", "↑ / ↓"),
+            ("Back (settings, history view, popovers)", "Esc"),
+        ];
+        egui::Frame::new().fill(th.sunken()).stroke(egui::Stroke::new(1.0, th.border())).corner_radius(th.radius()).inner_margin(egui::Margin::symmetric(12, 4)).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for (name, keys) in rows {
                 ui.horizontal(|ui| {
                     ui.set_min_height(th.m().control_height);
                     ui.label(RichText::new(name).color(th.fg()));
@@ -500,6 +566,38 @@ mod tests {
             });
         });
         used
+    }
+
+    #[test]
+    fn a_recorded_shortcut_is_saved_and_then_fires_its_command() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        app.settings_open = true;
+        app.settings_open_section(Section::Shortcuts);
+        let key = |k: egui::Key, m: egui::Modifiers| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::pos2(0.0, 0.0), vec2(900.0, 700.0))),
+            modifiers: m,
+            events: vec![egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: m }],
+            ..Default::default()
+        };
+        let frame = |app: &mut App, input: egui::RawInput| {
+            let _ = ctx.run(input, |ctx| {
+                app.shortcuts(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| app.settings_page(ui));
+            });
+        };
+        app.key_capture = Some(crate::ui::Cmd::OpenProject);
+        frame(&mut app, key(egui::Key::J, egui::Modifiers::NONE));
+        assert_eq!(app.key_capture, Some(crate::ui::Cmd::OpenProject), "a bare letter is refused");
+        frame(&mut app, key(egui::Key::J, egui::Modifiers::COMMAND | egui::Modifiers::CTRL));
+        assert_eq!(app.key_capture, None);
+        assert_eq!(app.settings.keys.get("OpenProject").map(String::as_str), Some("Ctrl+J"));
+        assert!(!app.pj.popover, "recording does not run the command");
+        app.settings_open = false;
+        frame(&mut app, key(egui::Key::J, egui::Modifiers::COMMAND | egui::Modifiers::CTRL));
+        assert!(app.pj.popover, "Ctrl+J now opens the project switcher");
+        frame(&mut app, key(egui::Key::O, egui::Modifiers::COMMAND | egui::Modifiers::CTRL));
+        assert!(app.pj.popover, "Ctrl+O no longer toggles it");
     }
 
     #[test]

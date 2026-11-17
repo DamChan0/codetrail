@@ -294,6 +294,8 @@ pub struct EditorState {
     pub conflict: Option<Disk>,
     pub notice: Option<(String, Instant)>,
     pub goto: Option<u32>,
+    /// Search match to paint: (1-based line, byte start, byte end within that line). Cleared on edit.
+    pub mark: Option<(u32, usize, usize)>,
     pub goto_open: bool,
     pub goto_input: String,
     pub last_check: Instant,
@@ -469,6 +471,8 @@ pub struct App {
     pub ask: AskState,
     pub settings_open: bool,
     pub settings_section: crate::settingspage::Section,
+    /// Shortcuts page is waiting for a key combination for this command.
+    pub key_capture: Option<crate::ui::Cmd>,
     pub settings_dirty_at: Option<Instant>,
     pub status_msg: Option<(String, Instant)>,
     pub smoke: Option<Smoke>,
@@ -566,6 +570,7 @@ impl App {
             history: HistoryState::default(),
             settings_open: false,
             settings_section: crate::settingspage::Section::default(),
+            key_capture: None,
             settings_dirty_at: None,
             status_msg: None,
             smoke,
@@ -1109,6 +1114,7 @@ impl App {
             if e.path == path {
                 if line.is_some() {
                     e.goto = line;
+                    e.mark = None;
                 }
                 return;
             }
@@ -1127,6 +1133,7 @@ impl App {
             conflict: None,
             notice: None,
             goto: line,
+            mark: None,
             goto_open: false,
             goto_input: String::new(),
             last_check: Instant::now(),

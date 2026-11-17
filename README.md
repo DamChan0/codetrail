@@ -209,7 +209,7 @@ The numbers in the last column come from other team members' test reports and we
 | `[` / `]` | Previous / next hunk |
 | `Esc` | Close popups |
 
-Single-key shortcuts are ignored while a text field has focus.
+Single-key shortcuts are ignored while a text field has focus. The Ctrl shortcuts (and Settings `Ctrl+,`) can be rebound in Settings > Shortcuts; overrides are saved under `[keys]` in `config.toml` (`OpenProject = "Ctrl+Shift+O"`, `""` = unbound).
 
 ## Troubleshooting
 

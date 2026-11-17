@@ -186,9 +186,10 @@ impl App {
         };
         let avail = ui.available_width();
         let r = widgets::chip(ui, &th, if narrow { "" } else { "Project" }, &name, true, (avail * 0.4).clamp(120.0, 260.0));
+        let key = crate::keymap::binding(&self.settings.keys, crate::ui::Cmd::OpenProject).map(|k| format!(" ({})", crate::keymap::format(&k))).unwrap_or_default();
         let r = match &root {
-            Some(p) => r.on_hover_text(format!("{}\nClick to switch project (Ctrl+O)", p.display())),
-            None => r.on_hover_text("Open a project (Ctrl+O)"),
+            Some(p) => r.on_hover_text(format!("{}\nClick to switch project{key}", p.display())),
+            None => r.on_hover_text(format!("Open a project{key}")),
         };
         if r.clicked() {
             self.pj_toggle_popover();
@@ -513,6 +514,100 @@ mod tests {
         assert!(app.commits.iter().all(|c| c.subject.contains("beta")), "no commit of alpha leaks in");
         assert_eq!(app.settings.recent.len(), 2, "both projects remembered, newest first");
         assert!(app.settings.recent[0].path.ends_with("beta"));
+    }
+
+    #[test]
+    fn a_search_hit_paints_its_match_in_the_editor_until_edited() {
+        let d = tempfile::tempdir().unwrap();
+        let a = repo(d.path(), "alpha", "a.txt");
+        std::fs::write(a.join("a.txt"), "first\nfoo needle bar\n").unwrap();
+        let mut app = app_for(a);
+        pump_until(&mut app, "repo", |x| x.repo.is_some());
+        app.open_editor("a.txt", Some(2));
+        app.editor.as_mut().unwrap().mark = Some((2, 4, 10));
+        pump_until(&mut app, "loaded", |x| x.editor.as_ref().is_some_and(|e| e.load.ready().is_some()));
+        let word = app.th.c(app.th.p().diff.add.word);
+        let frame = |app: &mut App| {
+            let ctx = app.ctx.clone();
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0))), ..Default::default() };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.editor_ui(ui));
+            });
+            fn walk(s: &egui::Shape, c: egui::Color32, n: &mut usize) {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, c, n)),
+                    egui::Shape::Rect(r) if r.fill == c => *n += 1,
+                    _ => {}
+                }
+            }
+            let mut n = 0;
+            out.shapes.iter().for_each(|cs| walk(&cs.shape, word, &mut n));
+            n
+        };
+        frame(&mut app);
+        assert_eq!(frame(&mut app), 1, "match highlighted");
+        app.editor.as_mut().unwrap().mark = Some((2, 4, 99));
+        assert_eq!(frame(&mut app), 0, "a range past the line end is not painted");
+    }
+
+    #[test]
+    fn arrows_in_the_search_field_step_through_hits_and_keep_focus() {
+        use crate::app::SearchGroup;
+        use crate::ui::step_hit;
+        let d = tempfile::tempdir().unwrap();
+        let a = repo(d.path(), "alpha", "a.txt");
+        std::fs::write(a.join("a.txt"), "needle one\nx\nneedle two\n").unwrap();
+        std::fs::write(a.join("b.txt"), "needle b\n").unwrap();
+        let mut app = app_for(a);
+        pump_until(&mut app, "repo", |x| x.repo.is_some());
+        let hit = |p: &str, line: u32| ct_core::SearchHit { path: p.into(), line, col: 1, text: "needle".into(), ranges: vec![(0, 6)] };
+        let groups = vec![
+            SearchGroup { path: "a.txt".into(), hits: vec![hit("a.txt", 1), hit("a.txt", 3)], collapsed: false },
+            SearchGroup { path: "b.txt".into(), hits: vec![hit("b.txt", 1)], collapsed: true },
+        ];
+        assert_eq!(step_hit(&groups, None, true), Some((0, 0)));
+        assert_eq!(step_hit(&groups, None, false), Some((1, 0)));
+        assert_eq!(step_hit(&groups, Some((0, 1)), true), Some((1, 0)), "crosses into the next file");
+        assert_eq!(step_hit(&groups, Some((1, 0)), true), Some((1, 0)), "stops at the end");
+        assert_eq!(step_hit(&groups, Some((0, 0)), false), Some((0, 0)));
+        assert_eq!(step_hit(&[], None, true), None);
+        app.search.query = "needle".into();
+        app.search.groups = groups;
+        app.search.focus = true;
+        let ctx = app.ctx.clone();
+        let mut frame = |app: &mut App, k: Option<egui::Key>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 700.0))),
+                events: k.map(|k| egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }).into_iter().collect(),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::SidePanel::left("rail").show(ctx, |ui| app.search_panel(ui));
+                egui::CentralPanel::default().show(ctx, |ui| app.editor_ui(ui));
+            });
+        };
+        frame(&mut app, None);
+        frame(&mut app, None);
+        let qid = egui::Id::new("search_query");
+        assert!(ctx.memory(|m| m.has_focus(qid)));
+        for (key, want) in [(egui::Key::ArrowDown, (0, 0)), (egui::Key::ArrowDown, (0, 1)), (egui::Key::ArrowDown, (1, 0)), (egui::Key::ArrowUp, (0, 1))] {
+            frame(&mut app, Some(key));
+            assert_eq!(app.search.selected, Some(want));
+            let path = app.search.groups[want.0].path.clone();
+            pump_until(&mut app, "file", |x| x.editor.as_ref().is_some_and(|e| e.path == path && e.load.ready().is_some()));
+            frame(&mut app, None);
+            frame(&mut app, None);
+            assert!(ctx.memory(|m| m.has_focus(qid)), "focus stays in the search field after {key:?}");
+            assert_eq!(app.editor.as_ref().unwrap().mark.map(|m| m.0), Some(app.search.groups[want.0].hits[want.1].line));
+        }
+        assert!(!app.search.groups[1].collapsed, "stepping into a collapsed file opens it");
+        // after Enter the field has no focus: arrows still step
+        ctx.memory_mut(|m| m.surrender_focus(qid));
+        frame(&mut app, None);
+        assert!(ctx.memory(|m| m.focused().is_none()));
+        frame(&mut app, Some(egui::Key::ArrowUp));
+        assert_eq!(app.search.selected, Some((0, 0)));
+        assert_eq!(app.search.query, "needle", "arrows never edit the query");
     }
 
     #[test]

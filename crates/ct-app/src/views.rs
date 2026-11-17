@@ -448,7 +448,7 @@ impl App {
 
     // ------------------------------------------------------------ editor
 
-    fn editor_ui(&mut self, ui: &mut Ui) {
+    pub(crate) fn editor_ui(&mut self, ui: &mut Ui) {
         let th = self.th.clone();
         let m = th.m().clone();
         let Some(e) = &mut self.editor else {
@@ -525,20 +525,33 @@ impl App {
         };
         let lang = highlight::lang_for_path(&e.path);
         let id = egui::Id::new("editor_text");
-        let goto = e.goto.take();
-        if let Some(line) = goto {
+        let goto = e.goto.take().map(|line| {
             let byte = crate::editor::line_start_offset(&e.text, line);
             let ci = e.text[..byte.min(e.text.len())].chars().count();
             let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
             st.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(ci))));
             st.store(ui.ctx(), id);
-            ui.ctx().memory_mut(|mm| mm.request_focus(id));
-        }
+            // a search hit keeps focus in the search field so arrows keep stepping hits
+            if e.mark.is_none() {
+                ui.ctx().memory_mut(|mm| mm.request_focus(id));
+            }
+            ci
+        });
         let mut cache = e.layout_cache.take();
         let mut out_cursor: Option<usize> = None;
         let mut scroll_rect: Option<Rect> = None;
         let th2 = th.clone();
         let wrap_on = self.settings.wrap;
+        // search match: char range in the whole text (only while it still fits the line)
+        let mark = e.mark.and_then(|(line, s, end)| {
+            let ls = crate::editor::line_start_offset(&e.text, line);
+            let le = e.text[ls..].find('\n').map_or(e.text.len(), |n| ls + n);
+            let (s, end) = (ls + s, ls + end);
+            (s < end && end <= le && e.text.is_char_boundary(s) && e.text.is_char_boundary(end)).then(|| {
+                let cs = e.text[..s].chars().count();
+                (cs, cs + e.text[s..end].chars().count())
+            })
+        });
         let area = if wrap_on { ScrollArea::vertical() } else { ScrollArea::both() };
         area.id_salt("editor_scroll").auto_shrink([false, false]).show(ui, |ui| {
             let mut layouter = |ui: &Ui, text: &str, wrap: f32| -> Arc<egui::Galley> {
@@ -567,14 +580,28 @@ impl App {
                 job.wrap.max_width = if wrap_on { wrap } else { f32::INFINITY };
                 ui.fonts(|f| f.layout_job(job))
             };
+            // reserved under the text so the highlight does not cover glyphs
+            let mark_slot = ui.painter().add(egui::Shape::Noop);
             let te = egui::TextEdit::multiline(&mut e.text).id(id).font(FontId::monospace(th.code_font)).code_editor().desired_width(if wrap_on { ui.available_width() } else { f32::INFINITY }).desired_rows(30).interactive(editable || true).layouter(&mut layouter).frame(false).margin(egui::Margin::symmetric(12, 8));
             let out = if editable { te.show(ui) } else { egui::TextEdit::multiline(&mut e.text.as_str()).id(id).font(FontId::monospace(th.code_font)).code_editor().desired_width(if wrap_on { ui.available_width() } else { f32::INFINITY }).desired_rows(30).layouter(&mut layouter).frame(false).margin(egui::Margin::symmetric(12, 8)).show(ui) };
+            if out.response.changed() {
+                e.mark = None;
+            } else if let Some((cs, ce)) = mark {
+                let off = out.galley_pos.to_vec2();
+                let a = out.galley.pos_from_ccursor(CCursor::new(cs)).translate(off);
+                let b = out.galley.pos_from_ccursor(CCursor::new(ce)).translate(off);
+                let clip = ui.clip_rect();
+                let band = Rect::from_x_y_ranges(clip.x_range(), a.y_range());
+                let hit = if (a.center().y - b.center().y).abs() < 1.0 { Rect::from_min_max(a.min, pos2(b.max.x.max(a.min.x + 2.0), a.max.y)) } else { Rect::from_min_max(a.min, pos2(clip.max.x, a.max.y)) };
+                ui.painter().set(mark_slot, egui::Shape::Vec(vec![egui::Shape::rect_filled(band, 0.0, th2.hover()), egui::Shape::rect_filled(hit, 2.0, th2.c(th2.p().diff.add.word))]));
+            }
             if let Some(cr) = out.cursor_range {
                 out_cursor = Some(cr.primary.ccursor.index);
-                if goto.is_some() {
-                    let r = out.galley.pos_from_ccursor(cr.primary.ccursor);
-                    scroll_rect = Some(r.translate(out.galley_pos.to_vec2()));
-                }
+            }
+            if let Some(ci) = goto {
+                // from the galley, not cursor_range: that is only reported while focused
+                let r = out.galley.pos_from_ccursor(CCursor::new(ci));
+                scroll_rect = Some(r.translate(out.galley_pos.to_vec2()));
             }
             if let Some(r) = scroll_rect {
                 ui.scroll_to_rect(r.expand2(vec2(0.0, 80.0)), Some(Align::Center));

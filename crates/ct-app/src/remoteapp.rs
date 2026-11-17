@@ -113,16 +113,27 @@ pub fn remote_breadcrumbs(path: &str) -> Vec<(String, String)> {
     out
 }
 
-/// One listing plus, when `known_git` is unknown, one more `list_dir` of the parent to learn
-/// whether `path` itself is a git working tree.
+/// One listing plus, when `known_git` is unknown, `list_dir` of each ancestor (nearest first,
+/// stops at the first hit) to learn whether `path` is inside a git working tree.
 pub fn browse_remote(be: &dyn RemoteBackend, spec: &RemoteSpec, path: &str, known_git: Option<bool>, cancel: Arc<AtomicBool>) -> Result<RemoteListing, String> {
     let entries = be.list_dir(spec, path, Some(cancel.clone()))?;
     let is_git = match known_git {
         Some(g) => g,
-        None => match parent_of(path) {
-            Some((parent, name)) if !cancel.load(std::sync::atomic::Ordering::Relaxed) => be.list_dir(spec, &parent, Some(cancel)).map(|v| v.iter().any(|e| e.name == name && e.is_git_repo)).unwrap_or(false),
-            _ => false,
-        },
+        None => {
+            let mut cur = path.to_string();
+            let mut found = false;
+            while let Some((parent, name)) = parent_of(&cur) {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                if be.list_dir(spec, &parent, Some(cancel.clone())).is_ok_and(|v| v.iter().any(|e| e.name == name && e.is_git_repo)) {
+                    found = true;
+                    break;
+                }
+                cur = parent;
+            }
+            found
+        }
     };
     Ok(RemoteListing { path: path.to_string(), entries, is_git })
 }
@@ -708,7 +719,7 @@ pub fn remote_picker_ui(ui: &mut Ui, th: &crate::theme::Theme, p: &mut RemotePic
     let (text, col) = match (&p.error, &p.listing) {
         (Some(e), _) => (e.clone(), widgets::level_color(th, Level::Error)),
         (None, Loadable::Ready(l)) if l.is_git => ("Git repository: ready to open.".to_string(), th.p().diff.add.fg.0),
-        (None, Loadable::Ready(_)) => ("Not a git repository. Open a folder that contains .git.".to_string(), th.warn()),
+        (None, Loadable::Ready(_)) => ("Not inside a git repository (no .git here or in a parent).".to_string(), th.warn()),
         (None, Loadable::Loading) => ("Reading remote folder…".to_string(), th.muted()),
         _ => (String::new(), th.muted()),
     };
@@ -728,7 +739,7 @@ pub fn remote_picker_ui(ui: &mut Ui, th: &crate::theme::Theme, p: &mut RemotePic
                     }
                     widgets::paint_text_fit(ui, egui::Rect::from_min_max(rect.min, pos2(right - 8.0, rect.max.y)), &e.name, widgets::ui_font(th), th.fg());
                     if resp.double_clicked() || resp.clicked() {
-                        act.go = Some((join_remote(&l.path, &e.name), Some(e.is_git_repo)));
+                        act.go = Some((join_remote(&l.path, &e.name), Some(l.is_git || e.is_git_repo)));
                     }
                 }
             }
@@ -781,7 +792,7 @@ mod tests {
     }
 
     fn scripted_app() -> (App, Arc<ScriptedRemote>) {
-        let be = ScriptedRemote::with(&[("~", &[("code", false), ("notes", false)]), ("~/code", &[("app", true), ("docs", false)]), ("~/code/app", &[("src", false)]), ("~/code/docs", &[])]);
+        let be = ScriptedRemote::with(&[("~", &[("code", false), ("notes", false)]), ("~/code", &[("app", true), ("docs", false)]), ("~/code/app", &[("src", false)]), ("~/code/app/src", &[]), ("~/code/docs", &[])]);
         let app = app_with(Path::new(""), None, Some(be.clone()));
         (app, be)
     }
@@ -860,6 +871,13 @@ mod tests {
         app.pj_remote_go("~/code/app".into(), None);
         pump_until(&mut app, "app again", |a| a.rs.picker.as_ref().unwrap().cwd == "~/code/app");
         assert!(listing(&app).is_git, "typed path resolved via parent");
+        // A folder inside a repo (no .git of its own) counts.
+        app.pj_remote_go("~/code/app/src".into(), None);
+        pump_until(&mut app, "src typed", |a| a.rs.picker.as_ref().unwrap().cwd == "~/code/app/src");
+        assert!(listing(&app).is_git, "git found in an ancestor");
+        app.pj_remote_go("~/code/docs".into(), None);
+        pump_until(&mut app, "docs again", |a| a.rs.picker.as_ref().unwrap().cwd == "~/code/docs");
+        assert!(!listing(&app).is_git, "walk up to ~ finds nothing");
     }
 
     #[test]

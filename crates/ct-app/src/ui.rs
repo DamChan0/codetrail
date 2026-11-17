@@ -7,9 +7,6 @@ use egui::{pos2, vec2, Align, Color32, FontId, Key, Layout, Modifiers, Rect, Ric
 use crate::jobs::JobKind;
 use std::time::{Duration, Instant};
 
-const CMD: Modifiers = Modifiers::COMMAND;
-const CMD_SHIFT: Modifiers = Modifiers { command: true, shift: true, ..Modifiers::NONE };
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cmd {
     PickFile,
@@ -41,7 +38,7 @@ pub const COMMANDS: [(Cmd, &str, &str); 14] = [
     (Cmd::GotoLine, "Go to line", "Ctrl+G"),
     (Cmd::ToggleInspector, "Show or hide inspector", ""),
     (Cmd::Refresh, "Reload commits and diff", ""),
-    (Cmd::Settings, "Settings", ""),
+    (Cmd::Settings, "Settings", "Ctrl+,"),
     (Cmd::Palette, "Command palette", "Ctrl+K"),
 ];
 
@@ -277,26 +274,23 @@ impl App {
         }
     }
 
-    fn shortcuts(&mut self, ctx: &egui::Context) {
+    pub(crate) fn shortcuts(&mut self, ctx: &egui::Context) {
         let mut cmds: Vec<Cmd> = Vec::new();
+        if self.key_capture.is_some() {
+            if self.settings_open && self.settings_section == crate::settingspage::Section::Shortcuts {
+                // the Shortcuts page is recording a key: nothing fires
+                return;
+            }
+            self.key_capture = None;
+        }
         let typing = ctx.wants_keyboard_input();
+        let table = crate::keymap::table(&self.settings.keys);
         ctx.input_mut(|i| {
-            let mut hit = |m: Modifiers, k: Key, c: Cmd| {
-                if i.consume_key(m, k) {
-                    cmds.push(c);
+            for (k, c) in &table {
+                if i.consume_shortcut(k) {
+                    cmds.push(*c);
                 }
-            };
-            hit(CMD_SHIFT, Key::F, Cmd::SearchPanel);
-            hit(CMD_SHIFT, Key::C, Cmd::CopyRef);
-            hit(CMD, Key::P, Cmd::PickFile);
-            hit(CMD, Key::K, Cmd::Palette);
-            hit(CMD, Key::O, Cmd::OpenProject);
-            hit(CMD, Key::B, Cmd::BaseMenu);
-            hit(CMD, Key::E, Cmd::ToggleEdit);
-            hit(CMD, Key::S, Cmd::Save);
-            hit(CMD, Key::L, Cmd::AskAi);
-            hit(CMD, Key::G, Cmd::GotoLine);
-            hit(CMD, Key::Comma, Cmd::Settings);
+            }
         });
         for c in cmds {
             self.run_cmd(c);
@@ -623,15 +617,27 @@ impl App {
         }
     }
 
-    fn search_panel(&mut self, ui: &mut Ui) {
+    pub(crate) fn search_panel(&mut self, ui: &mut Ui) {
         let th = self.th.clone();
         let m = th.m().clone();
         let mut changed = false;
+        let qid = egui::Id::new("search_query");
+        // Up/Down step through the hits while the query field (or nothing) has focus; consumed
+        // before the field is drawn so the text edit does not move its cursor (its focus
+        // lock filter keeps vertical arrows, so egui does not move focus to a neighbouring widget either).
+        let mut step: Option<bool> = None;
+        if self.palette.open.is_none() && self.tt.is_none() && ui.memory(|mm| mm.focused().is_none_or(|f| f == qid)) {
+            let (down, up) = ui.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::ArrowDown), i.consume_key(Modifiers::NONE, Key::ArrowUp)));
+            step = if down { Some(true) } else if up { Some(false) } else { None };
+        }
         ui.horizontal(|ui| {
             ui.add_space(m.space[2]);
             let w = ui.available_width() - m.space[2];
-            let te = egui::TextEdit::singleline(&mut self.search.query).hint_text("Search file contents").desired_width(w).margin(vec2(8.0, 6.0));
+            let te = egui::TextEdit::singleline(&mut self.search.query).id(qid).hint_text("Search file contents").desired_width(w).margin(vec2(8.0, 6.0));
             let r = ui.add_sized([w, m.control_height], te);
+            if r.has_focus() {
+                ui.memory_mut(|mm| mm.set_focus_lock_filter(qid, egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, ..Default::default() }));
+            }
             if self.search.focus {
                 r.request_focus();
                 self.search.focus = false;
@@ -705,19 +711,26 @@ impl App {
         if self.search.capped {
             widgets::banner(ui, &th, Level::Warn, &format!("Showing the first {MAX_SEARCH_HITS} matches. Narrow the query."), None, false);
         }
-        // Flatten for virtualised rendering: group header + its hits.
-        let mut flat: Vec<(usize, Option<usize>)> = Vec::new();
-        for (gi, g) in self.search.groups.iter().enumerate() {
-            flat.push((gi, None));
-            if !g.collapsed {
-                flat.extend((0..g.hits.len()).map(|h| (gi, Some(h))));
-            }
-        }
+        let mut flat = flat_rows(&self.search.groups);
         let mut toggle: Option<usize> = None;
         let mut open: Option<(usize, usize)> = None;
-        let sel = self.search.selected;
         let row_h = 26.0;
-        ScrollArea::vertical().id_salt("search_list").auto_shrink([false, false]).show_rows(ui, row_h, flat.len(), |ui, range| {
+        let mut area = ScrollArea::vertical().id_salt("search_list").auto_shrink([false, false]);
+        if let Some(down) = step {
+            if let Some((g, h)) = step_hit(&self.search.groups, self.search.selected, down) {
+                open = Some((g, h));
+                self.search.selected = Some((g, h));
+                if self.search.groups[g].collapsed {
+                    self.search.groups[g].collapsed = false;
+                    flat = flat_rows(&self.search.groups);
+                }
+                if let Some(i) = flat.iter().position(|r| *r == (g, Some(h))) {
+                    area = area.vertical_scroll_offset((i as f32 * row_h - ui.available_height() / 2.0).max(0.0));
+                }
+            }
+        }
+        let sel = self.search.selected;
+        area.show_rows(ui, row_h, flat.len(), |ui, range| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for i in range {
                 let (gi, hi) = flat[i];
@@ -780,6 +793,14 @@ impl App {
             self.search.selected = Some((g, h));
             let hit = self.search.groups[g].hits[h].clone();
             self.open_editor(&hit.path, Some(hit.line));
+            if let (Some(e), Some(&(s, end))) = (self.editor.as_mut().filter(|e| e.path == hit.path), hit.ranges.first()) {
+                e.mark = Some((hit.line, s as usize, end as usize));
+            }
+            if self.blame.path == hit.path && self.centre == Centre::Blame {
+                // remote: blame view stands in for the editor; select the hit line
+                let i = hit.line.saturating_sub(1) as usize;
+                self.blame.selected = Some((i, i));
+            }
             let r = crate::selection::code_ref_for_lines(&hit.path, hit.line, hit.line, &ct_core::RefAt::Worktree);
             self.set_selection(r, SelSource::Search, hit.text);
         }
@@ -1047,9 +1068,10 @@ impl App {
                             if enter {
                                 run = Some(items[self.palette.sel].0);
                             }
-                            for (i, (c, label, key)) in items.iter().enumerate() {
+                            for (i, (c, label, _)) in items.iter().enumerate() {
                                 let (resp, rect) = widgets::list_row(ui, &th, 30.0, i == self.palette.sel);
-                                let kw = if key.is_empty() { 0.0 } else { widgets::paint_text_right(ui, rect, key, widgets::small_font(&th), th.muted()) };
+                                let key = crate::keymap::binding(&self.settings.keys, *c).map(|k| crate::keymap::format(&k)).unwrap_or_default();
+                                let kw = if key.is_empty() { 0.0 } else { widgets::paint_text_right(ui, rect, &key, widgets::small_font(&th), th.muted()) };
                                 widgets::paint_text_fit(ui, Rect::from_min_max(rect.min, pos2(rect.max.x - kw - 8.0, rect.max.y)), label, widgets::ui_font(&th), th.fg());
                                 if resp.clicked() {
                                     run = Some(*c);
@@ -1119,6 +1141,31 @@ fn fuzzy_galley(ui: &Ui, name: &str, font: &FontId, th: &crate::theme::Theme, hi
         job.append(&ch.to_string(), 0.0, egui::TextFormat { font_id: font.clone(), color: col, ..Default::default() });
     }
     ui.fonts(|f| f.layout_job(job))
+}
+
+/// Search list rows for virtualised rendering: group header (`None`) + its hits unless collapsed.
+fn flat_rows(groups: &[SearchGroup]) -> Vec<(usize, Option<usize>)> {
+    let mut flat = Vec::new();
+    for (gi, g) in groups.iter().enumerate() {
+        flat.push((gi, None));
+        if !g.collapsed {
+            flat.extend((0..g.hits.len()).map(|h| (gi, Some(h))));
+        }
+    }
+    flat
+}
+
+/// Next / previous hit across all groups (collapsed ones included); nothing selected starts at
+/// the first / last hit; stops at the ends.
+pub fn step_hit(groups: &[SearchGroup], cur: Option<(usize, usize)>, down: bool) -> Option<(usize, usize)> {
+    let all: Vec<(usize, usize)> = groups.iter().enumerate().flat_map(|(g, x)| (0..x.hits.len()).map(move |h| (g, h))).collect();
+    let i = match cur.and_then(|c| all.iter().position(|x| *x == c)) {
+        None if down => 0,
+        None => all.len().checked_sub(1)?,
+        Some(i) if down => (i + 1).min(all.len() - 1),
+        Some(i) => i.saturating_sub(1),
+    };
+    all.get(i).copied()
 }
 
 #[cfg(test)]

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0
+
+- **Search**: ↑ / ↓ step to the previous / next hit (across files, opening collapsed ones) while the search field has focus or nothing does; the field keeps focus.
+- **Search**: opening a hit highlights the match (and its line) in the editor until the text is edited; on a remote project the hit line is selected in Blame.
+- **Shortcuts are editable**: Settings > Shortcuts, click a binding and press the new keys (Ctrl/Alt or an F-key required; a key already in use moves over). Stored as overrides in `[keys]` of `config.toml`, e.g. `OpenProject = "Ctrl+Shift+O"`, `""` unbinds.
+- **Remote folder picker** also accepts a folder inside a git repository (`.git` in any parent).
+- **Path autocomplete**: Tab completes the common prefix; when there is nothing more to complete it steps through the suggestions (Shift+Tab back), Enter accepts.
+
 ## 0.3.1
 
 - The project picker opens a folder inside a git repository (`.git` in a parent folder), not only the repository root.

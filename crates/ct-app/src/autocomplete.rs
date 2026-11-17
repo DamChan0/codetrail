@@ -173,6 +173,20 @@ impl Auto {
         &self.cur_parent
     }
 
+    /// Tab / Shift+Tab: step through the shown rows, wrapping at both ends.
+    fn cycle_sel(&mut self, down: bool) {
+        let n = self.matches.len().min(MAX_SHOWN);
+        if n == 0 {
+            return;
+        }
+        self.sel = Some(match (self.sel, down) {
+            (None, true) => 0,
+            (None, false) => n - 1,
+            (Some(s), true) => (s + 1) % n,
+            (Some(s), false) => (s + n - 1) % n,
+        });
+    }
+
     fn move_sel(&mut self, down: bool) {
         let n = self.matches.len().min(MAX_SHOWN);
         if n == 0 {
@@ -208,7 +222,8 @@ pub struct FieldOut {
 }
 
 /// Path text field with the dropdown under it. Keys while the field has focus:
-/// Tab completes, Up/Down move in the dropdown, Enter accepts the highlighted row (otherwise
+/// Tab completes the common prefix, or (nothing to complete / a row already highlighted) steps
+/// through the dropdown like Down (Shift+Tab back, both wrap); Up/Down move in the dropdown, Enter accepts the highlighted row (otherwise
 /// submits), Esc closes the dropdown (a second Esc is left for the dialog).
 pub fn path_field(ui: &mut Ui, th: &crate::theme::Theme, text: &mut String, a: &mut Auto, salt: &str, hint: &str, width: f32, grab_focus: bool) -> FieldOut {
     let id = Id::new(("path_field", salt));
@@ -238,10 +253,17 @@ pub fn path_field(ui: &mut Ui, th: &crate::theme::Theme, text: &mut String, a: &
         } else if ui.input(|i| i.key_pressed(Key::Enter)) {
             out.submit = true;
         }
+        if ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab)) && shown {
+            a.cycle_sel(false);
+        }
         if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
-            if let Some(t) = tab_complete(a.parent_str(), &a.seg, &a.matches) {
-                *text = t;
-                changed = true;
+            match (a.sel, tab_complete(a.parent_str(), &a.seg, &a.matches)) {
+                (None, Some(t)) => {
+                    *text = t;
+                    changed = true;
+                }
+                _ if shown => a.cycle_sel(true),
+                _ => {}
             }
         }
     }
@@ -410,6 +432,29 @@ mod tests {
         assert_eq!(a.sel, Some(MAX_SHOWN - 1));
         a.move_sel(false);
         assert_eq!(a.sel, Some(MAX_SHOWN - 2));
+        a.sel = None;
+        a.cycle_sel(true);
+        a.cycle_sel(false);
+        assert_eq!(a.sel, Some(MAX_SHOWN - 1), "cycling stays inside the shown rows");
+    }
+
+    #[test]
+    fn tab_cycles_the_shown_rows_and_wraps() {
+        let t0 = Instant::now();
+        let mut a = Auto::default();
+        a.edit("/p/pe", t0);
+        let Poll::Request { token, .. } = a.poll(t0 + DEBOUNCE) else { panic!() };
+        a.arrived(token, "/p/", Some(vec![c("pennybot", true), c("pennybot-x", true), c("other", false)]));
+        assert_eq!(tab_complete(a.parent_str(), &a.seg, &a.matches).as_deref(), Some("/p/pennybot"), "common prefix first");
+        a.edit("/p/pennybot", t0);
+        assert_eq!(tab_complete(a.parent_str(), &a.seg, &a.matches), None, "nothing longer to complete: Tab steps rows");
+        a.cycle_sel(true);
+        assert_eq!(a.sel, Some(0));
+        a.cycle_sel(true);
+        a.cycle_sel(true);
+        assert_eq!(a.sel, Some(0), "wraps");
+        a.cycle_sel(false);
+        assert_eq!(a.sel, Some(1), "Shift+Tab wraps back");
     }
 
     #[test]

@@ -76,7 +76,7 @@ GUI 유휴 CPU ≈0.6%, RSS 86–104MB(팀 테스트 보고 수치, 이 문서 �
 
 ## 설정 / 단축키
 
-`~/.config/codetrail/config.toml`, `theme.toml` (키 목록은 [README.md](README.md#configuration)). 단축키: `Ctrl+P` 파일, `Ctrl+Shift+F` 검색, `Ctrl+K` 팔레트, `Ctrl+O` 프로젝트, `Ctrl+B` base, `Ctrl+E`/`Ctrl+S` 편집/저장, `Ctrl+G` 줄 이동, `Ctrl+L` Ask AI, `Ctrl+Shift+C` 코드 위치 복사.
+`~/.config/codetrail/config.toml`, `theme.toml` (키 목록은 [README.md](README.md#configuration)). 단축키: `Ctrl+P` 파일, `Ctrl+Shift+F` 검색, `Ctrl+K` 팔레트, `Ctrl+O` 프로젝트, `Ctrl+B` base, `Ctrl+E`/`Ctrl+S` 편집/저장, `Ctrl+G` 줄 이동, `Ctrl+L` Ask AI, `Ctrl+Shift+C` 코드 위치 복사. Ctrl 단축키는 Settings > Shortcuts에서 바꿀 수 있음 (`config.toml`의 `[keys]`).
 
 ## 문제 해결
 
