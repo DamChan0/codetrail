@@ -88,6 +88,8 @@ pub struct Reviewer {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pr {
     pub number: u64,
+    /// `owner/name`: Review requested spans the whole organisation.
+    pub repo: String,
     pub title: String,
     pub url: String,
     pub draft: bool,
@@ -236,6 +238,7 @@ fn parse_pr(p: &Value) -> Option<Pr> {
     };
     Some(Pr {
         number,
+        repo: s(&p["repository"]["nameWithOwner"]),
         title: s(&p["title"]),
         url: s(&p["url"]),
         draft: p["isDraft"].as_bool().unwrap_or(false),
@@ -292,6 +295,7 @@ pub fn github_slug(remote: &str) -> Option<String> {
 
 const QUERY: &str = r#"query($q:String!, $n:Int!, $after:String){ search(query:$q, type:ISSUE, first:$n, after:$after){ issueCount pageInfo{ hasNextPage endCursor } nodes{ ... on PullRequest{
  number title url isDraft headRefName baseRefName additions deletions changedFiles updatedAt
+ repository{ nameWithOwner }
  reviewDecision mergeStateStatus
  mergeQueueEntry{ position state }
  autoMergeRequest{ enabledAt }
@@ -302,6 +306,19 @@ const QUERY: &str = r#"query($q:String!, $n:Int!, $after:String){ search(query:$
 }}}}"#;
 
 /// Fetches the open PRs of the repository at `root` (its `origin` remote must be on GitHub).
+/// GitHub search for a scope. Mine: open PRs I wrote in this repository. Review requested: like
+/// GitHub's own review list, PRs anywhere in the owner's organisation that ask me personally (not
+/// through a team), open, not draft, not archived.
+pub fn search_query(slug: &str, scope: Scope) -> String {
+    match scope {
+        Scope::Mine => format!("repo:{slug} is:pr is:open author:@me sort:updated-desc"),
+        Scope::ReviewRequested => {
+            let owner = slug.split('/').next().unwrap_or(slug);
+            format!("is:pr user-review-requested:@me archived:false is:open user:{owner} draft:false sort:updated-desc")
+        }
+    }
+}
+
 /// Returns the repository slug, the PRs (newest update first, at most [`MAX_PRS`]) and how many
 /// match in total.
 pub fn fetch(root: &Path, scope: Scope, cancel: &std::sync::atomic::AtomicBool) -> Result<(String, Vec<Pr>, usize), String> {
@@ -310,14 +327,11 @@ pub fn fetch(root: &Path, scope: Scope, cancel: &std::sync::atomic::AtomicBool) 
     let o = run_bounded(g, Duration::from_secs(5), Some(cancel))?;
     let url = String::from_utf8_lossy(&o.stdout).into_owned();
     let slug = github_slug(&url).ok_or_else(|| format!("origin is not a GitHub repository ({})", url.trim()))?;
-    let who = match scope {
-        Scope::Mine => "author:@me",
-        Scope::ReviewRequested => "review-requested:@me",
-    };
+    let q = search_query(&slug, scope);
     let (mut prs, mut after) = (Vec::new(), None::<String>);
     let total = loop {
         let mut c = Command::new("gh");
-        c.current_dir(root).args(["api", "graphql", "-F"]).arg(format!("q=repo:{slug} is:pr is:open {who} sort:updated-desc")).args(["-F", &format!("n={PAGE}")]).arg("-f").arg(format!("query={QUERY}"));
+        c.current_dir(root).args(["api", "graphql", "-F"]).arg(format!("q={q}")).args(["-F", &format!("n={PAGE}")]).arg("-f").arg(format!("query={QUERY}"));
         if let Some(a) = &after {
             c.arg("-f").arg(format!("after={a}"));
         }
@@ -409,6 +423,12 @@ mod tests {
     }
 
     #[test]
+    fn review_requested_matches_the_github_review_list_query() {
+        assert_eq!(search_query("bearrobotics/pennybot", Scope::ReviewRequested), "is:pr user-review-requested:@me archived:false is:open user:bearrobotics draft:false sort:updated-desc");
+        assert_eq!(search_query("o/n", Scope::Mine), "repo:o/n is:pr is:open author:@me sort:updated-desc");
+    }
+
+    #[test]
     fn times_and_slugs() {
         assert_eq!(parse_time("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_time("2026-11-17T19:08:33Z"), Some(1_794_942_513));
@@ -419,7 +439,7 @@ mod tests {
     }
 
     fn pr(n: u64, head: &str, base: &str, updated: i64) -> Pr {
-        Pr { number: n, title: String::new(), url: String::new(), draft: false, head: head.into(), base: base.into(), additions: 0, deletions: 0, files: 0, updated, decision: String::new(), merge_state: String::new(), queue: None, auto_merge: false, reviewers: vec![], unresolved: 0, ci: Ci::None, checks: vec![] }
+        Pr { number: n, repo: String::new(), title: String::new(), url: String::new(), draft: false, head: head.into(), base: base.into(), additions: 0, deletions: 0, files: 0, updated, decision: String::new(), merge_state: String::new(), queue: None, auto_merge: false, reviewers: vec![], unresolved: 0, ci: Ci::None, checks: vec![] }
     }
 
     #[test]

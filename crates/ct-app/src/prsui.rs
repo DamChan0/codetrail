@@ -388,6 +388,9 @@ impl App {
                 ui.label(RichText::new(&p.title).font(widgets::heading_font(th)).color(th.fg()));
                 ui.add_space(4.0);
                 ui.label(RichText::new(format!("{}  into  {}", p.head, p.base)).font(widgets::mono_font(th)).color(th.muted()));
+                if !p.repo.is_empty() && self.prs.list.as_ref().is_some_and(|(slug, _)| *slug != p.repo) {
+                    ui.label(RichText::new(format!("in {}", p.repo)).font(widgets::mono_font(th)).color(th.warn()));
+                }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if Btn::new("Open on GitHub").kind(BtnKind::Primary).compact().show(ui, th).clicked() {
@@ -615,7 +618,7 @@ mod tests {
     }
 
     fn pr(n: u64, head: &str, base: &str, decision: &str, ci: Ci) -> Pr {
-        Pr { number: n, title: format!("PR {n}"), url: format!("https://x/{n}"), draft: false, head: head.into(), base: base.into(), additions: 1, deletions: 1, files: 1, updated: n as i64, decision: decision.into(), merge_state: "CLEAN".into(), queue: None, auto_merge: false, reviewers: vec![crate::prs::Reviewer { name: "ann".into(), state: Review::Approved, at: Some(0), re_requested: false, team: false }], unresolved: 0, ci, checks: vec![] }
+        Pr { number: n, repo: "o/n".into(), title: format!("PR {n}"), url: format!("https://x/{n}"), draft: false, head: head.into(), base: base.into(), additions: 1, deletions: 1, files: 1, updated: n as i64, decision: decision.into(), merge_state: "CLEAN".into(), queue: None, auto_merge: false, reviewers: vec![crate::prs::Reviewer { name: "ann".into(), state: Review::Approved, at: Some(0), re_requested: false, team: false }], unresolved: 0, ci, checks: vec![] }
     }
 
     #[test]

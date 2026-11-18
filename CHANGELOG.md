@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.3
+
+- **Review requested** uses GitHub's review-list query: `is:pr user-review-requested:@me archived:false is:open user:<owner> draft:false sort:updated-desc` (only PRs that ask you personally, across the owner's repositories, no drafts). A PR from another repository names it in the detail split.
+
 ## 0.5.2
 
 - **Self-update restart fixed**: after the binary was swapped, the restart used the path Linux reports for the replaced file (`codetrail (deleted)`) and failed with "No such file or directory"; a second update then wrote a stray `codetrail (deleted)` file. The binary's path is now taken once at startup, a re-check after installing keeps offering the restart, and a failed restart no longer hides it.
