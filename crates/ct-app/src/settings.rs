@@ -91,6 +91,8 @@ pub struct Settings {
     pub recent: Vec<RecentProject>,
     /// Shortcut overrides (`[keys]`): command name -> `"Ctrl+Shift+F"`, `""` = unbound.
     pub keys: std::collections::BTreeMap<String, String>,
+    /// Look for a newer release on GitHub at startup.
+    pub update_check: bool,
 }
 
 impl Default for Settings {
@@ -116,6 +118,7 @@ impl Default for Settings {
             remotes: Vec::new(),
             recent: Vec::new(),
             keys: Default::default(),
+            update_check: true,
         }
     }
 }

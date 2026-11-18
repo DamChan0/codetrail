@@ -1028,6 +1028,7 @@ impl App {
             let scene = s.scene.clone();
             match scene.as_str() {
                 "split" => self.settings.split_view = true,
+                "update" => self.upd = crate::updater::UpdState::Available(crate::updater::Release { version: "9.0.0".into(), page: String::new(), tarball: None, sums: None }),
                 "light" => {
                     self.th.file.active = crate::theme::Mode::Light;
                     self.th.apply(&self.ctx);

@@ -106,6 +106,8 @@ impl eframe::App for App {
             });
         }
 
+        self.update_notice(ctx, &th);
+
         if self.settings_open {
             if Self::settings_wide(ctx) {
                 self.settings_nav_panel(ctx);
@@ -126,6 +128,38 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// The update notice under the top bar: available / downloading / installed / failed.
+    fn update_notice(&mut self, ctx: &egui::Context, th: &crate::theme::Theme) {
+        use crate::updater::UpdState;
+        if self.upd_hidden {
+            return;
+        }
+        let can_self = crate::updater::running_self_updatable();
+        let (lvl, text, action) = match &self.upd {
+            UpdState::Available(r) if can_self => (Level::Info, format!("CodeTrail {} is available (you have {}).", r.version, crate::updater::CURRENT), Some("Update now")),
+            UpdState::Available(r) => (Level::Info, format!("CodeTrail {} is available. This copy is a system install: get the new package from the release page.", r.version), Some("Open release page")),
+            UpdState::Installing(r) => (Level::Info, format!("Downloading CodeTrail {}…", r.version), None),
+            UpdState::Installed(v) => (Level::Info, format!("CodeTrail {v} is installed. Restart to use it."), Some("Restart now")),
+            UpdState::Failed(e) => (Level::Error, format!("Update failed: {e}"), Some("Retry check")),
+            _ => return,
+        };
+        let mut act = widgets::BannerAction::None;
+        egui::TopBottomPanel::top("update_notice").frame(egui::Frame::new().fill(th.bg()).inner_margin(egui::Margin::symmetric(8, 6))).show(ctx, |ui| {
+            act = widgets::banner(ui, th, lvl, &text, action, true);
+        });
+        match act {
+            widgets::BannerAction::Dismiss => self.upd_hidden = true,
+            widgets::BannerAction::Action => match self.upd.clone() {
+                UpdState::Available(r) if !can_self => crate::updater::open_url(&r.page),
+                UpdState::Available(_) => self.upd_install(),
+                UpdState::Installed(_) => self.upd_restart(ctx),
+                UpdState::Failed(_) => self.upd_check(),
+                _ => {}
+            },
+            widgets::BannerAction::None => {}
+        }
+    }
+
     fn main_panes(&mut self, ctx: &egui::Context, th: &crate::theme::Theme) {
         use crate::panels;
         let win_w = ctx.screen_rect().width();

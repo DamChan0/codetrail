@@ -529,6 +529,34 @@ impl App {
         row(ui, &th, "Build", |ui| {
             ui.label(RichText::new(format!("{} · {}", env!("CT_GIT_SHA"), env!("CT_BUILD_DATE"))).font(widgets::mono_font(&th)).color(th.fg()));
         });
+        widgets::heading(ui, &th, "Updates");
+        let status = match &self.upd {
+            crate::updater::UpdState::Idle => "Not checked yet.".to_string(),
+            crate::updater::UpdState::Checking => "Checking…".to_string(),
+            crate::updater::UpdState::UpToDate => "Up to date.".to_string(),
+            crate::updater::UpdState::Available(r) => format!("{} is available.", r.version),
+            crate::updater::UpdState::Installing(r) => format!("Installing {}…", r.version),
+            crate::updater::UpdState::Installed(v) => format!("{v} installed; restart to use it."),
+            crate::updater::UpdState::Failed(e) | crate::updater::UpdState::CheckFailed(e) => format!("Last attempt failed: {e}"),
+        };
+        row(ui, &th, "Status", |ui| {
+            ui.label(RichText::new(status).color(th.fg()));
+        });
+        row(ui, &th, "Check", |ui| {
+            let busy = matches!(self.upd, crate::updater::UpdState::Checking | crate::updater::UpdState::Installing(_));
+            if Btn::new("Check now").compact().enabled(!busy).show(ui, &th).clicked() {
+                self.upd_hidden = false;
+                self.upd_check();
+            }
+            let mut on = self.settings.update_check;
+            if ui.checkbox(&mut on, "At startup").changed() {
+                self.settings.update_check = on;
+                self.settings_dirty_at = Some(Instant::now());
+            }
+        });
+        if !crate::updater::running_self_updatable() {
+            hint(ui, &th, "This copy is installed system-wide (for example from the .deb): updates are announced, and you install the new package yourself.");
+        }
         for (label, path) in [("Config file", cfg.clone()), ("Theme file", theme::theme_path()), ("Data directory", data)] {
             let dir = if path.is_dir() { path.clone() } else { path.parent().map(std::path::Path::to_path_buf).unwrap_or_default() };
             ui.label(RichText::new(label).color(th.fg()));

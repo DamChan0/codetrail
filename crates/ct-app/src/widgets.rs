@@ -464,7 +464,7 @@ pub fn banner(ui: &mut Ui, th: &Theme, level: Level, text: &str, action: Option<
             let mut job = LayoutJob::default();
             job.wrap.max_width = w;
             job.append(text, 0.0, TextFormat { font_id: ui_font(th), color: th.fg(), ..Default::default() });
-            ui.add_sized([w, 0.0], egui::Label::new(job).selectable(true));
+            ui.allocate_ui_with_layout(vec2(w, 0.0), egui::Layout::left_to_right(egui::Align::Center), |ui| ui.add(egui::Label::new(job).selectable(true)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if dismissable && icon_button(ui, th, Icon::Close, "Dismiss").clicked() {
                     out = BannerAction::Dismiss;

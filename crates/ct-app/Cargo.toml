@@ -14,6 +14,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 serde.workspace = true
 toml.workspace = true
+serde_json.workspace = true
 similar.workspace = true
 egui.workspace = true
 eframe.workspace = true

@@ -216,6 +216,8 @@ pub enum Msg {
     RunControl { what: &'static str, res: Result<(), String> },
     RunFinished { what: &'static str, res: Result<String, String> },
     RunReview { res: Result<(String, String), String> },
+    UpdCheck(Result<Option<crate::updater::Release>, String>),
+    UpdInstalled(Result<String, String>),
 }
 
 pub const REMOTE_RO: &str = "remote repositories are read-only";
@@ -473,6 +475,9 @@ pub struct App {
     pub settings_section: crate::settingspage::Section,
     /// Shortcuts page is waiting for a key combination for this command.
     pub key_capture: Option<crate::ui::Cmd>,
+    pub upd: crate::updater::UpdState,
+    /// The update notice was dismissed for this run.
+    pub upd_hidden: bool,
     pub settings_dirty_at: Option<Instant>,
     pub status_msg: Option<(String, Instant)>,
     pub smoke: Option<Smoke>,
@@ -571,6 +576,8 @@ impl App {
             settings_open: false,
             settings_section: crate::settingspage::Section::default(),
             key_capture: None,
+            upd: Default::default(),
+            upd_hidden: false,
             settings_dirty_at: None,
             status_msg: None,
             smoke,
@@ -581,7 +588,36 @@ impl App {
         } else {
             app.open_repo();
         }
+        if app.smoke.is_none() && !cfg!(test) && app.settings.update_check {
+            app.upd_check();
+        }
         app
+    }
+
+    // ------------------------------------------------------------ self-update
+
+    pub fn upd_check(&mut self) {
+        self.upd = crate::updater::UpdState::Checking;
+        self.jobs.spawn(JobKind::Update, |c| c.finish(Msg::UpdCheck(crate::updater::check())));
+    }
+
+    pub fn upd_install(&mut self) {
+        let crate::updater::UpdState::Available(r) = self.upd.clone() else { return };
+        let Ok(exe) = std::env::current_exe() else {
+            self.upd = crate::updater::UpdState::Failed("cannot locate the running binary".into());
+            return;
+        };
+        self.upd = crate::updater::UpdState::Installing(r.clone());
+        self.jobs.spawn(JobKind::Update, move |c| c.finish(Msg::UpdInstalled(crate::updater::install(&r, &exe))));
+    }
+
+    /// Saves settings, starts the new binary and closes this window.
+    pub fn upd_restart(&mut self, ctx: &egui::Context) {
+        self.persist_settings();
+        match std::env::current_exe().map_err(|e| e.to_string()).and_then(|e| crate::updater::relaunch(&e)) {
+            Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(e) => self.upd = crate::updater::UpdState::Failed(format!("restart failed: {e}")),
+        }
     }
 
     // ------------------------------------------------------------ helpers
@@ -1345,6 +1381,20 @@ impl App {
 
     fn handle(&mut self, msg: Msg) {
         match msg {
+            Msg::UpdCheck(res) => {
+                self.upd = match res {
+                    Ok(Some(r)) => crate::updater::UpdState::Available(r),
+                    Ok(None) => crate::updater::UpdState::UpToDate,
+                    Err(e) => crate::updater::UpdState::CheckFailed(e),
+                };
+            }
+            Msg::UpdInstalled(res) => {
+                self.upd = match res {
+                    Ok(v) => crate::updater::UpdState::Installed(v),
+                    Err(e) => crate::updater::UpdState::Failed(e),
+                };
+                self.upd_hidden = false;
+            }
             Msg::Opened(res) => match res {
                 Ok(o) => {
                     match self.remote.clone() {
