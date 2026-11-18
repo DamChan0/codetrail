@@ -73,11 +73,19 @@ pub fn parse_release(json: &[u8]) -> Result<Release, String> {
     })
 }
 
-/// `Ok(None)` = up to date.
+/// Version this process already installed (waiting for a restart).
+static INSTALLED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn installed() -> Option<String> {
+    INSTALLED.lock().ok().and_then(|g| g.clone())
+}
+
+/// `Ok(None)` = up to date (or that version is already installed and only needs a restart).
 pub fn check() -> Result<Option<Release>, String> {
     let body = curl(&["-H", "Accept: application/vnd.github+json", &api_url()], Duration::from_secs(15))?;
     let r = parse_release(&body)?;
-    Ok(is_newer(&r.version, CURRENT).then_some(r))
+    let have = INSTALLED.lock().map(|g| g.clone()).ok().flatten().filter(|v| is_newer(v, CURRENT)).unwrap_or_else(|| CURRENT.to_string());
+    Ok(is_newer(&r.version, &have).then_some(r))
 }
 
 /// The binary can replace itself: its folder is writable and not a system prefix.
@@ -92,10 +100,23 @@ pub fn self_updatable(exe: &Path) -> bool {
     ok
 }
 
+/// Path of the running binary, taken once at startup. After the update swaps the file, Linux
+/// reports `current_exe()` as `<path> (deleted)` (the old inode), which must never be used to
+/// relaunch or to install again.
+pub fn exe_path() -> Option<PathBuf> {
+    static P: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    P.get_or_init(|| std::env::current_exe().ok().map(|p| strip_deleted(&p))).clone()
+}
+
+pub fn strip_deleted(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    PathBuf::from(s.strip_suffix(" (deleted)").unwrap_or(&s).to_string())
+}
+
 /// [`self_updatable`] for the running binary, probed once per process.
 pub fn running_self_updatable() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::current_exe().is_ok_and(|e| self_updatable(&e)))
+    *V.get_or_init(|| exe_path().is_some_and(|e| self_updatable(&e)))
 }
 
 fn sha256(path: &Path) -> Result<String, String> {
@@ -147,6 +168,7 @@ fn install_in(dir: &Path, tar_url: &str, sums_url: &str, exe: &Path) -> Result<S
     if !o.ok || ver.is_empty() {
         return Err("the downloaded binary does not run on this system".into());
     }
+    let exe = &strip_deleted(exe);
     let staged = exe.with_extension("update");
     std::fs::copy(&new_bin, &staged).map_err(|e| format!("cannot write {}: {e}", staged.display()))?;
     use std::os::unix::fs::PermissionsExt;
@@ -155,6 +177,9 @@ fn install_in(dir: &Path, tar_url: &str, sums_url: &str, exe: &Path) -> Result<S
         let _ = std::fs::remove_file(&staged);
         format!("cannot replace {}: {e}", exe.display())
     })?;
+    if let Ok(mut g) = INSTALLED.lock() {
+        *g = Some(ver.clone());
+    }
     Ok(ver)
 }
 
@@ -189,6 +214,12 @@ mod tests {
         let r = parse_release(j).unwrap();
         assert_eq!((r.version.as_str(), r.tarball.as_deref(), r.sums.as_deref()), ("9.1.0", Some("https://x/tgz"), Some("https://x/sums")));
         assert!(parse_release(b"{}").is_err());
+    }
+
+    #[test]
+    fn a_swapped_binary_path_loses_the_deleted_suffix() {
+        assert_eq!(strip_deleted(Path::new("/home/u/.local/bin/codetrail (deleted)")), PathBuf::from("/home/u/.local/bin/codetrail"));
+        assert_eq!(strip_deleted(Path::new("/x/codetrail")), PathBuf::from("/x/codetrail"));
     }
 
     #[test]

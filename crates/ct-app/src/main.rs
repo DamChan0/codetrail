@@ -93,6 +93,8 @@ fn parse(args: &[String]) -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
+    // before any self-update can swap the file under us
+    let _ = updater::exe_path();
     // Resource budget: the search pool must not spawn one thread per core (32 on big machines).
     if std::env::var_os("RAYON_NUM_THREADS").is_none() {
         std::env::set_var("RAYON_NUM_THREADS", "4");

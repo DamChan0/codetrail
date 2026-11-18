@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.2
+
+- **Self-update restart fixed**: after the binary was swapped, the restart used the path Linux reports for the replaced file (`codetrail (deleted)`) and failed with "No such file or directory"; a second update then wrote a stray `codetrail (deleted)` file. The binary's path is now taken once at startup, a re-check after installing keeps offering the restart, and a failed restart no longer hides it.
+
 ## 0.5.1
 
 - **Search highlights every match** in the opened file, not only the first one of the hit's line; the opened hit is outlined. An **overview ruler** beside the editor shows where the matches are (and the visible part); a hovered marker grows and names its line, a click opens that hit.

@@ -616,7 +616,7 @@ impl App {
 
     pub fn upd_install(&mut self) {
         let crate::updater::UpdState::Available(r) = self.upd.clone() else { return };
-        let Ok(exe) = std::env::current_exe() else {
+        let Some(exe) = crate::updater::exe_path() else {
             self.upd = crate::updater::UpdState::Failed("cannot locate the running binary".into());
             return;
         };
@@ -640,9 +640,10 @@ impl App {
     /// Saves settings, starts the new binary and closes this window.
     pub fn upd_restart(&mut self, ctx: &egui::Context) {
         self.persist_settings();
-        match std::env::current_exe().map_err(|e| e.to_string()).and_then(|e| crate::updater::relaunch(&e)) {
+        match crate::updater::exe_path().ok_or_else(|| "cannot locate the binary".to_string()).and_then(|e| crate::updater::relaunch(&e)) {
             Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-            Err(e) => self.upd = crate::updater::UpdState::Failed(format!("restart failed: {e}")),
+            // the new binary is in place: keep offering the restart, say why this one failed
+            Err(e) => self.flash(format!("Restart failed ({e}); quit and start CodeTrail again.")),
         }
     }
 
@@ -1412,7 +1413,8 @@ impl App {
             Msg::UpdCheck(res) => {
                 self.upd = match res {
                     Ok(Some(r)) => crate::updater::UpdState::Available(r),
-                    Ok(None) => crate::updater::UpdState::UpToDate,
+                    // a re-check after installing keeps the restart offer
+                    Ok(None) => crate::updater::installed().map_or(crate::updater::UpdState::UpToDate, crate::updater::UpdState::Installed),
                     Err(e) => crate::updater::UpdState::CheckFailed(e),
                 };
             }
