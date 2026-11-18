@@ -1028,6 +1028,13 @@ impl App {
             let scene = s.scene.clone();
             match scene.as_str() {
                 "split" => self.settings.split_view = true,
+                "prs" => {
+                    self.rail = RailTab::Prs;
+                    let q = self.smoke.as_ref().map(|s| s.query.clone()).unwrap_or_default();
+                    if let Ok(n) = q.parse::<u64>() {
+                        self.prs.selected = Some(n);
+                    }
+                }
                 "update" => self.upd = crate::updater::UpdState::Available(crate::updater::Release { version: "9.0.0".into(), page: String::new(), tarball: None, sums: None }),
                 "light" => {
                     self.th.file.active = crate::theme::Mode::Light;

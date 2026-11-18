@@ -218,6 +218,7 @@ pub enum Msg {
     RunReview { res: Result<(String, String), String> },
     UpdCheck(Result<Option<crate::updater::Release>, String>),
     UpdInstalled(Result<String, String>),
+    Prs { scope: crate::prs::Scope, res: Result<(String, Vec<crate::prs::Pr>), String> },
 }
 
 pub const REMOTE_RO: &str = "remote repositories are read-only";
@@ -234,6 +235,7 @@ pub enum RailTab {
     Search,
     Files,
     Runs,
+    Prs,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Centre {
@@ -476,6 +478,9 @@ pub struct App {
     /// Shortcuts page is waiting for a key combination for this command.
     pub key_capture: Option<crate::ui::Cmd>,
     pub upd: crate::updater::UpdState,
+    pub prs: crate::prsui::PrsState,
+    /// Scroll the PR board to this card once (keyboard selection).
+    pub prs_scroll_to: Option<u64>,
     /// The update notice was dismissed for this run.
     pub upd_hidden: bool,
     pub settings_dirty_at: Option<Instant>,
@@ -577,6 +582,8 @@ impl App {
             settings_section: crate::settingspage::Section::default(),
             key_capture: None,
             upd: Default::default(),
+            prs: Default::default(),
+            prs_scroll_to: None,
             upd_hidden: false,
             settings_dirty_at: None,
             status_msg: None,
@@ -588,7 +595,8 @@ impl App {
         } else {
             app.open_repo();
         }
-        if app.smoke.is_none() && !cfg!(test) && app.settings.update_check {
+        static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if app.smoke.is_none() && !cfg!(test) && app.settings.update_check && !CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             app.upd_check();
         }
         app
@@ -598,7 +606,7 @@ impl App {
 
     pub fn upd_check(&mut self) {
         self.upd = crate::updater::UpdState::Checking;
-        self.jobs.spawn(JobKind::Update, |c| c.finish(Msg::UpdCheck(crate::updater::check())));
+        self.upd_spawn(|| Msg::UpdCheck(crate::updater::check()));
     }
 
     pub fn upd_install(&mut self) {
@@ -608,7 +616,20 @@ impl App {
             return;
         };
         self.upd = crate::updater::UpdState::Installing(r.clone());
-        self.jobs.spawn(JobKind::Update, move |c| c.finish(Msg::UpdInstalled(crate::updater::install(&r, &exe))));
+        self.upd_spawn(move || Msg::UpdInstalled(crate::updater::install(&r, &exe)));
+    }
+
+    /// Update work answers on the process-wide side channel, so a project switch mid-download
+    /// does not lose the result.
+    fn upd_spawn(&self, f: impl FnOnce() -> Msg + Send + 'static) {
+        let (tx, ctx) = (self.ag.side_tx.clone(), self.ctx.clone());
+        std::thread::Builder::new()
+            .name("ct-update".into())
+            .spawn(move || {
+                let _ = tx.send(f());
+                ctx.request_repaint();
+            })
+            .ok();
     }
 
     /// Saves settings, starts the new binary and closes this window.
@@ -633,6 +654,7 @@ impl App {
     /// True while any async work is outstanding (used by smoke mode to know a scene settled).
     pub fn busy(&self) -> bool {
         self.open_state.is_loading()
+            || self.prs.loading
             || self.commits_loading
             || self.diffset.is_loading()
             || self.prepared.is_loading()
@@ -1388,6 +1410,7 @@ impl App {
                     Err(e) => crate::updater::UpdState::CheckFailed(e),
                 };
             }
+            Msg::Prs { scope, res } => self.prs_loaded(scope, res),
             Msg::UpdInstalled(res) => {
                 self.upd = match res {
                     Ok(v) => crate::updater::UpdState::Installed(v),
@@ -1409,6 +1432,10 @@ impl App {
                     self.store = o.store;
                     self.store_note = o.store_note;
                     self.open_state = Loadable::Ready(());
+                    // the activity bar's PR badge; the page refreshes on its own while open
+                    if (self.smoke.is_none() && !cfg!(test)) || self.rail == RailTab::Prs {
+                        self.prs_fetch();
+                    }
                     self.wt.last = Instant::now();
                     let dirty = o.dirty.as_ref().is_some_and(|s| s.dirty());
                     self.wt.summary = o.dirty;

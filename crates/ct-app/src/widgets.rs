@@ -23,13 +23,23 @@ pub enum Icon {
     File,
     Blame,
     Refresh,
+    /// Working-tree changes: a filled dot inside a ring.
+    Changes,
+    /// Pull request: two branch nodes and a merge arrow.
+    PullRequest,
+    /// Agent runs: a play triangle.
+    Play,
 }
 
 pub const ICON_SIZE: f32 = 14.0;
 
 pub fn paint_icon(p: &Painter, c: Pos2, icon: Icon, col: Color32) {
+    paint_icon_sized(p, c, icon, col, ICON_SIZE);
+}
+
+pub fn paint_icon_sized(p: &Painter, c: Pos2, icon: Icon, col: Color32, size: f32) {
     let s = Stroke::new(1.5, col);
-    let r = ICON_SIZE / 2.0 - 1.0;
+    let r = size / 2.0 - 1.0;
     let l = |a: Pos2, b: Pos2| p.line_segment([a, b], s);
     let o = |dx: f32, dy: f32| pos2(c.x + dx, c.y + dy);
     match icon {
@@ -95,6 +105,24 @@ pub fn paint_icon(p: &Painter, c: Pos2, icon: Icon, col: Color32) {
             p.circle_stroke(c, r * 0.75, s);
             l(o(r * 0.75, -r * 0.2), o(r * 0.75, -r * 0.8));
             l(o(r * 0.75, -r * 0.2), o(r * 0.2, -r * 0.2));
+        }
+        Icon::Changes => {
+            p.circle_stroke(c, r * 0.85, s);
+            p.circle_filled(c, r * 0.35, col);
+        }
+        Icon::PullRequest => {
+            p.circle_stroke(o(-r * 0.55, -r * 0.7), r * 0.28, s);
+            p.circle_stroke(o(-r * 0.55, r * 0.7), r * 0.28, s);
+            p.circle_stroke(o(r * 0.55, r * 0.7), r * 0.28, s);
+            l(o(-r * 0.55, -r * 0.42), o(-r * 0.55, r * 0.42));
+            l(o(r * 0.55, r * 0.42), o(r * 0.55, -r * 0.45));
+            l(o(r * 0.55, -r * 0.45), o(r * 0.05, -r * 0.45));
+            l(o(r * 0.05, -r * 0.45), o(r * 0.3, -r * 0.7));
+            l(o(r * 0.05, -r * 0.45), o(r * 0.3, -r * 0.2));
+        }
+        Icon::Play => {
+            let pts = vec![o(-r * 0.5, -r * 0.8), o(r * 0.8, 0.0), o(-r * 0.5, r * 0.8)];
+            p.add(Shape::closed_line(pts, s));
         }
     }
 }

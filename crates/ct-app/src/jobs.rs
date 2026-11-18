@@ -47,7 +47,7 @@ pub enum JobKind {
     Discover,
     Status,
     Resources,
-    Update,
+    Prs,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

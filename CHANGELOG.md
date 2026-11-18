@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0
+
+- **Pull requests page** (activity bar > PRs, `Ctrl+Shift+P`): open PRs of the project from `gh api graphql`, refreshed every minute. Phase tiles (needs work / in review / ready to merge / in merge queue / draft) count and filter; stacks are drawn lane by lane from their base branch; the detail split lists every reviewer's state (approved, changes requested, waiting, asked again), unresolved threads, CI checks (failing first, click to open) and the merge state. ↑ / ↓ walk the cards, Enter opens the PR. Mine / Review requested switch.
+- **Self-update**: checks the latest GitHub release at startup (Settings > About: check now, turn off). The notice installs it in place (SHA-256 verified, atomic swap) and restarts; a system-wide install gets a link to the release page.
+- **Layout**: an activity bar replaces the rail's tab strip (icons, labels, counts for local changes, failing PRs and runs); each section has a title; comparison controls show only in the code views; settings navigation is a list with the content beside it; font details moved from the status bar to Settings > About.
+
 ## 0.4.0
 
 - **Search**: ↑ / ↓ step to the previous / next hit (across files, opening collapsed ones) while the search field has focus or nothing does; the field keeps focus.

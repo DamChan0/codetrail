@@ -23,12 +23,14 @@ pub enum Cmd {
     ToggleInspector,
     Refresh,
     OpenProject,
+    PullRequests,
 }
 
-pub const COMMANDS: [(Cmd, &str, &str); 14] = [
+pub const COMMANDS: [(Cmd, &str, &str); 15] = [
     (Cmd::OpenProject, "Switch project", "Ctrl+O"),
     (Cmd::PickFile, "Go to file", "Ctrl+P"),
     (Cmd::SearchPanel, "Search in files", "Ctrl+Shift+F"),
+    (Cmd::PullRequests, "Pull requests", "Ctrl+Shift+P"),
     (Cmd::BaseMenu, "Change base", "Ctrl+B"),
     (Cmd::ToggleEdit, "Toggle editor", "Ctrl+E"),
     (Cmd::Save, "Save file", "Ctrl+S"),
@@ -107,6 +109,9 @@ impl eframe::App for App {
         }
 
         self.update_notice(ctx, &th);
+        if !self.repo_arg.as_os_str().is_empty() || self.settings_open {
+            egui::SidePanel::left("activity").exact_width(68.0).resizable(false).frame(egui::Frame::new().fill(th.raised()).stroke(egui::Stroke::new(1.0, th.border()))).show(ctx, |ui| self.activity_bar(ui));
+        }
 
         if self.settings_open {
             if Self::settings_wide(ctx) {
@@ -177,6 +182,10 @@ impl App {
         let dragging = ctx.input(|i| i.pointer.primary_down());
         let lay = panels::panel_layout(win_w, self.settings.rail_width, self.settings.inspector_width, self.insp_open);
         self.conn_banner(ctx, th);
+        if self.rail == RailTab::Prs {
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(th.sunken())).show(ctx, |ui| self.prs_page(ui));
+            return;
+        }
         let (rw, rlo, rhi) = lay.rail;
         let r = egui::SidePanel::left("rail").resizable(true).default_width(rw).width_range(rlo..=rhi).frame(egui::Frame::new().fill(th.bg()).stroke(egui::Stroke::new(1.0, th.border()))).show(ctx, |ui| self.rail_ui(ui));
         let rail_seen = ctx.data(|d| d.get_temp::<f32>(egui::Id::new("rail_seen")));
@@ -263,9 +272,11 @@ impl App {
             Cmd::Palette => {
                 self.palette = PaletteState { open: Some(PaletteMode::Commands), focus: true, ..Default::default() };
             }
-            Cmd::SearchPanel => {
-                self.rail = RailTab::Search;
-                self.search.focus = true;
+            Cmd::SearchPanel => self.set_rail(RailTab::Search),
+            Cmd::PullRequests => {
+                if self.remote.is_none() {
+                    self.set_rail(RailTab::Prs);
+                }
             }
             Cmd::BaseMenu => self.base_pop.open = !self.base_pop.open,
             Cmd::ToggleEdit => match self.settings.view_mode {
@@ -387,8 +398,12 @@ impl App {
             if !self.head_name.is_empty() {
                 widgets::badge(ui, &th, &self.head_name, th.muted());
             }
+            // Comparison controls belong to the code views only.
+            if self.settings_open || self.rail == RailTab::Prs {
+                return;
+            }
             ui.add_space(m.space[1]);
-            // Base chip: always visible, shows the comparison base in effect.
+            // Base chip: always visible in the code views, shows the comparison base in effect.
             let avail = ui.available_width();
             let base_label = self.base_label();
             let r = widgets::chip(ui, &th, "Base", &base_label, true, (avail * 0.4).max(160.0));
@@ -402,9 +417,6 @@ impl App {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = m.space[1];
-                if widgets::icon_button(ui, &th, Icon::Settings, "Settings").clicked() {
-                    self.settings_open = !self.settings_open;
-                }
                 // Diff layout only means something while a diff is on screen.
                 if self.centre == Centre::Diff && self.prepared.ready().is_some() {
                     let mut v = usize::from(self.settings.split_view);
@@ -462,7 +474,6 @@ impl App {
                         ui.label(RichText::new(format!("Ln {}", e.cursor_line)).font(f.clone()).color(th.muted()));
                     }
                 }
-                ui.label(RichText::new(self.fonts_note.clone()).font(f.clone()).color(th.muted()));
                 self.resource_label(ui, &th, f.clone());
             });
         });
@@ -470,38 +481,77 @@ impl App {
 
     // ------------------------------------------------------------ left rail
 
+    /// Switches the left section with the side effects each one needs.
+    pub fn set_rail(&mut self, tab: RailTab) {
+        self.settings_open = false;
+        self.rail = tab;
+        let dirty = self.wt.summary.as_ref().map_or(0, |s| s.files);
+        if tab == RailTab::Current && dirty > 0 && !matches!(self.target, Some(TargetSel::Worktree)) {
+            self.select_worktree();
+        }
+        if tab == RailTab::Search {
+            self.search.focus = true;
+        }
+        if tab == RailTab::Runs {
+            self.ag_open_runs();
+        } else if self.centre == Centre::Run {
+            self.centre = Centre::Diff;
+        }
+        if tab == RailTab::Prs {
+            self.prs_refresh_if_stale();
+        }
+    }
+
+    /// The narrow bar at the far left: one icon + label per section, settings at the bottom.
+    pub(crate) fn activity_bar(&mut self, ui: &mut Ui) {
+        let th = self.th.clone();
+        let dirty = self.wt.summary.as_ref().map_or(0, |s| s.files);
+        let runs = self.ag.runs.badge();
+        let needs = self.prs.list.as_ref().map_or(0, |(_, v)| v.iter().filter(|p| p.phase() == crate::prs::Phase::NeedsWork).count());
+        let remote = self.remote.is_some();
+        let items: [(RailTab, Icon, &str, usize, Option<String>); 6] = [
+            (RailTab::Commits, Icon::Commit, "Commits", 0, None),
+            (RailTab::Current, Icon::Changes, "Changes", dirty, None),
+            (RailTab::Search, Icon::Search, "Search", 0, None),
+            (RailTab::Files, Icon::File, "Files", 0, None),
+            (RailTab::Prs, Icon::PullRequest, "PRs", needs, remote.then(|| "Pull requests: open a local project".to_string())),
+            (RailTab::Runs, Icon::Play, "Runs", runs, remote.then(|| format!("Runs: {}", crate::app::REMOTE_NO_AGENT))),
+        ];
+        ui.add_space(6.0);
+        ui.spacing_mut().item_spacing.y = 2.0;
+        let mut pick = None;
+        for (tab, icon, label, badge, off) in items {
+            let sel = self.rail == tab && !self.settings_open;
+            if activity_item(ui, &th, icon, label, sel, badge, off.as_deref()).clicked() && off.is_none() {
+                pick = Some(tab);
+            }
+        }
+        ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+            ui.add_space(6.0);
+            if activity_item(ui, &th, Icon::Settings, "Settings", self.settings_open, 0, None).clicked() {
+                self.settings_open = !self.settings_open;
+            }
+        });
+        if let Some(t) = pick {
+            self.set_rail(t);
+        }
+    }
+
     fn rail_ui(&mut self, ui: &mut Ui) {
         let th = self.th.clone();
         let m = th.m().clone();
-        ui.add_space(m.space[1]);
+        let title = match self.rail {
+            RailTab::Commits => "Commits",
+            RailTab::Current => "Changes",
+            RailTab::Search => "Search",
+            RailTab::Files => "Files",
+            RailTab::Runs => "Runs",
+            RailTab::Prs => "Pull requests",
+        };
+        ui.add_space(m.space[2]);
         ui.horizontal(|ui| {
             ui.add_space(m.space[2]);
-            let mut i = match self.rail {
-                RailTab::Commits => 0,
-                RailTab::Current => 1,
-                RailTab::Search => 2,
-                RailTab::Files => 3,
-                RailTab::Runs => 4,
-            };
-            let badge = self.ag.runs.badge();
-            let runs_label = if badge > 0 { format!("Runs {badge}") } else { "Runs".to_string() };
-            let dirty = self.wt.summary.as_ref().map_or(0, |s| s.files);
-            let cur_label = if dirty > 0 { format!("Current {dirty}") } else { "Current".to_string() };
-            let off = [None, None, None, None, self.remote.as_ref().map(|_| format!("Runs: {}", crate::app::REMOTE_NO_AGENT))];
-            if widgets::segmented_gated(ui, &th, &["Commits", &cur_label, "Search", "Files", &runs_label], &off, &mut i, 5.0) {
-                self.rail = [RailTab::Commits, RailTab::Current, RailTab::Search, RailTab::Files, RailTab::Runs][i];
-                if self.rail == RailTab::Current && dirty > 0 && !matches!(self.target, Some(TargetSel::Worktree)) {
-                    self.select_worktree();
-                }
-                if self.rail == RailTab::Search {
-                    self.search.focus = true;
-                }
-                if self.rail == RailTab::Runs {
-                    self.ag_open_runs();
-                } else if self.centre == Centre::Run {
-                    self.centre = Centre::Diff;
-                }
-            }
+            ui.label(RichText::new(title).font(widgets::heading_font(&th)).color(th.fg()));
         });
         ui.add_space(m.space[1]);
         match self.rail {
@@ -510,6 +560,7 @@ impl App {
             RailTab::Search => self.search_panel(ui),
             RailTab::Files => self.files_panel(ui),
             RailTab::Runs => self.runs_panel(ui),
+            RailTab::Prs => {}
         }
     }
 
@@ -1210,5 +1261,38 @@ pub mod settings_window_tests {
     pub fn test_app(ctx: &egui::Context) -> App {
         let (th, _) = theme::ThemeFile::load(std::path::Path::new("/nonexistent/theme.toml"));
         App::new(ctx.clone(), std::path::PathBuf::from("/nonexistent"), th, crate::settings::Settings::default(), Vec::new(), String::new(), None, std::sync::Arc::new(FakeAgents::new()))
+    }
+}
+
+/// One activity-bar entry: icon over a short label, optional count badge, disabled with a reason.
+fn activity_item(ui: &mut Ui, th: &crate::theme::Theme, icon: Icon, label: &str, selected: bool, badge: usize, off: Option<&str>) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 54.0), egui::Sense::click());
+    let r = rect.shrink2(vec2(6.0, 1.0));
+    let p = ui.painter();
+    if selected {
+        p.rect_filled(r, th.radius(), th.selection());
+    } else if resp.hovered() && off.is_none() {
+        p.rect_filled(r, th.radius(), th.hover());
+    }
+    let col = if off.is_some() { crate::theme::mix(th.muted(), th.bg(), 0.4) } else if selected { th.fg() } else { th.muted() };
+    let ic = pos2(r.center().x, r.min.y + 18.0);
+    widgets::paint_icon_sized(p, ic, icon, col, 18.0);
+    p.text(pos2(r.center().x, r.max.y - 11.0), egui::Align2::CENTER_CENTER, label, widgets::small_font(th), col);
+    if badge > 0 {
+        let t = if badge > 99 { "99+".to_string() } else { badge.to_string() };
+        let g = p.layout_no_wrap(t, egui::FontId::proportional(10.0), th.bg());
+        let w = (g.size().x + 8.0).max(16.0);
+        let b = Rect::from_min_size(pos2(ic.x + 5.0, ic.y - 15.0), vec2(w, 16.0));
+        p.rect_filled(b, 8.0, if icon == Icon::PullRequest { th.p().diff.del.fg.0 } else { th.accent() });
+        p.galley(pos2(b.center().x - g.size().x / 2.0, b.center().y - g.size().y / 2.0), g, th.bg());
+    }
+    if resp.has_focus() {
+        p.rect_stroke(r, th.radius(), egui::Stroke::new(th.m().focus_ring, th.accent()), egui::StrokeKind::Inside);
+    }
+    let resp = resp.on_hover_text(off.unwrap_or(label));
+    if off.is_some() {
+        resp.on_hover_cursor(egui::CursorIcon::NotAllowed)
+    } else {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 }

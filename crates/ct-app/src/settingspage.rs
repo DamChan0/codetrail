@@ -101,9 +101,12 @@ impl App {
         egui::SidePanel::left("settings_nav").exact_width(NAV_WIDTH).resizable(false).frame(egui::Frame::new().fill(th.bg()).stroke(egui::Stroke::new(1.0, th.border())).inner_margin(egui::Margin::same(12))).show(ctx, |ui| {
             self.settings_back_button(ui);
             ui.add_space(12.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
             for s in Section::ALL {
                 let sel = self.settings_section == s;
-                if Btn::new(s.label()).selected(sel).min_width(ui.available_width()).show(ui, &th).clicked() {
+                let (resp, rect) = widgets::list_row(ui, &th, 34.0, sel);
+                widgets::paint_text_fit(ui, rect, s.label(), widgets::ui_font(&th), if sel { th.fg() } else { th.muted() });
+                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.settings_section = s;
                 }
             }
@@ -112,7 +115,7 @@ impl App {
 
     fn settings_back_button(&mut self, ui: &mut Ui) {
         let th = self.th.clone();
-        if Btn::new("← Back").show(ui, &th).on_hover_text("Back to the repository (Esc)").clicked() {
+        if Btn::new("← Back").kind(BtnKind::Ghost).compact().show(ui, &th).on_hover_text("Back to the repository (Esc)").clicked() {
             self.settings_open = false;
         }
     }
@@ -121,13 +124,15 @@ impl App {
         ctx.screen_rect().width() >= NAV_BREAKPOINT
     }
 
-    /// The page body: centred column, scrollable. Call inside the central panel.
+    /// The page body: a left-aligned column beside the section list, scrollable. Call inside the
+    /// central panel.
     pub fn settings_page(&mut self, ui: &mut Ui) {
         let th = self.th.clone();
         let wide = Self::settings_wide(ui.ctx());
         let full = ui.max_rect();
         let w = (full.width() - 32.0).clamp(240.0, COLUMN_MAX);
-        let col = Rect::from_min_size(egui::pos2(full.center().x - w / 2.0, full.min.y + 16.0), vec2(w, (full.height() - 16.0).max(80.0)));
+        let left = if wide { full.min.x + 32.0 } else { full.center().x - w / 2.0 };
+        let col = Rect::from_min_size(egui::pos2(left, full.min.y + 20.0), vec2(w, (full.height() - 20.0).max(80.0)));
         let mut dirty = Dirty::default();
         ui.scope_builder(egui::UiBuilder::new().max_rect(col), |ui| {
             ui.set_width(w);
@@ -525,6 +530,9 @@ impl App {
         let data = ct_runs::default_data_dir();
         row(ui, &th, "Version", |ui| {
             ui.label(RichText::new(env!("CARGO_PKG_VERSION")).font(widgets::mono_font(&th)).color(th.fg()));
+        });
+        row(ui, &th, "Fonts", |ui| {
+            ui.label(RichText::new(&self.fonts_note).color(th.fg()));
         });
         row(ui, &th, "Build", |ui| {
             ui.label(RichText::new(format!("{} · {}", env!("CT_GIT_SHA"), env!("CT_BUILD_DATE"))).font(widgets::mono_font(&th)).color(th.fg()));

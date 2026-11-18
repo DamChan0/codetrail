@@ -18,7 +18,9 @@ A lightweight desktop viewer (Rust + egui, Linux) for reviewing git changes, wit
 
 ## What it is
 
-- **Review commits and current changes.** Commit list, per-commit file list, unified or side-by-side diff, rename/binary handling. The **Current** tab shows staged / unstaged / untracked changes.
+- **Review commits and current changes.** Commit list, per-commit file list, unified or side-by-side diff, rename/binary handling. The **Changes** section shows staged / unstaged / untracked changes.
+- **Pull requests.** Your open PRs (or the ones waiting for your review) from `gh`, refreshed every minute: phase tiles (needs work, in review, ready, merge queue, draft), stacks drawn by base branch, and per PR every reviewer's state, the CI checks and the merge state.
+- **Self-update.** At startup CodeTrail checks the latest GitHub release; one click downloads it, verifies `SHA256SUMS`, swaps the binary and restarts (system `.deb` installs get a link instead).
 - **Pick the base.** `Base` in the top bar (`Ctrl+B`): parent (default), previous selection, current changes (working tree), any ref, or merge-base of a ref.
 - **AI change history + why.** Hooks/skills record every agent edit; the **Why** panel shows the reason and a confidence level for the selected lines. **Blame** follows a line's history.
 - **Ask AI.** Select lines, `Ctrl+L`: the code, diff, recorded reasons and your question go to Pi (ChatGPT / GitHub Copilot), Claude Code or Codex.
@@ -66,7 +68,7 @@ codetrail /path/to/repo   # open a repo
 
 `Ctrl+O` switches project (recent list + folder browser).
 
-Left rail tabs: **Commits** · **Current** · **Search** · **Files** · **Runs**.
+Activity bar (far left): **Commits** · **Changes** · **Search** · **Files** · **PRs** · **Runs**, Settings at the bottom.
 
 1. **Commits**: click a commit (or `j`/`k`). The diff shows against the base in the top bar. `[` / `]` jump between hunks.
 2. **Base**: `Ctrl+B` → Parent / Previous selection / Current changes / any ref / Merge-base.
@@ -198,6 +200,7 @@ The numbers in the last column come from other team members' test reports and we
 |---|---|
 | `Ctrl+P` | Go to file |
 | `Ctrl+Shift+F` | Search in files |
+| `Ctrl+Shift+P` | Pull requests |
 | `Ctrl+K` | Command palette |
 | `Ctrl+O` | Switch project |
 | `Ctrl+B` | Change base |

@@ -10,7 +10,9 @@ git 변경을 검토하고, AI 에이전트가 각 줄을 **왜** 바꿨는지 �
 
 ## 무엇인가
 
-- **커밋 / 현재 변경 리뷰**: 커밋 목록, 파일 목록, unified/side-by-side diff. **Current** 탭은 staged / unstaged / untracked.
+- **커밋 / 현재 변경 리뷰**: 커밋 목록, 파일 목록, unified/side-by-side diff. **Changes** 섹션은 staged / unstaged / untracked.
+- **Pull requests**: `gh`로 내 열린 PR(또는 리뷰 요청받은 PR)을 1분마다 갱신. 상태 타일(작업 필요·리뷰 중·머지 가능·머지 큐·드래프트), base 브랜치 기준 스택, PR별 리뷰어 상태·CI·머지 상태.
+- **자동 업데이트**: 시작 시 최신 릴리스 확인, 알림에서 한 번 클릭으로 받아 SHA-256 검증 후 교체·재시작 (.deb 시스템 설치는 릴리스 링크만).
 - **Base 선택** (`Ctrl+B`): parent(기본), 이전 선택, 현재 변경(working tree), 임의 ref, merge-base.
 - **AI 변경 이력 + 이유**: 에이전트 편집을 기록하고 **Why** 패널에 이유와 신뢰도를 표시. **Blame**으로 줄 이력 추적.
 - **Ask AI**: 줄을 선택하고 `Ctrl+L` → 코드·diff·기록된 이유·질문을 Pi(ChatGPT/Copilot), Claude Code, Codex에 전달.
@@ -38,7 +40,7 @@ sudo apt install ./codetrail_<ver>_amd64.deb      # Debian/Ubuntu
 codetrail [/path/to/repo]
 ```
 
-왼쪽 탭 **Commits · Current · Search · Files · Runs**. 가운데 **Diff · Blame · Edit**, 오른쪽 인스펙터 **Why · Blame · Ask AI**. `j`/`k` 커밋 이동, `[`/`]` hunk 이동, `Ctrl+E` 편집, `Ctrl+S` 저장(1MB 초과·바이너리는 읽기 전용).
+왼쪽 activity bar **Commits · Changes · Search · Files · PRs · Runs** (아래 Settings). 가운데 **Diff · Blame · Edit**, 오른쪽 인스펙터 **Why · Blame · Ask AI**. `j`/`k` 커밋 이동, `[`/`]` hunk 이동, `Ctrl+E` 편집, `Ctrl+S` 저장(1MB 초과·바이너리는 읽기 전용).
 
 ## 원격 저장소
 

@@ -147,6 +147,9 @@ impl App {
         fresh.settings_section = self.settings_section;
         fresh.rs.backend = self.rs.backend.take();
         fresh.rs.status = std::mem::take(&mut self.rs.status);
+        fresh.upd = std::mem::take(&mut self.upd);
+        fresh.upd_hidden = self.upd_hidden;
+        fresh.prs.scope = self.prs.scope;
         fresh.ag.new_run = None;
         fresh.ag.confirm = None;
         fresh.ag.runs.selected = None;
