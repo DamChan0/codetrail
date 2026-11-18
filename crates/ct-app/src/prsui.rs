@@ -12,15 +12,33 @@ use std::time::{Duration, Instant};
 
 /// Refresh interval while the page is open.
 pub const REFRESH: Duration = Duration::from_secs(60);
-const CARD_H: f32 = 104.0;
-const CARD_MIN_W: f32 = 260.0;
+/// Card widths below these switch to a shorter card with less on it.
+const FULL_W: f32 = 250.0;
+const COMPACT_W: f32 = 160.0;
+const CARD_MIN_W: f32 = 96.0;
+
+/// Card height for a card `w` wide: full (chips, branch), compact (title + one chip), mini.
+pub fn card_h(w: f32) -> f32 {
+    if w >= FULL_W {
+        104.0
+    } else if w >= COMPACT_W {
+        76.0
+    } else {
+        50.0
+    }
+}
 const GAP: f32 = 12.0;
+/// Space between a PR and the one stacked on it: room for the arrow.
+const ROW_GAP: f32 = 44.0;
+const LANE_GAP: f32 = 32.0;
 const DETAIL_W: f32 = 380.0;
 
 #[derive(Default)]
 pub struct PrsState {
     pub scope: Scope,
     pub list: Option<(String, Vec<Pr>)>,
+    /// How many PRs match in total (more than loaded when over [`crate::prs::MAX_PRS`]).
+    pub total: usize,
     pub loading: bool,
     pub error: Option<String>,
     pub at: Option<Instant>,
@@ -112,19 +130,20 @@ impl App {
         });
     }
 
-    pub fn prs_loaded(&mut self, scope: crate::prs::Scope, res: Result<(String, Vec<Pr>), String>) {
+    pub fn prs_loaded(&mut self, scope: crate::prs::Scope, res: Result<(String, Vec<Pr>, usize), String>) {
         if scope != self.prs.scope {
             return;
         }
         self.prs.loading = false;
         self.prs.at = Some(Instant::now());
         match res {
-            Ok(l) => {
+            Ok((slug, prs, total)) => {
                 self.prs.error = None;
-                if self.prs.selected.is_some_and(|n| !l.1.iter().any(|p| p.number == n)) {
+                if self.prs.selected.is_some_and(|n| !prs.iter().any(|p| p.number == n)) {
                     self.prs.selected = None;
                 }
-                self.prs.list = Some(l);
+                self.prs.total = total;
+                self.prs.list = Some((slug, prs));
             }
             Err(e) => self.prs.error = Some(e),
         }
@@ -163,7 +182,7 @@ impl App {
         self.prs_summary(ui, &th, &prs);
         ui.add_space(12.0);
         let sel = self.prs.selected.and_then(|n| prs.iter().find(|p| p.number == n)).cloned();
-        egui::SidePanel::right("pr_detail").resizable(true).default_width(DETAIL_W).width_range(300.0..=560.0).frame(egui::Frame::new().fill(th.bg()).stroke(Stroke::new(1.0, th.border()))).show_inside(ui, |ui| match &sel {
+        egui::SidePanel::right("pr_detail").resizable(true).default_width(DETAIL_W).width_range(300.0..=(ui.available_width() * 0.75).max(320.0)).frame(egui::Frame::new().fill(th.bg()).stroke(Stroke::new(1.0, th.border()))).show_inside(ui, |ui| match &sel {
             Some(p) => self.pr_detail(ui, &th, p),
             None => widgets::empty_state(ui, &th, "Select a pull request", "Click a card, or use the arrow keys. Reviewers, checks and merge state show here."),
         });
@@ -202,12 +221,18 @@ impl App {
                     if Btn::new("Refresh").icon(Icon::Refresh).compact().enabled(!self.prs.loading).show(ui, th).clicked() {
                         self.prs_fetch();
                     }
+                    let shown = self.prs.list.as_ref().map_or(0, |l| l.1.len());
                     let note = if self.prs.loading {
                         "Updating…".to_string()
+                    } else if self.prs.total > shown {
+                        format!("{shown} most recently updated of {}", self.prs.total)
                     } else {
                         self.prs.at.map(|t| format!("Updated {} ago, every minute", short_dur(t.elapsed()))).unwrap_or_default()
                     };
-                    ui.label(RichText::new(note).font(widgets::small_font(th)).color(th.muted()));
+                    let nw = widgets::galley(ui, &note, widgets::small_font(th), th.muted()).size().x;
+                    if ui.available_width() > nw + 8.0 {
+                        ui.label(RichText::new(note).font(widgets::small_font(th)).color(th.muted()));
+                    }
                 });
             });
         });
@@ -217,7 +242,7 @@ impl App {
     fn prs_summary(&mut self, ui: &mut Ui, th: &Theme, prs: &[Pr]) {
         let count = |ph: Phase| prs.iter().filter(|p| p.phase() == ph).count();
         let w = ui.available_width() - 32.0;
-        let small = ((w - GAP * 4.0) / 6.0).max(110.0);
+        let small = ((w - GAP * 4.0) / 6.0).max(80.0);
         ui.horizontal(|ui| {
             ui.add_space(16.0);
             ui.spacing_mut().item_spacing.x = GAP;
@@ -233,8 +258,8 @@ impl App {
                 p.rect(rect, th.radius() + 2.0, fill, Stroke::new(if on { 2.0 } else { 1.0 }, if on { col } else { th.border() }), egui::StrokeKind::Inside);
                 let numc = if n == 0 { th.muted() } else { col };
                 p.text(rect.min + vec2(14.0, 12.0), egui::Align2::LEFT_TOP, n.to_string(), egui::FontId::proportional(th.ui_font + 13.0), numc);
-                p.text(rect.min + vec2(14.0, 50.0), egui::Align2::LEFT_TOP, ph.label(), widgets::ui_font(th), th.fg());
-                if wide && n > 0 {
+                widgets::paint_text_fit(ui, Rect::from_min_max(rect.min + vec2(14.0, 46.0), pos2(rect.max.x - 8.0, rect.min.y + 66.0)), ph.label(), widgets::ui_font(th), th.fg());
+                if wide && n > 0 && tw > 280.0 {
                     let names: Vec<String> = prs.iter().filter(|p| p.phase() == ph).take(4).map(|p| format!("#{} {}", p.number, needs_reason(p))).collect();
                     let x = rect.min.x + 120.0;
                     for (k, t) in names.iter().enumerate() {
@@ -296,29 +321,27 @@ impl App {
                 tile(ui, th, &title, |ui| {
                     let pos = layout_stack(s);
                     let lanes = pos.iter().map(|p| p.0).max().unwrap_or(0) + 1;
-                    let cw = ((ui.available_width() - GAP * (lanes as f32 - 1.0)) / lanes as f32).max(CARD_MIN_W);
+                    // cards shrink (and simplify) with the space the detail split leaves
+                    let lane_gap = if lanes > 1 && ui.available_width() / (lanes as f32) < FULL_W { 16.0 } else { LANE_GAP };
+                    let cw = ((ui.available_width() - lane_gap * (lanes as f32 - 1.0)) / lanes as f32).clamp(CARD_MIN_W, 420.0);
+                    let ch = card_h(cw);
                     let rows = pos.iter().map(|p| p.1).max().unwrap_or(0) + 1;
-                    let total = vec2(cw * lanes as f32 + GAP * (lanes as f32 - 1.0), rows as f32 * (CARD_H + 18.0) - 18.0);
+                    let total = vec2(cw * lanes as f32 + lane_gap * (lanes as f32 - 1.0), rows as f32 * (ch + ROW_GAP) - ROW_GAP);
                     ScrollArea::horizontal().id_salt(("stack", root.number)).show(ui, |ui| {
                         let (area, _) = ui.allocate_exact_size(total, Sense::hover());
-                        let at = |(lane, row): (usize, usize)| Rect::from_min_size(area.min + vec2(lane as f32 * (cw + GAP), row as f32 * (CARD_H + 18.0)), vec2(cw, CARD_H));
-                        // connectors first, under the cards
+                        let at = |(lane, row): (usize, usize)| Rect::from_min_size(area.min + vec2(lane as f32 * (cw + lane_gap), row as f32 * (ch + ROW_GAP)), vec2(cw, ch));
+                        // arrows first, under the cards: from a PR to the one stacked on it (merge order)
                         for (k, &(i, d)) in s.iter().enumerate() {
                             if d == 0 {
                                 continue;
                             }
                             if let Some(pk) = (0..k).rev().find(|&j| s[j].1 + 1 == d && prs[s[j].0].head == prs[i].base) {
-                                let (a, b) = (at(pos[pk]), at(pos[k]));
-                                let st = Stroke::new(1.5, th.border());
-                                let mid = a.max.y + 9.0;
-                                ui.painter().line_segment([pos2(a.center().x, a.max.y), pos2(a.center().x, mid)], st);
-                                ui.painter().line_segment([pos2(a.center().x, mid), pos2(b.center().x, mid)], st);
-                                ui.painter().line_segment([pos2(b.center().x, mid), pos2(b.center().x, b.min.y)], st);
+                                arrow(ui.painter(), th, at(pos[pk]), at(pos[k]));
                             }
                         }
-                        for (k, &(i, _)) in s.iter().enumerate() {
+                        for (k, &(i, d)) in s.iter().enumerate() {
                             let r = at(pos[k]);
-                            if card(ui, th, &prs[i], r, self.prs.selected == Some(prs[i].number), filter).clicked() {
+                            if card(ui, th, &prs[i], r, self.prs.selected == Some(prs[i].number), filter, d == 0).clicked() {
                                 click = Some(prs[i].number);
                             }
                             if scroll_to == Some(prs[i].number) {
@@ -330,14 +353,15 @@ impl App {
             }
             if !singles.is_empty() {
                 tile(ui, th, &format!("Single pull requests ({})", singles.len()), |ui| {
-                    let cols = ((ui.available_width() + GAP) / (CARD_MIN_W + GAP)).floor().max(1.0) as usize;
+                    let cols = ((ui.available_width() + GAP) / (FULL_W + GAP)).floor().max(1.0) as usize;
                     let cw = (ui.available_width() - GAP * (cols as f32 - 1.0)) / cols as f32;
+                    let ch = card_h(cw);
                     let rows = singles.len().div_ceil(cols);
-                    let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), rows as f32 * (CARD_H + GAP) - GAP), Sense::hover());
+                    let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), rows as f32 * (ch + GAP) - GAP), Sense::hover());
                     for (k, s) in singles.iter().enumerate() {
                         let i = s[0].0;
-                        let r = Rect::from_min_size(area.min + vec2((k % cols) as f32 * (cw + GAP), (k / cols) as f32 * (CARD_H + GAP)), vec2(cw, CARD_H));
-                        if card(ui, th, &prs[i], r, self.prs.selected == Some(prs[i].number), filter).clicked() {
+                        let r = Rect::from_min_size(area.min + vec2((k % cols) as f32 * (cw + GAP), (k / cols) as f32 * (ch + GAP)), vec2(cw, ch));
+                        if card(ui, th, &prs[i], r, self.prs.selected == Some(prs[i].number), filter, false).clicked() {
                             click = Some(prs[i].number);
                         }
                         if scroll_to == Some(prs[i].number) {
@@ -485,7 +509,20 @@ fn tile(ui: &mut Ui, th: &Theme, title: &str, body: impl FnOnce(&mut Ui)) {
     });
 }
 
-fn card(ui: &mut Ui, th: &Theme, p: &Pr, r: Rect, selected: bool, filter: Option<Phase>) -> egui::Response {
+/// Elbow arrow from the bottom of `a` to the top of `b`, head on `b`.
+fn arrow(p: &egui::Painter, th: &Theme, a: Rect, b: Rect) {
+    let st = Stroke::new(1.6, th.muted());
+    let mid = a.max.y + (b.min.y - a.max.y) * 0.45;
+    let tip = pos2(b.center().x, b.min.y - 2.0);
+    p.line_segment([pos2(a.center().x, a.max.y), pos2(a.center().x, mid)], st);
+    p.line_segment([pos2(a.center().x, mid), pos2(b.center().x, mid)], st);
+    p.line_segment([pos2(b.center().x, mid), pos2(tip.x, tip.y - 6.0)], st);
+    p.add(egui::Shape::convex_polygon(vec![tip, pos2(tip.x - 5.0, tip.y - 8.0), pos2(tip.x + 5.0, tip.y - 8.0)], th.muted(), Stroke::NONE));
+}
+
+/// `first`: the bottom of a stack, the PR to merge before the ones on top of it; drawn heavier.
+#[allow(clippy::too_many_arguments)]
+fn card(ui: &mut Ui, th: &Theme, p: &Pr, r: Rect, selected: bool, filter: Option<Phase>, first: bool) -> egui::Response {
     let resp = ui.interact(r, ui.id().with(("pr_card", p.number)), Sense::click());
     let ph = p.phase();
     let dim = filter.is_some_and(|f| f != ph);
@@ -493,36 +530,72 @@ fn card(ui: &mut Ui, th: &Theme, p: &Pr, r: Rect, selected: bool, filter: Option
     let pcol = phase_color(th, ph);
     let painter = ui.painter_at(r.expand(2.0));
     let fill = if selected { mix(th.raised(), th.accent(), 0.12) } else if resp.hovered() { th.hover() } else { th.raised() };
-    painter.rect(r, th.radius() + 2.0, fill, Stroke::new(if selected { 2.0 } else { 1.0 }, if selected { th.accent() } else { th.border() }), egui::StrokeKind::Inside);
+    let edge = if selected { Stroke::new(2.0, th.accent()) } else if first { Stroke::new(2.0, fade(th.fg())) } else { Stroke::new(1.0, th.border()) };
+    painter.rect(r, th.radius() + 2.0, fill, edge, egui::StrokeKind::Inside);
     // phase stripe across the top edge, so the state reads before any text
     painter.rect_filled(Rect::from_min_size(r.min + vec2(1.0, 1.0), vec2(r.width() - 2.0, 3.0)), egui::CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 }, fade(pcol));
-    let inner = r.shrink2(vec2(12.0, 10.0));
-    let num = painter.text(pos2(inner.min.x, inner.min.y + 2.0), egui::Align2::LEFT_TOP, format!("#{}", p.number), widgets::mono_font(th), fade(th.muted()));
-    let label = ph.label();
-    let g = painter.layout_no_wrap(label.to_string(), widgets::small_font(th), fade(pcol));
-    let _ = widgets::paint_badge(&painter, th, pos2(inner.max.x - g.size().x - 12.0, num.center().y), label, fade(pcol));
-    widgets::paint_text_fit(ui, Rect::from_min_max(pos2(inner.min.x, num.max.y + 4.0), pos2(inner.max.x, num.max.y + 24.0)), &p.title, widgets::ui_font(th), fade(th.fg()));
-    widgets::paint_text_fit(ui, Rect::from_min_max(pos2(inner.min.x, num.max.y + 26.0), pos2(inner.max.x, num.max.y + 42.0)), &p.head, widgets::small_font(th), fade(th.muted()));
-    // status chips in priority order; one that does not fit is dropped, never clipped
-    let (rv, rs) = review_summary(p);
-    let mut chips: Vec<(String, Color32)> = vec![(rv, review_color(th, rs)), (format!("CI {}", p.ci.label().to_lowercase()), ci_color(th, p.ci))];
-    if let Some((pos, _)) = &p.queue {
-        chips.push((format!("Queue {pos}"), pcol));
-    } else if let Some(m) = p.merge_label().filter(|m| *m != "Mergeable" && *m != "Blocked") {
-        chips.push((m.to_string(), if m == "Conflicts" { th.p().diff.del.fg.0 } else { th.warn() }));
+    let full = r.width() >= FULL_W;
+    let mini = r.width() < COMPACT_W;
+    let inner = r.shrink2(vec2(if mini { 8.0 } else { 12.0 }, if mini { 8.0 } else { 10.0 }));
+    let numc = if first { fade(th.fg()) } else { fade(th.muted()) };
+    let num = painter.text(pos2(inner.min.x, inner.min.y + 2.0), egui::Align2::LEFT_TOP, format!("#{}", p.number), widgets::mono_font(th), numc);
+    if first {
+        // faux bold: the UI face has no bold cut loaded
+        painter.text(pos2(inner.min.x + 0.7, inner.min.y + 2.0), egui::Align2::LEFT_TOP, format!("#{}", p.number), widgets::mono_font(th), numc);
     }
-    if p.unresolved > 0 {
-        chips.push((format!("{} open threads", p.unresolved), th.warn()));
+    let badge_w = |t: &str| painter.layout_no_wrap(t.to_string(), widgets::small_font(th), th.fg()).size().x + 12.0;
+    // header badges, right to left: phase, then "Merge first" when there is room
+    let mut right = inner.max.x;
+    if !mini && num.max.x + 8.0 + badge_w(ph.label()) <= right {
+        right -= badge_w(ph.label());
+        widgets::paint_badge(&painter, th, pos2(right, num.center().y), ph.label(), fade(pcol));
+        right -= 6.0;
     }
-    let y = inner.max.y - 9.0;
-    let mut x = inner.min.x;
-    for (t, c) in chips {
-        let w = painter.layout_no_wrap(t.clone(), widgets::small_font(th), c).size().x + 12.0;
-        if x + w > inner.max.x {
-            break;
+    if first && !mini && num.max.x + 8.0 + badge_w("Merge first") <= right {
+        widgets::paint_badge(&painter, th, pos2(num.max.x + 8.0, num.center().y), "Merge first", fade(th.fg()));
+    }
+    let title_r = Rect::from_min_max(pos2(inner.min.x, num.max.y + 4.0), pos2(inner.max.x, num.max.y + 24.0));
+    let tfont = if mini { widgets::small_font(th) } else { widgets::ui_font(th) };
+    widgets::paint_text_fit(ui, title_r, &p.title, tfont.clone(), fade(th.fg()));
+    if first {
+        widgets::paint_text_fit(ui, title_r.translate(vec2(0.7, 0.0)), &p.title, tfont, fade(th.fg()));
+    }
+    if full {
+        widgets::paint_text_fit(ui, Rect::from_min_max(pos2(inner.min.x, num.max.y + 26.0), pos2(inner.max.x, num.max.y + 42.0)), &p.head, widgets::small_font(th), fade(th.muted()));
+    }
+    if !mini {
+        // status chips in priority order (the compact card keeps the most telling one); a chip
+        // that does not fit is dropped, never clipped
+        let (rv, rs) = review_summary(p);
+        let ci = (format!("CI {}", p.ci.label().to_lowercase()), ci_color(th, p.ci));
+        let mut chips: Vec<(String, Color32)> = if p.ci == Ci::Fail && !full { vec![ci] } else { vec![(rv, review_color(th, rs)), ci] };
+        if let Some((pos, _)) = &p.queue {
+            chips.push((format!("Queue {pos}"), pcol));
+        } else if let Some(m) = p.merge_label().filter(|m| *m != "Mergeable" && *m != "Blocked") {
+            chips.push((m.to_string(), if m == "Conflicts" { th.p().diff.del.fg.0 } else { th.warn() }));
         }
-        x += widgets::paint_badge(&painter, th, pos2(x, y), &t, fade(c)) + 6.0;
+        if p.unresolved > 0 {
+            chips.push((format!("{} open threads", p.unresolved), th.warn()));
+        }
+        if !full {
+            chips.truncate(1);
+        }
+        let y = inner.max.y - 9.0;
+        let mut x = inner.min.x;
+        for (t, c) in chips {
+            if x + badge_w(&t) > inner.max.x {
+                break;
+            }
+            x += widgets::paint_badge(&painter, th, pos2(x, y), &t, fade(c)) + 6.0;
+        }
     }
+    // what the smaller cards leave out is one hover away
+    let resp = if full {
+        resp
+    } else {
+        let (rv, _) = review_summary(p);
+        resp.on_hover_text(format!("#{} {}\n{}{}\n{}, CI {}", p.number, p.title, if first { "Merge first. " } else { "" }, ph.label(), rv, p.ci.label().to_lowercase()))
+    };
     if resp.has_focus() {
         painter.rect_stroke(r, th.radius() + 2.0, Stroke::new(th.m().focus_ring, th.accent()), egui::StrokeKind::Outside);
     }
@@ -574,7 +647,7 @@ mod tests {
         frame(&mut app, Some(Key::ArrowDown));
         assert_eq!(app.prs.selected, Some(2), "the filter limits keyboard order to matching PRs");
         // a late answer for the other scope is ignored
-        app.prs_loaded(Scope::ReviewRequested, Ok(("o/n".into(), vec![])));
+        app.prs_loaded(Scope::ReviewRequested, Ok(("o/n".into(), vec![], 0)));
         assert_eq!(app.prs.list.as_ref().unwrap().1.len(), 3);
         app.prs_loaded(Scope::Mine, Err("gh is not logged in".into()));
         assert!(app.prs.error.is_some() && app.prs.list.is_some(), "an error keeps the last list");

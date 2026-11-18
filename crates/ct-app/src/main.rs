@@ -46,7 +46,7 @@ use std::process::ExitCode;
 
 const VERSION: &str = concat!("codetrail ", env!("CARGO_PKG_VERSION"), " (", env!("CT_GIT_SHA"), " ", env!("CT_BUILD_DATE"), ")");
 
-const USAGE: &str = "codetrail [REPO]\n       codetrail <install|hook|note|record|ask|export> ...\n       codetrail --smoke REPO --screenshot OUT.png [--scene commit|update|prs|split|search|why|light|settings|settings-page|runs|runs-stream|accounts|model-picker|new-run|project-picker|folder-browser|folder-autocomplete|filter-current-many|filter-commits|remote-settings|remote-picker|remote-auth-fail|remote-commit|worktree|current-dirty|current-clean|history-time-travel|mode-sticky|resources] [--size WxH] [--query TEXT]";
+const USAGE: &str = "codetrail [REPO]\n       codetrail <install|hook|note|record|ask|export> ...\n       codetrail --smoke REPO --screenshot OUT.png [--scene commit|update|prs|search-hit|split|search|why|light|settings|settings-page|runs|runs-stream|accounts|model-picker|new-run|project-picker|folder-browser|folder-autocomplete|filter-current-many|filter-commits|remote-settings|remote-picker|remote-auth-fail|remote-commit|worktree|current-dirty|current-clean|history-time-travel|mode-sticky|resources] [--size WxH] [--query TEXT]";
 
 struct Args {
     repo: Option<PathBuf>,
@@ -69,7 +69,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--screenshot" => shot = Some(PathBuf::from(val("--screenshot")?)),
             "--scene" => {
                 scene = val("--scene")?;
-                if !["commit", "update", "prs", "split", "search", "why", "light", "settings", "settings-page", "runs", "runs-stream", "accounts", "model-picker", "new-run", "project-picker", "folder-browser", "folder-autocomplete", "filter-current-many", "filter-commits", "remote-settings", "remote-picker", "remote-auth-fail", "remote-commit", "worktree", "current-dirty", "current-clean", "history-time-travel", "mode-sticky", "resources"].contains(&scene.as_str()) {
+                if !["commit", "update", "prs", "search-hit", "split", "search", "why", "light", "settings", "settings-page", "runs", "runs-stream", "accounts", "model-picker", "new-run", "project-picker", "folder-browser", "folder-autocomplete", "filter-current-many", "filter-commits", "remote-settings", "remote-picker", "remote-auth-fail", "remote-commit", "worktree", "current-dirty", "current-clean", "history-time-travel", "mode-sticky", "resources"].contains(&scene.as_str()) {
                     return Err(format!("unknown scene {scene:?}"));
                 }
             }

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.1
+
+- **Search highlights every match** in the opened file, not only the first one of the hit's line; the opened hit is outlined. An **overview ruler** beside the editor shows where the matches are (and the visible part); a hovered marker grows and names its line, a click opens that hit.
+- **Section shortcuts**: `Ctrl+1` Commits, `Ctrl+2` Changes, `Ctrl+4` Files, `Ctrl+6` Runs (with `Ctrl+Shift+F` Search and `Ctrl+Shift+P` Pull requests); all rebindable, shown in the activity bar tooltips.
+- **PR stacks**: more room between a PR and the one stacked on it, with arrows in merge order; the PR to merge first (bottom of a stack) is drawn bold with a "Merge first" badge. Cards shrink and simplify as the detail split is dragged wider (full, compact, mini; the rest is on hover).
+- **Review requested** loads again: PRs are fetched 20 per request (a 50-PR page timed out with HTTP 504 when many reviews were requested), up to the 60 most recently updated; the header says when more match.
+
 ## 0.5.0
 
 - **Pull requests page** (activity bar > PRs, `Ctrl+Shift+P`): open PRs of the project from `gh api graphql`, refreshed every minute. Phase tiles (needs work / in review / ready to merge / in merge queue / draft) count and filter; stacks are drawn lane by lane from their base branch; the detail split lists every reviewer's state (approved, changes requested, waiting, asked again), unresolved threads, CI checks (failing first, click to open) and the merge state. ↑ / ↓ walk the cards, Enter opens the PR. Mine / Review requested switch.

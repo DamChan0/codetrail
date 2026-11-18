@@ -16,6 +16,56 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// (byte offset, char offset) of the start of every line.
+pub fn line_index(text: &str) -> Vec<(usize, usize)> {
+    let mut v = vec![(0, 0)];
+    let mut chars = 0;
+    for (i, c) in text.char_indices() {
+        chars += 1;
+        if c == '\n' {
+            v.push((i + 1, chars));
+        }
+    }
+    v
+}
+
+/// Overview ruler beside the editor: the visible part of the file as a band, one marker per
+/// matching line. A hovered marker grows and names its line; a click returns that line.
+#[allow(clippy::too_many_arguments)]
+fn overview_ruler(ui: &mut Ui, th: &Theme, r: Rect, lines: &[(u32, String)], total: usize, current: Option<u32>, offset: f32, view_h: f32, content_h: f32) -> Option<u32> {
+    let resp = ui.interact(r, egui::Id::new("editor_overview"), Sense::click());
+    let p = ui.painter_at(r);
+    p.rect_filled(r, 0.0, th.raised());
+    p.line_segment([r.left_top(), r.left_bottom()], egui::Stroke::new(1.0, th.border()));
+    let inner = r.shrink2(vec2(0.0, 6.0));
+    if content_h > 0.0 {
+        let y0 = inner.min.y + (offset / content_h).clamp(0.0, 1.0) * inner.height();
+        let y1 = inner.min.y + ((offset + view_h) / content_h).clamp(0.0, 1.0) * inner.height();
+        p.rect_filled(Rect::from_x_y_ranges(r.x_range(), y0..=y1.max(y0 + 6.0)), 0.0, th.hover());
+    }
+    let y_of = |line: u32| inner.min.y + (line.saturating_sub(1) as f32 / (total.saturating_sub(1).max(1)) as f32) * inner.height();
+    let hover = resp.hover_pos();
+    let near = hover.and_then(|h| lines.iter().map(|(l, _)| (*l, (y_of(*l) - h.y).abs())).filter(|x| x.1 <= 6.0).min_by(|a, b| a.1.total_cmp(&b.1)).map(|x| x.0));
+    let word = th.c(th.p().diff.add.fg);
+    for (l, _) in lines {
+        let hot = near == Some(*l);
+        let grow = ui.ctx().animate_bool_with_time(egui::Id::new(("ruler_mark", *l)), hot, 0.12);
+        let y = y_of(*l);
+        let half = 1.5 + grow * 3.0;
+        let w = 8.0 + grow * 4.0;
+        let col = if current == Some(*l) { th.accent() } else { word };
+        p.rect_filled(Rect::from_center_size(pos2(r.center().x, y), vec2(w, half * 2.0)), 1.5, col);
+    }
+    let resp = match near.and_then(|l| lines.iter().find(|x| x.0 == l)) {
+        Some((l, text)) => resp.on_hover_text(format!("Line {l}: {text}")).on_hover_cursor(egui::CursorIcon::PointingHand),
+        None => resp,
+    };
+    if near.is_some() {
+        ui.ctx().request_repaint();
+    }
+    resp.clicked().then_some(near).flatten()
+}
+
 fn line_job(th: &Theme, text: &str, spans: &[Span], font: &FontId) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
@@ -542,18 +592,49 @@ impl App {
         let mut scroll_rect: Option<Rect> = None;
         let th2 = th.clone();
         let wrap_on = self.settings.wrap;
-        // search match: char range in the whole text (only while it still fits the line)
-        let mark = e.mark.and_then(|(line, s, end)| {
-            let ls = crate::editor::line_start_offset(&e.text, line);
-            let le = e.text[ls..].find('\n').map_or(e.text.len(), |n| ls + n);
-            let (s, end) = (ls + s, ls + end);
+        // Search matches of this file as char ranges: every range of every hit (only while the
+        // buffer equals the disk copy the search ran on); the opened hit's line is "current".
+        let idx = match &e.line_index {
+            Some((k, v)) if *k == key => v.clone(),
+            _ => {
+                let v = Arc::new(line_index(&e.text));
+                e.line_index = Some((key, v.clone()));
+                v
+            }
+        };
+        let char_range = |line: u32, s: usize, end: usize| -> Option<(usize, usize)> {
+            let &(lb, lc) = idx.get((line as usize).checked_sub(1)?)?;
+            let le = idx.get(line as usize).map_or(e.text.len(), |x| x.0.saturating_sub(1));
+            let (s, end) = (lb + s, lb + end);
             (s < end && end <= le && e.text.is_char_boundary(s) && e.text.is_char_boundary(end)).then(|| {
-                let cs = e.text[..s].chars().count();
+                let cs = lc + e.text[lb..s].chars().count();
                 (cs, cs + e.text[s..end].chars().count())
             })
-        });
+        };
+        let cur_line = e.mark.map(|m| m.0);
+        let mark = e.mark.filter(|_| !e.dirty()).and_then(|(line, s, end)| char_range(line, s, end));
+        let file_hits: Vec<&ct_core::SearchHit> = if e.dirty() { Vec::new() } else { self.search.groups.iter().filter(|g| g.path == e.path).flat_map(|g| g.hits.iter()).collect() };
+        let mut matches: Vec<(usize, usize, bool)> = Vec::new();
+        for h in &file_hits {
+            for &(s, end) in &h.ranges {
+                if let Some((cs, ce)) = char_range(h.line, s as usize, end as usize) {
+                    matches.push((cs, ce, Some(h.line) == cur_line));
+                }
+            }
+        }
+        if let Some((cs, ce)) = mark.filter(|m| !matches.iter().any(|x| (x.0, x.1) == *m)) {
+            matches.push((cs, ce, true));
+        }
+        // overview ruler: one marker per matching line, at its position in the file
+        let total_lines = idx.len().max(1);
+        let mut ruler_lines: Vec<(u32, String)> = file_hits.iter().map(|h| (h.line, h.text.trim().to_string())).collect();
+        ruler_lines.dedup_by_key(|x| x.0);
+        let full = ui.available_rect_before_wrap();
+        let ruler_w = if ruler_lines.is_empty() { 0.0 } else { 16.0 };
+        let body = Rect::from_min_max(full.min, pos2(full.max.x - ruler_w, full.max.y));
+        let ruler = Rect::from_min_max(pos2(body.max.x, full.min.y), full.max);
         let area = if wrap_on { ScrollArea::vertical() } else { ScrollArea::both() };
-        area.id_salt("editor_scroll").auto_shrink([false, false]).show(ui, |ui| {
+        let so = ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| area.id_salt("editor_scroll").auto_shrink([false, false]).show(ui, |ui| {
             let mut layouter = |ui: &Ui, text: &str, wrap: f32| -> Arc<egui::Galley> {
                 let job = match &cache {
                     Some((k, j)) if *k == key => j.clone(),
@@ -586,14 +667,28 @@ impl App {
             let out = if editable { te.show(ui) } else { egui::TextEdit::multiline(&mut e.text.as_str()).id(id).font(FontId::monospace(th.code_font)).code_editor().desired_width(if wrap_on { ui.available_width() } else { f32::INFINITY }).desired_rows(30).layouter(&mut layouter).frame(false).margin(egui::Margin::symmetric(12, 8)).show(ui) };
             if out.response.changed() {
                 e.mark = None;
-            } else if let Some((cs, ce)) = mark {
+            } else if !matches.is_empty() {
                 let off = out.galley_pos.to_vec2();
-                let a = out.galley.pos_from_ccursor(CCursor::new(cs)).translate(off);
-                let b = out.galley.pos_from_ccursor(CCursor::new(ce)).translate(off);
                 let clip = ui.clip_rect();
-                let band = Rect::from_x_y_ranges(clip.x_range(), a.y_range());
-                let hit = if (a.center().y - b.center().y).abs() < 1.0 { Rect::from_min_max(a.min, pos2(b.max.x.max(a.min.x + 2.0), a.max.y)) } else { Rect::from_min_max(a.min, pos2(clip.max.x, a.max.y)) };
-                ui.painter().set(mark_slot, egui::Shape::Vec(vec![egui::Shape::rect_filled(band, 0.0, th2.hover()), egui::Shape::rect_filled(hit, 2.0, th2.c(th2.p().diff.add.word))]));
+                let word = th2.c(th2.p().diff.add.word);
+                let mut shapes = Vec::new();
+                if let Some((cs, _)) = mark {
+                    let a = out.galley.pos_from_ccursor(CCursor::new(cs)).translate(off);
+                    shapes.push(egui::Shape::rect_filled(Rect::from_x_y_ranges(clip.x_range(), a.y_range()), 0.0, th2.hover()));
+                }
+                for &(cs, ce, current) in &matches {
+                    let a = out.galley.pos_from_ccursor(CCursor::new(cs)).translate(off);
+                    if a.max.y < clip.min.y - 40.0 || a.min.y > clip.max.y + 40.0 {
+                        continue;
+                    }
+                    let b = out.galley.pos_from_ccursor(CCursor::new(ce)).translate(off);
+                    let r = if (a.center().y - b.center().y).abs() < 1.0 { Rect::from_min_max(a.min, pos2(b.max.x.max(a.min.x + 2.0), a.max.y)) } else { Rect::from_min_max(a.min, pos2(clip.max.x, a.max.y)) };
+                    shapes.push(egui::Shape::rect_filled(r, 2.0, word));
+                    if current {
+                        shapes.push(egui::Shape::rect_stroke(r.expand(1.0), 2.0, egui::Stroke::new(1.5, th2.accent()), egui::StrokeKind::Outside));
+                    }
+                }
+                ui.painter().set(mark_slot, egui::Shape::Vec(shapes));
             }
             if let Some(cr) = out.cursor_range {
                 out_cursor = Some(cr.primary.ccursor.index);
@@ -606,8 +701,22 @@ impl App {
             if let Some(r) = scroll_rect {
                 ui.scroll_to_rect(r.expand2(vec2(0.0, 80.0)), Some(Align::Center));
             }
-        });
+        }));
         e.layout_cache = cache;
+        let mut jump: Option<u32> = None;
+        if !ruler_lines.is_empty() {
+            let so = so.inner;
+            jump = overview_ruler(ui, &th, ruler, &ruler_lines, total_lines, cur_line, so.state.offset.y, so.inner_rect.height(), so.content_size.y);
+        }
+        if let Some(line) = jump {
+            if let Some((gi, h)) = self.search.groups.iter().enumerate().find(|(_, g)| g.path == e.path).and_then(|(gi, g)| g.hits.iter().position(|x| x.line == line).map(|h| (gi, h))) {
+                let hit = &self.search.groups[gi].hits[h];
+                e.goto = Some(line);
+                e.mark = hit.ranges.first().map(|&(s, end)| (line, s as usize, end as usize));
+                self.search.selected = Some((gi, h));
+                self.search_scroll_to = true;
+            }
+        }
         if let Some(ci) = out_cursor {
             if ci as u64 != e.spans_key {
                 e.spans_key = ci as u64;
@@ -1034,6 +1143,9 @@ impl App {
                     if let Ok(n) = q.parse::<u64>() {
                         self.prs.selected = Some(n);
                     }
+                    if q == "review" {
+                        self.prs.scope = crate::prs::Scope::ReviewRequested;
+                    }
                 }
                 "update" => self.upd = crate::updater::UpdState::Available(crate::updater::Release { version: "9.0.0".into(), page: String::new(), tarball: None, sums: None }),
                 "light" => {
@@ -1142,7 +1254,7 @@ impl App {
                         n.focus = false;
                     }
                 }
-                "search" => {
+                "search" | "search-hit" => {
                     self.rail = RailTab::Search;
                     self.search.query = self.smoke.as_ref().map(|s| s.query.clone()).unwrap_or_default();
                 }
@@ -1158,8 +1270,20 @@ impl App {
         // Scene steps that need data.
         let failed = matches!(self.open_state, Loadable::Failed(_));
         let ready = failed || (!self.busy() && self.repo.is_some() && !self.commits.is_empty() && !matches!(self.diffset, Loadable::Loading));
-        if scene == "search" && self.repo.is_some() && self.search.ran.is_none() {
+        if (scene == "search" || scene == "search-hit") && self.repo.is_some() && self.search.ran.is_none() {
             self.start_search();
+        }
+        if scene == "search-hit" && self.editor.is_some() {
+            self.centre = Centre::Editor;
+        }
+        if scene == "search-hit" && !self.search.running && self.editor.is_none() {
+            if let Some(hit) = self.search.groups.first().and_then(|g| g.hits.first()).cloned() {
+                self.search.selected = Some((0, 0));
+                self.open_editor(&hit.path, Some(hit.line));
+                if let (Some(e), Some(&(s, end))) = (self.editor.as_mut(), hit.ranges.first()) {
+                    e.mark = Some((hit.line, s as usize, end as usize));
+                }
+            }
         }
         if scene == "remote-auth-fail" {
             // the live bug: widths saved on a big screen + a remote that rejects authentication
@@ -1198,7 +1322,7 @@ impl App {
             }
             self.ag_select_run("r1");
         }
-        let mut settled = ag_ready && browser_ready && ready && (scene != "search" || self.search.ran.is_some());
+        let mut settled = ag_ready && browser_ready && ready && (scene != "search" || self.search.ran.is_some()) && (scene != "search-hit" || self.editor.as_ref().is_some_and(|e| e.load.ready().is_some()));
         // Fixture scenes (see docs): g.txt line 5 has a multi-commit history across a rename.
         if scene == "history-time-travel" && ready {
             if self.tt.is_none() && self.blame.path.is_empty() {

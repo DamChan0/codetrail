@@ -257,15 +257,29 @@ fn parse_pr(p: &Value) -> Option<Pr> {
 }
 
 /// The GraphQL answer → PRs, newest update first.
+#[cfg(test)]
 pub fn parse(json: &[u8]) -> Result<Vec<Pr>, String> {
+    let mut prs = parse_page(json)?.0;
+    prs.sort_by_key(|p| std::cmp::Reverse(p.updated));
+    Ok(prs)
+}
+
+/// One page of the search: its PRs, the cursor of the next page, the total match count.
+pub fn parse_page(json: &[u8]) -> Result<(Vec<Pr>, Option<String>, usize), String> {
     let v: Value = serde_json::from_slice(json).map_err(|e| format!("unexpected answer from gh: {e}"))?;
     if let Some(e) = v["errors"][0]["message"].as_str() {
         return Err(e.to_string());
     }
-    let mut prs: Vec<Pr> = v["data"]["search"]["nodes"].as_array().ok_or("unexpected answer from gh")?.iter().filter_map(parse_pr).collect();
-    prs.sort_by_key(|p| std::cmp::Reverse(p.updated));
-    Ok(prs)
+    let s = &v["data"]["search"];
+    let prs = s["nodes"].as_array().ok_or("unexpected answer from gh")?.iter().filter_map(parse_pr).collect();
+    let next = (s["pageInfo"]["hasNextPage"] == true).then(|| s["pageInfo"]["endCursor"].as_str().map(str::to_string)).flatten();
+    Ok((prs, next, s["issueCount"].as_u64().unwrap_or(0) as usize))
 }
+
+/// PRs per request: the per-PR checks and threads make bigger pages time out (HTTP 504).
+const PAGE: usize = 20;
+/// Most recently updated PRs loaded at most.
+pub const MAX_PRS: usize = 60;
 
 /// `git@github.com:o/n.git`, `https://github.com/o/n(.git)` → `o/n`.
 pub fn github_slug(remote: &str) -> Option<String> {
@@ -276,7 +290,7 @@ pub fn github_slug(remote: &str) -> Option<String> {
     (!o.is_empty() && !n.is_empty() && it.next().is_none()).then(|| format!("{o}/{n}"))
 }
 
-const QUERY: &str = r#"query($q:String!){ search(query:$q, type:ISSUE, first:50){ nodes{ ... on PullRequest{
+const QUERY: &str = r#"query($q:String!, $n:Int!, $after:String){ search(query:$q, type:ISSUE, first:$n, after:$after){ issueCount pageInfo{ hasNextPage endCursor } nodes{ ... on PullRequest{
  number title url isDraft headRefName baseRefName additions deletions changedFiles updatedAt
  reviewDecision mergeStateStatus
  mergeQueueEntry{ position state }
@@ -288,7 +302,9 @@ const QUERY: &str = r#"query($q:String!){ search(query:$q, type:ISSUE, first:50)
 }}}}"#;
 
 /// Fetches the open PRs of the repository at `root` (its `origin` remote must be on GitHub).
-pub fn fetch(root: &Path, scope: Scope, cancel: &std::sync::atomic::AtomicBool) -> Result<(String, Vec<Pr>), String> {
+/// Returns the repository slug, the PRs (newest update first, at most [`MAX_PRS`]) and how many
+/// match in total.
+pub fn fetch(root: &Path, scope: Scope, cancel: &std::sync::atomic::AtomicBool) -> Result<(String, Vec<Pr>, usize), String> {
     let mut g = Command::new("git");
     g.arg("-C").arg(root).args(["remote", "get-url", "origin"]);
     let o = run_bounded(g, Duration::from_secs(5), Some(cancel))?;
@@ -298,14 +314,34 @@ pub fn fetch(root: &Path, scope: Scope, cancel: &std::sync::atomic::AtomicBool) 
         Scope::Mine => "author:@me",
         Scope::ReviewRequested => "review-requested:@me",
     };
-    let mut c = Command::new("gh");
-    c.current_dir(root).args(["api", "graphql", "-F"]).arg(format!("q=repo:{slug} is:pr is:open {who}")).arg("-f").arg(format!("query={QUERY}"));
-    let o = run_bounded(c, Duration::from_secs(45), Some(cancel)).map_err(|e| if e.contains("No such file") { "the GitHub CLI `gh` is not installed".to_string() } else { e })?;
-    if !o.ok {
-        let e = o.stderr.trim();
-        return Err(if e.contains("auth login") { "gh is not logged in: run `gh auth login`".into() } else { format!("gh failed: {e}") });
-    }
-    Ok((slug, parse(&o.stdout)?))
+    let (mut prs, mut after) = (Vec::new(), None::<String>);
+    let total = loop {
+        let mut c = Command::new("gh");
+        c.current_dir(root).args(["api", "graphql", "-F"]).arg(format!("q=repo:{slug} is:pr is:open {who} sort:updated-desc")).args(["-F", &format!("n={PAGE}")]).arg("-f").arg(format!("query={QUERY}"));
+        if let Some(a) = &after {
+            c.arg("-f").arg(format!("after={a}"));
+        }
+        let o = run_bounded(c, Duration::from_secs(45), Some(cancel)).map_err(|e| if e.contains("No such file") { "the GitHub CLI `gh` is not installed".to_string() } else { e })?;
+        if !o.ok {
+            let e = o.stderr.trim();
+            return Err(if e.contains("auth login") {
+                "gh is not logged in: run `gh auth login`".into()
+            } else if e.contains("HTTP 502") || e.contains("HTTP 504") {
+                "GitHub timed out answering; try Refresh in a moment".into()
+            } else {
+                format!("gh failed: {e}")
+            });
+        }
+        let (page, next, n) = parse_page(&o.stdout)?;
+        prs.extend(page);
+        match next {
+            Some(cur) if prs.len() < MAX_PRS => after = Some(cur),
+            _ => break n,
+        }
+    };
+    prs.truncate(MAX_PRS);
+    prs.sort_by_key(|p| std::cmp::Reverse(p.updated));
+    Ok((slug, prs, total))
 }
 
 /// Groups PRs into stacks (a PR whose base is another PR's head sits on top of it). Each stack is
@@ -414,7 +450,9 @@ mod tests {
     #[ignore]
     fn real_fetch() {
         let root = std::env::var("CT_PRS_REPO").expect("CT_PRS_REPO");
-        let (slug, prs) = fetch(Path::new(&root), Scope::Mine, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        let scope = if std::env::var("CT_PRS_SCOPE").is_ok_and(|s| s == "review") { Scope::ReviewRequested } else { Scope::Mine };
+        let (slug, prs, total) = fetch(Path::new(&root), scope, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        eprintln!("{} of {total}", prs.len());
         for st in stacks(&prs) {
             let line: Vec<String> = st.iter().map(|&(i, _)| format!("#{} {:?} ci={:?} rv={}", prs[i].number, prs[i].phase(), prs[i].ci, prs[i].reviewers.len())).collect();
             eprintln!("{slug}: {}", line.join("  ->  "));

@@ -201,6 +201,7 @@ The numbers in the last column come from other team members' test reports and we
 | `Ctrl+P` | Go to file |
 | `Ctrl+Shift+F` | Search in files |
 | `Ctrl+Shift+P` | Pull requests |
+| `Ctrl+1` / `Ctrl+2` / `Ctrl+4` / `Ctrl+6` | Commits / Changes / Files / Runs |
 | `Ctrl+K` | Command palette |
 | `Ctrl+O` | Switch project |
 | `Ctrl+B` | Change base |

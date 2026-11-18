@@ -218,7 +218,7 @@ pub enum Msg {
     RunReview { res: Result<(String, String), String> },
     UpdCheck(Result<Option<crate::updater::Release>, String>),
     UpdInstalled(Result<String, String>),
-    Prs { scope: crate::prs::Scope, res: Result<(String, Vec<crate::prs::Pr>), String> },
+    Prs { scope: crate::prs::Scope, res: Result<(String, Vec<crate::prs::Pr>, usize), String> },
 }
 
 pub const REMOTE_RO: &str = "remote repositories are read-only";
@@ -306,6 +306,8 @@ pub struct EditorState {
     pub checking: bool,
     pub saving: bool,
     pub layout_cache: Option<(u64, egui::text::LayoutJob)>,
+    /// (text key, per line: (byte offset, char offset) of its start), for match painting.
+    pub line_index: Option<(u64, Arc<Vec<(usize, usize)>>)>,
     pub cursor_line: u32,
     pub spans_key: u64,
 }
@@ -481,6 +483,8 @@ pub struct App {
     pub prs: crate::prsui::PrsState,
     /// Scroll the PR board to this card once (keyboard selection).
     pub prs_scroll_to: Option<u64>,
+    /// Scroll the search list to the selected hit once.
+    pub search_scroll_to: bool,
     /// The update notice was dismissed for this run.
     pub upd_hidden: bool,
     pub settings_dirty_at: Option<Instant>,
@@ -584,6 +588,7 @@ impl App {
             upd: Default::default(),
             prs: Default::default(),
             prs_scroll_to: None,
+            search_scroll_to: false,
             upd_hidden: false,
             settings_dirty_at: None,
             status_msg: None,
@@ -1198,6 +1203,7 @@ impl App {
             checking: false,
             saving: false,
             layout_cache: None,
+            line_index: None,
             cursor_line: 1,
             spans_key: 0,
         });

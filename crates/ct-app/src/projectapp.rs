@@ -614,6 +614,55 @@ mod tests {
     }
 
     #[test]
+    fn every_match_in_the_file_is_painted_and_the_ruler_jumps_to_a_hit() {
+        use crate::app::SearchGroup;
+        let d = tempfile::tempdir().unwrap();
+        let a = repo(d.path(), "alpha", "a.txt");
+        let text = "x\nNode::Node(\ny\nz\nw Node\n";
+        std::fs::write(a.join("a.txt"), text).unwrap();
+        let mut app = app_for(a);
+        pump_until(&mut app, "repo", |x| x.repo.is_some());
+        let hit = |line: u32, t: &str, ranges: Vec<(u32, u32)>| ct_core::SearchHit { path: "a.txt".into(), line, col: 1, text: t.into(), ranges };
+        app.search.query = "Node".into();
+        app.search.groups = vec![SearchGroup { path: "a.txt".into(), hits: vec![hit(2, "Node::Node(", vec![(0, 4), (6, 10)]), hit(5, "w Node", vec![(2, 6)])], collapsed: false }];
+        app.open_editor("a.txt", Some(2));
+        app.editor.as_mut().unwrap().mark = Some((2, 0, 4));
+        pump_until(&mut app, "loaded", |x| x.editor.as_ref().is_some_and(|e| e.load.ready().is_some()));
+        let word = app.th.c(app.th.p().diff.add.word);
+        let ctx = app.ctx.clone();
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0))), events, ..Default::default() };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.editor_ui(ui));
+            });
+            fn walk(s: &egui::Shape, c: egui::Color32, n: &mut usize) {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, c, n)),
+                    egui::Shape::Rect(r) if r.fill == c => *n += 1,
+                    _ => {}
+                }
+            }
+            let mut n = 0;
+            out.shapes.iter().for_each(|cs| walk(&cs.shape, word, &mut n));
+            n
+        };
+        frame(&mut app, vec![]);
+        assert_eq!(frame(&mut app, vec![]), 3, "both matches on line 2 and the one on line 5");
+        // ruler: right 16 px of the panel (8 px margin), markers spread over 6 lines
+        let (top, bottom) = (8.0 + 6.0, 592.0 - 6.0);
+        let y5 = top + (4.0 / 5.0) * (bottom - top);
+        let at = egui::pos2(784.0, y5);
+        frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+        frame(&mut app, vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }]);
+        frame(&mut app, vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
+        assert_eq!(app.search.selected, Some((0, 1)), "the click picked the hit on line 5");
+        assert_eq!(app.editor.as_ref().unwrap().mark, Some((5, 2, 6)));
+        // an edit hides the (now stale) matches
+        app.editor.as_mut().unwrap().text.insert(0, 'q');
+        assert_eq!(frame(&mut app, vec![]), 0);
+    }
+
+    #[test]
     fn only_git_repositories_can_be_opened() {
         let d = tempfile::tempdir().unwrap();
         let a = repo(d.path(), "alpha", "a.txt");

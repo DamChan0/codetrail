@@ -24,13 +24,21 @@ pub enum Cmd {
     Refresh,
     OpenProject,
     PullRequests,
+    ShowCommits,
+    ShowChanges,
+    ShowFiles,
+    ShowRuns,
 }
 
-pub const COMMANDS: [(Cmd, &str, &str); 15] = [
+pub const COMMANDS: [(Cmd, &str, &str); 19] = [
     (Cmd::OpenProject, "Switch project", "Ctrl+O"),
     (Cmd::PickFile, "Go to file", "Ctrl+P"),
     (Cmd::SearchPanel, "Search in files", "Ctrl+Shift+F"),
+    (Cmd::ShowCommits, "Show commits", "Ctrl+1"),
+    (Cmd::ShowChanges, "Show local changes", "Ctrl+2"),
+    (Cmd::ShowFiles, "Show file list", "Ctrl+4"),
     (Cmd::PullRequests, "Pull requests", "Ctrl+Shift+P"),
+    (Cmd::ShowRuns, "Show agent runs", "Ctrl+6"),
     (Cmd::BaseMenu, "Change base", "Ctrl+B"),
     (Cmd::ToggleEdit, "Toggle editor", "Ctrl+E"),
     (Cmd::Save, "Save file", "Ctrl+S"),
@@ -278,6 +286,14 @@ impl App {
                     self.set_rail(RailTab::Prs);
                 }
             }
+            Cmd::ShowCommits => self.set_rail(RailTab::Commits),
+            Cmd::ShowChanges => self.set_rail(RailTab::Current),
+            Cmd::ShowFiles => self.set_rail(RailTab::Files),
+            Cmd::ShowRuns => {
+                if self.remote.is_none() {
+                    self.set_rail(RailTab::Runs);
+                }
+            }
             Cmd::BaseMenu => self.base_pop.open = !self.base_pop.open,
             Cmd::ToggleEdit => match self.settings.view_mode {
                 crate::settings::ViewMode::Edit => self.set_view_pref(crate::settings::ViewMode::Diff),
@@ -509,6 +525,8 @@ impl App {
         let runs = self.ag.runs.badge();
         let needs = self.prs.list.as_ref().map_or(0, |(_, v)| v.iter().filter(|p| p.phase() == crate::prs::Phase::NeedsWork).count());
         let remote = self.remote.is_some();
+        let key = |c: Cmd| crate::keymap::binding(&self.settings.keys, c).map(|k| crate::keymap::format(&k));
+        let keys = [key(Cmd::ShowCommits), key(Cmd::ShowChanges), key(Cmd::SearchPanel), key(Cmd::ShowFiles), key(Cmd::PullRequests), key(Cmd::ShowRuns)];
         let items: [(RailTab, Icon, &str, usize, Option<String>); 6] = [
             (RailTab::Commits, Icon::Commit, "Commits", 0, None),
             (RailTab::Current, Icon::Changes, "Changes", dirty, None),
@@ -520,15 +538,17 @@ impl App {
         ui.add_space(6.0);
         ui.spacing_mut().item_spacing.y = 2.0;
         let mut pick = None;
-        for (tab, icon, label, badge, off) in items {
+        for ((tab, icon, label, badge, off), k) in items.into_iter().zip(keys) {
             let sel = self.rail == tab && !self.settings_open;
-            if activity_item(ui, &th, icon, label, sel, badge, off.as_deref()).clicked() && off.is_none() {
+            let tip = off.clone().unwrap_or_else(|| k.map_or(label.to_string(), |k| format!("{label} ({k})")));
+            if activity_item(ui, &th, icon, label, sel, badge, off.is_some(), &tip).clicked() && off.is_none() {
                 pick = Some(tab);
             }
         }
         ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
             ui.add_space(6.0);
-            if activity_item(ui, &th, Icon::Settings, "Settings", self.settings_open, 0, None).clicked() {
+            let tip = key(Cmd::Settings).map_or("Settings".to_string(), |k| format!("Settings ({k})"));
+            if activity_item(ui, &th, Icon::Settings, "Settings", self.settings_open, 0, false, &tip).clicked() {
                 self.settings_open = !self.settings_open;
             }
         });
@@ -801,6 +821,12 @@ impl App {
         let mut open: Option<(usize, usize)> = None;
         let row_h = 26.0;
         let mut area = ScrollArea::vertical().id_salt("search_list").auto_shrink([false, false]);
+        let reveal = std::mem::take(&mut self.search_scroll_to).then_some(self.search.selected).flatten();
+        if let Some((g, h)) = reveal.filter(|_| step.is_none()) {
+            if let Some(i) = flat.iter().position(|r| *r == (g, Some(h))) {
+                area = area.vertical_scroll_offset((i as f32 * row_h - ui.available_height() / 2.0).max(0.0));
+            }
+        }
         if let Some(down) = step {
             if let Some((g, h)) = step_hit(&self.search.groups, self.search.selected, down) {
                 open = Some((g, h));
@@ -1265,16 +1291,17 @@ pub mod settings_window_tests {
 }
 
 /// One activity-bar entry: icon over a short label, optional count badge, disabled with a reason.
-fn activity_item(ui: &mut Ui, th: &crate::theme::Theme, icon: Icon, label: &str, selected: bool, badge: usize, off: Option<&str>) -> egui::Response {
+#[allow(clippy::too_many_arguments)]
+fn activity_item(ui: &mut Ui, th: &crate::theme::Theme, icon: Icon, label: &str, selected: bool, badge: usize, off: bool, tip: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 54.0), egui::Sense::click());
     let r = rect.shrink2(vec2(6.0, 1.0));
     let p = ui.painter();
     if selected {
         p.rect_filled(r, th.radius(), th.selection());
-    } else if resp.hovered() && off.is_none() {
+    } else if resp.hovered() && !off {
         p.rect_filled(r, th.radius(), th.hover());
     }
-    let col = if off.is_some() { crate::theme::mix(th.muted(), th.bg(), 0.4) } else if selected { th.fg() } else { th.muted() };
+    let col = if off { crate::theme::mix(th.muted(), th.bg(), 0.4) } else if selected { th.fg() } else { th.muted() };
     let ic = pos2(r.center().x, r.min.y + 18.0);
     widgets::paint_icon_sized(p, ic, icon, col, 18.0);
     p.text(pos2(r.center().x, r.max.y - 11.0), egui::Align2::CENTER_CENTER, label, widgets::small_font(th), col);
@@ -1289,8 +1316,8 @@ fn activity_item(ui: &mut Ui, th: &crate::theme::Theme, icon: Icon, label: &str,
     if resp.has_focus() {
         p.rect_stroke(r, th.radius(), egui::Stroke::new(th.m().focus_ring, th.accent()), egui::StrokeKind::Inside);
     }
-    let resp = resp.on_hover_text(off.unwrap_or(label));
-    if off.is_some() {
+    let resp = resp.on_hover_text(tip);
+    if off {
         resp.on_hover_cursor(egui::CursorIcon::NotAllowed)
     } else {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
