@@ -12,14 +12,14 @@ A lightweight desktop viewer (Rust + egui, Linux) for reviewing git changes, wit
 
 [한국어](README.ko.md) · [Changelog](CHANGELOG.md) · [Design notes](PLAN.md) (Korean)
 
-![Commit review](docs/screens/commit-desktop.png)
+![Search in CodeTrail source, with every matching occurrence highlighted and the overview ruler visible](docs/screens/search-desktop.png)
 
-> Screenshots in `docs/screens/` are rendered from a small demo repository with demo agent data (`--smoke`), not from a live account.
+> Screenshots in `docs/screens/` are rendered from the CodeTrail repository itself (`--smoke`), not a live account. The PR screenshot uses fictional PRs and review/check data.
 
 ## What it is
 
 - **Review commits and current changes.** Commit list, per-commit file list, unified or side-by-side diff, rename/binary handling. The **Changes** section shows staged / unstaged / untracked changes.
-- **Pull requests.** Your open PRs (or the ones waiting for your review) from `gh`, refreshed every minute: phase tiles (needs work, in review, ready, merge queue, draft), stacks drawn by base branch, and per PR every reviewer's state, the CI checks and the merge state.
+- **Pull requests.** Your open PRs (or the ones waiting for your review) from `gh`, refreshed every minute: phase tiles (needs work, in review, ready, merge queue, draft), stacks drawn by base branch, and per PR every reviewer's state, the CI checks and the merge state. Your own approval is highlighted in yellow. Ctrl-click a PR card to open it on GitHub; a regular click selects it. If `gh` is not signed in or lacks permission, CodeTrail opens a sign-in prompt; GitHub CLI setup is also available in Settings.
 - **Self-update.** At startup CodeTrail checks the latest GitHub release; one click downloads it, verifies `SHA256SUMS`, swaps the binary and restarts (system `.deb` installs get a link instead).
 - **Pick the base.** `Base` in the top bar (`Ctrl+B`): parent (default), previous selection, current changes (working tree), any ref, or merge-base of a ref.
 - **AI change history + why.** Hooks/skills record every agent edit; the **Why** panel shows the reason and a confidence level for the selected lines. **Blame** follows a line's history.
@@ -31,6 +31,10 @@ A lightweight desktop viewer (Rust + egui, Linux) for reviewing git changes, wit
 | Why | Runs |
 |---|---|
 | ![Why panel](docs/screens/why-desktop.png) | ![Runs](docs/screens/runs-desktop.png) |
+
+### Pull request stacks
+
+![Fictional three-PR stack with merge order, a Merge first badge, and a separate draft PR](docs/screens/prs-desktop.png)
 
 ## Install
 
@@ -141,6 +145,10 @@ Open **Settings → Accounts** (or the model picker). codetrail never stores API
 An account can be switched off with `accounts_disabled` in `config.toml`.
 
 ![Accounts](docs/screens/accounts-desktop.png)
+
+**GitHub CLI for PRs:** Settings → GitHub CLI provides sign-in and installation guidance.
+
+![GitHub CLI setup in Settings](docs/screens/github-cli-desktop.png)
 
 ## Runs
 

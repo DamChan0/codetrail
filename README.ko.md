@@ -4,14 +4,18 @@
 
 git 변경을 검토하고, AI 에이전트가 각 줄을 **왜** 바꿨는지 기록해 보여주는 가벼운 데스크톱 뷰어 (Rust + egui, Linux). 영문 원본: [README.md](README.md)
 
-![커밋 리뷰](docs/screens/commit-desktop.png)
+![CodeTrail 소스 검색 결과와 다중 하이라이트 및 우측 위치 맵](docs/screens/search-desktop.png)
 
-> `docs/screens/`의 스크린샷은 데모 저장소와 데모 에이전트 데이터로 만든 것입니다(`--smoke`).
+> `docs/screens/` 스크린샷은 CodeTrail 저장소 코드로 만들었습니다(`--smoke`). PR 화면의 PR·리뷰·체크 데이터는 가상 예시이며 실제 계정 데이터가 아닙니다.
+
+### PR 스택
+
+![가상 PR 3단계 스택의 머지 순서와 Merge first 표시, 별도 draft PR](docs/screens/prs-desktop.png)
 
 ## 무엇인가
 
 - **커밋 / 현재 변경 리뷰**: 커밋 목록, 파일 목록, unified/side-by-side diff. **Changes** 섹션은 staged / unstaged / untracked.
-- **Pull requests**: `gh`로 내 열린 PR(또는 리뷰 요청받은 PR)을 1분마다 갱신. 상태 타일(작업 필요·리뷰 중·머지 가능·머지 큐·드래프트), base 브랜치 기준 스택, PR별 리뷰어 상태·CI·머지 상태.
+- **Pull requests**: `gh`로 내 열린 PR(또는 리뷰 요청받은 PR)을 1분마다 갱신. 상태 타일(작업 필요·리뷰 중·머지 가능·머지 큐·드래프트), base 브랜치 기준 스택, PR별 리뷰어 상태·CI·머지 상태. 내가 승인한 리뷰는 노란색으로 표시. PR 카드를 Ctrl+클릭하면 GitHub 링크를 열고, 일반 클릭은 카드를 선택합니다. `gh` 로그인이나 권한이 없으면 로그인 안내창을 띄우며 Settings > GitHub CLI에서도 설정할 수 있습니다.
 - **자동 업데이트**: 시작 시 최신 릴리스 확인, 알림에서 한 번 클릭으로 받아 SHA-256 검증 후 교체·재시작 (.deb 시스템 설치는 릴리스 링크만).
 - **Base 선택** (`Ctrl+B`): parent(기본), 이전 선택, 현재 변경(working tree), 임의 ref, merge-base.
 - **AI 변경 이력 + 이유**: 에이전트 편집을 기록하고 **Why** 패널에 이유와 신뢰도를 표시. **Blame**으로 줄 이력 추적.
@@ -64,6 +68,10 @@ Claude Code는 훅이 자동 기록(항상 exit 0, 에이전트를 막지 않음
 
 API 키는 저장하지 않습니다. **Pi**(ChatGPT, GitHub Copilot)는 codetrail이 `~/.local/share/codetrail/agent`에 설치하는 Pi 런타임의 OAuth. **Claude**는 공식 `claude` CLI 로그인(`claude auth login`)만 사용 — Anthropic 약관상 제3자 OAuth는 제공하지 않음: <https://code.claude.com/docs/en/legal-and-compliance>. **Codex**는 `codex login`.
 
+PR 조회용 `gh` 로그인·권한은 Settings > GitHub CLI에서 설정할 수 있습니다. 조회 권한이 없으면 PR 화면에서도 로그인 안내창이 표시됩니다.
+
+![Settings의 GitHub CLI 로그인 버튼](docs/screens/github-cli-desktop.png)
+
 ## Runs
 
 - 에이전트는 `~/.local/share/codetrail/worktrees/…`의 별도 worktree, 브랜치 `ct/<slug>-<id>`에서 작업합니다.
@@ -78,7 +86,7 @@ GUI 유휴 CPU ≈0.6%, RSS 86–104MB(팀 테스트 보고 수치, 이 문서 �
 
 ## 설정 / 단축키
 
-`~/.config/codetrail/config.toml`, `theme.toml` (키 목록은 [README.md](README.md#configuration)). 단축키: `Ctrl+P` 파일, `Ctrl+Shift+F` 검색, `Ctrl+K` 팔레트, `Ctrl+O` 프로젝트, `Ctrl+B` base, `Ctrl+E`/`Ctrl+S` 편집/저장, `Ctrl+G` 줄 이동, `Ctrl+L` Ask AI, `Ctrl+Shift+C` 코드 위치 복사. Ctrl 단축키는 Settings > Shortcuts에서 바꿀 수 있음 (`config.toml`의 `[keys]`).
+`~/.config/codetrail/config.toml`, `theme.toml` (키 목록은 [README.md](README.md#configuration)). 섹션 이동은 `Ctrl+1` Commits, `Ctrl+2` Changes, `Ctrl+4` Files, `Ctrl+6` Runs, `Ctrl+Shift+P` PRs. 그 밖에 `Ctrl+P` 파일, `Ctrl+Shift+F` 검색, `Ctrl+K` 팔레트, `Ctrl+O` 프로젝트, `Ctrl+B` base, `Ctrl+E`/`Ctrl+S` 편집/저장, `Ctrl+G` 줄 이동, `Ctrl+L` Ask AI, `Ctrl+Shift+C` 코드 위치 복사. Ctrl 단축키는 Settings > Shortcuts에서 바꿀 수 있음 (`config.toml`의 `[keys]`).
 
 ## 문제 해결
 

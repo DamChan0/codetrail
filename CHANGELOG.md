@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.4
+
+- **GitHub CLI setup**: PR authentication or permission errors offer sign-in / repository-scope refresh, also available in Settings > GitHub CLI.
+- **My approval** is highlighted in yellow on PR cards and details.
+- **PR cards** open their GitHub link with Ctrl-click; a normal click still selects the card.
+- README screenshots refreshed with CodeTrail source and clearly labeled fictional PR stack data.
+
 ## 0.5.3
 
 - **Review requested** uses GitHub's review-list query: `is:pr user-review-requested:@me archived:false is:open user:<owner> draft:false sort:updated-desc` (only PRs that ask you personally, across the owner's repositories, no drafts). A PR from another repository names it in the detail split.

@@ -15,6 +15,13 @@ pub enum Scope {
     ReviewRequested,
 }
 
+/// Authentication or authorization errors that need the GitHub CLI setup flow.
+pub fn needs_gh_login(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    ["auth login", "not logged in", "http 401", "http 403", "bad credentials", "resource not accessible", "authentication required", "must have admin rights", "saml"]
+        .iter().any(|needle| e.contains(needle))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Review {
     Approved,
@@ -83,6 +90,8 @@ pub struct Reviewer {
     /// Asked again after this review.
     pub re_requested: bool,
     pub team: bool,
+    /// This reviewer is the authenticated `gh` user.
+    pub mine: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +118,28 @@ pub struct Pr {
     pub unresolved: usize,
     pub ci: Ci,
     pub checks: Vec<Check>,
+}
+
+/// Deterministic fictional stack used by the PR screenshot scene.
+pub fn demo_stack() -> (String, Vec<Pr>) {
+    let now = crate::agentapp::now_ms() / 1000;
+    let reviewer = |name: &str, state| Reviewer { name: name.into(), state, at: None, re_requested: false, team: false, mine: name == "you" };
+    let mk = |number, title: &str, head: &str, base: &str, decision: &str, merge_state: &str, ci, reviewers, unresolved| Pr {
+        number, repo: String::new(), title: title.into(), url: String::new(), draft: false,
+        head: head.into(), base: base.into(), additions: 80, deletions: 12, files: 3, updated: now,
+        decision: decision.into(), merge_state: merge_state.into(), queue: None, auto_merge: false,
+        reviewers, unresolved, ci, checks: vec![],
+    };
+    let mut root = mk(204, "Add the search overview ruler", "feature/search-ruler", "main", "APPROVED", "CLEAN", Ci::Pass, vec![reviewer("you", Review::Approved), reviewer("reviewer-b", Review::Pending)], 1);
+    root.additions = 164;
+    root.checks = vec![Check { name: "unit-tests".into(), state: Ci::Pass, url: String::new() }, Check { name: "clippy".into(), state: Ci::Pass, url: String::new() }];
+    let mut child = mk(205, "Support multiple search matches", "feature/multi-match", "feature/search-ruler", "REVIEW_REQUIRED", "BEHIND", Ci::Running, vec![reviewer("reviewer-a", Review::Pending)], 2);
+    child.additions = 72;
+    child.checks = vec![Check { name: "unit-tests".into(), state: Ci::Running, url: String::new() }];
+    let leaf = mk(206, "Add keyboard shortcuts for sections", "feature/section-shortcuts", "feature/multi-match", "REVIEW_REQUIRED", "CLEAN", Ci::Pass, vec![reviewer("reviewer-a", Review::Pending)], 0);
+    let mut draft = mk(207, "Polish compact PR cards", "feature/compact-cards", "main", "", "CLEAN", Ci::None, vec![], 0);
+    draft.draft = true;
+    ("codetrail (demo)".into(), vec![root, child, leaf, draft])
 }
 
 /// What the PR waits on, for the board's grouping and colours.
@@ -198,13 +229,13 @@ fn s(v: &Value) -> String {
     v.as_str().unwrap_or_default().to_string()
 }
 
-fn parse_pr(p: &Value) -> Option<Pr> {
+fn parse_pr(p: &Value, viewer: &str) -> Option<Pr> {
     let number = p["number"].as_u64()?;
     let mut reviewers: Vec<Reviewer> = p["latestReviews"]["nodes"]
         .as_array()
         .into_iter()
         .flatten()
-        .map(|r| Reviewer { name: s(&r["author"]["login"]), state: Review::parse(r["state"].as_str().unwrap_or("")), at: r["submittedAt"].as_str().and_then(parse_time), re_requested: false, team: false })
+        .map(|r| { let name = s(&r["author"]["login"]); Reviewer { mine: name == viewer, name, state: Review::parse(r["state"].as_str().unwrap_or("")), at: r["submittedAt"].as_str().and_then(parse_time), re_requested: false, team: false } })
         .collect();
     for rr in p["reviewRequests"]["nodes"].as_array().into_iter().flatten() {
         let who = &rr["requestedReviewer"];
@@ -215,7 +246,7 @@ fn parse_pr(p: &Value) -> Option<Pr> {
         }
         match reviewers.iter_mut().find(|r| r.name == name) {
             Some(r) => r.re_requested = true,
-            None => reviewers.push(Reviewer { name, state: Review::Pending, at: None, re_requested: false, team }),
+            None => { let mine = !team && name == viewer; reviewers.push(Reviewer { name, state: Review::Pending, at: None, re_requested: false, team, mine }); }
         }
     }
     let rollup = &p["commits"]["nodes"][0]["commit"]["statusCheckRollup"];
@@ -273,10 +304,11 @@ pub fn parse_page(json: &[u8]) -> Result<(Vec<Pr>, Option<String>, usize), Strin
     if let Some(e) = v["errors"][0]["message"].as_str() {
         return Err(e.to_string());
     }
-    let s = &v["data"]["search"];
-    let prs = s["nodes"].as_array().ok_or("unexpected answer from gh")?.iter().filter_map(parse_pr).collect();
-    let next = (s["pageInfo"]["hasNextPage"] == true).then(|| s["pageInfo"]["endCursor"].as_str().map(str::to_string)).flatten();
-    Ok((prs, next, s["issueCount"].as_u64().unwrap_or(0) as usize))
+    let search = &v["data"]["search"];
+    let viewer = s(&v["data"]["viewer"]["login"]);
+    let prs = search["nodes"].as_array().ok_or("unexpected answer from gh")?.iter().filter_map(|p| parse_pr(p, &viewer)).collect();
+    let next = (search["pageInfo"]["hasNextPage"] == true).then(|| search["pageInfo"]["endCursor"].as_str().map(str::to_string)).flatten();
+    Ok((prs, next, search["issueCount"].as_u64().unwrap_or(0) as usize))
 }
 
 /// PRs per request: the per-PR checks and threads make bigger pages time out (HTTP 504).
@@ -293,7 +325,7 @@ pub fn github_slug(remote: &str) -> Option<String> {
     (!o.is_empty() && !n.is_empty() && it.next().is_none()).then(|| format!("{o}/{n}"))
 }
 
-const QUERY: &str = r#"query($q:String!, $n:Int!, $after:String){ search(query:$q, type:ISSUE, first:$n, after:$after){ issueCount pageInfo{ hasNextPage endCursor } nodes{ ... on PullRequest{
+const QUERY: &str = r#"query($q:String!, $n:Int!, $after:String){ viewer{login} search(query:$q, type:ISSUE, first:$n, after:$after){ issueCount pageInfo{ hasNextPage endCursor } nodes{ ... on PullRequest{
  number title url isDraft headRefName baseRefName additions deletions changedFiles updatedAt
  repository{ nameWithOwner }
  reviewDecision mergeStateStatus
@@ -338,8 +370,8 @@ pub fn fetch(root: &Path, scope: Scope, cancel: &std::sync::atomic::AtomicBool) 
         let o = run_bounded(c, Duration::from_secs(45), Some(cancel)).map_err(|e| if e.contains("No such file") { "the GitHub CLI `gh` is not installed".to_string() } else { e })?;
         if !o.ok {
             let e = o.stderr.trim();
-            return Err(if e.contains("auth login") {
-                "gh is not logged in: run `gh auth login`".into()
+            return Err(if needs_gh_login(e) {
+                format!("GitHub CLI authentication or permissions are missing: {e}")
             } else if e.contains("HTTP 502") || e.contains("HTTP 504") {
                 "GitHub timed out answering; try Refresh in a moment".into()
             } else {
@@ -389,7 +421,7 @@ pub fn stacks(prs: &[Pr]) -> Vec<Vec<(usize, usize)>> {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = r#"{"data":{"search":{"nodes":[
+    const SAMPLE: &str = r#"{"data":{"viewer":{"login":"ann"},"search":{"nodes":[
       {"number":2,"title":"two","url":"u2","isDraft":false,"headRefName":"b2","baseRefName":"b1","additions":3,"deletions":1,"changedFiles":2,"updatedAt":"2026-11-17T19:08:33Z",
        "reviewDecision":"REVIEW_REQUIRED","mergeStateStatus":"BEHIND","mergeQueueEntry":null,"autoMergeRequest":null,
        "latestReviews":{"nodes":[{"state":"APPROVED","submittedAt":"2026-11-17T10:00:00Z","author":{"login":"ann"}},{"state":"CHANGES_REQUESTED","submittedAt":"2026-11-16T10:00:00Z","author":{"login":"bob"}}]},
@@ -411,8 +443,8 @@ mod tests {
         assert_eq!(prs.iter().map(|p| p.number).collect::<Vec<_>>(), [2, 1], "newest first, empty nodes skipped");
         let p = &prs[0];
         assert_eq!(p.reviewers.len(), 3);
-        assert_eq!((p.reviewers[0].name.as_str(), p.reviewers[0].state, p.reviewers[0].re_requested), ("ann", Review::Approved, false));
-        assert!(p.reviewers[1].re_requested, "bob was asked again after requesting changes");
+        assert_eq!((p.reviewers[0].name.as_str(), p.reviewers[0].state, p.reviewers[0].re_requested, p.reviewers[0].mine), ("ann", Review::Approved, false, true));
+        assert!(p.reviewers[1].re_requested && !p.reviewers[1].mine, "bob was asked again after requesting changes");
         assert!(p.reviewers[2].team && p.reviewers[2].state == Review::Pending && p.reviewers[2].at.is_none());
         assert_eq!(p.checks.iter().map(|c| (c.name.as_str(), c.state)).collect::<Vec<_>>(), [("test", Ci::Fail), ("lint", Ci::Running), ("build", Ci::Pass)], "failures first");
         assert_eq!((p.ci, p.unresolved, p.phase()), (Ci::Fail, 1, Phase::NeedsWork));
@@ -420,6 +452,14 @@ mod tests {
         let q = &prs[1];
         assert_eq!((q.queue.clone(), q.auto_merge, q.ci, q.phase()), (Some((3, "QUEUED".into())), true, Ci::None, Phase::Queued));
         assert!(parse(br#"{"errors":[{"message":"Bad credentials"}]}"#).unwrap_err().contains("Bad credentials"));
+    }
+
+    #[test]
+    fn github_auth_and_permission_errors_offer_setup() {
+        for e in ["gh is not logged in: run gh auth login", "gh failed: HTTP 403: Resource not accessible by integration", "Bad credentials"] {
+            assert!(needs_gh_login(e), "{e}");
+        }
+        assert!(!needs_gh_login("gh failed: HTTP 504"));
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub enum Section {
     General,
     Appearance,
     Agents,
+    GitHub,
     Remotes,
     Resources,
     Shortcuts,
@@ -28,13 +29,14 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ALL: [Section; 7] = [Section::General, Section::Appearance, Section::Agents, Section::Remotes, Section::Resources, Section::Shortcuts, Section::About];
+    pub const ALL: [Section; 8] = [Section::General, Section::Appearance, Section::Agents, Section::GitHub, Section::Remotes, Section::Resources, Section::Shortcuts, Section::About];
 
     pub fn label(self) -> &'static str {
         match self {
             Section::General => "General",
             Section::Appearance => "Appearance",
             Section::Agents => "Agents & Accounts",
+            Section::GitHub => "GitHub CLI",
             Section::Remotes => "Remotes",
             Section::Resources => "Resources & Limits",
             Section::Shortcuts => "Shortcuts",
@@ -55,6 +57,32 @@ struct Dirty {
     settings: bool,
     reset_colors: bool,
     limits: bool,
+}
+
+/// Start GitHub CLI login or refresh its repository permission in a desktop terminal.
+pub fn start_gh_setup() -> Result<(), String> {
+    use std::process::Command;
+    // Log in when no active account exists; otherwise request the repo scope needed to read private PRs.
+    let setup = "if gh auth status --active >/dev/null 2>&1; then gh auth refresh -s repo; else gh auth login; fi";
+    let xfce = format!("sh -lc '{setup}'");
+    let candidates: &[(&str, &[&str])] = &[
+        ("x-terminal-emulator", &["-e", "sh", "-lc", setup]),
+        ("gnome-terminal", &["--", "sh", "-lc", setup]),
+        ("konsole", &["-e", "sh", "-lc", setup]),
+        ("xfce4-terminal", &["--command", &xfce]),
+        ("xterm", &["-e", "sh", "-lc", setup]),
+    ];
+    for (program, args) in candidates {
+        match Command::new(program).args(*args).spawn() {
+            Ok(mut child) => {
+                let _ = std::thread::Builder::new().name("ct-gh-login".into()).spawn(move || { let _ = child.wait(); });
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("could not open {program}: {e}")),
+        }
+    }
+    Err("No supported terminal found. Open a terminal and run `gh auth login` or `gh auth refresh -s repo`.".into())
 }
 
 pub fn open_path(path: &std::path::Path) {
@@ -163,6 +191,7 @@ impl App {
                     Section::General => self.sec_general(ui, &mut dirty),
                     Section::Appearance => self.sec_appearance(ui, &mut dirty),
                     Section::Agents => self.sec_agents(ui, &mut dirty),
+                    Section::GitHub => self.sec_github(ui),
                     Section::Remotes => self.sec_remotes(ui),
                     Section::Resources => self.sec_resources(ui, &mut dirty),
                     Section::Shortcuts => self.sec_shortcuts(ui),
@@ -200,6 +229,24 @@ impl App {
         }
         if persist {
             self.settings_dirty_at = Some(Instant::now());
+        }
+    }
+
+    // ------------------------------------------------------------ GitHub CLI
+
+    fn sec_github(&mut self, ui: &mut Ui) {
+        let th = self.th.clone();
+        ui.label(RichText::new("Pull requests use GitHub CLI (`gh`) on this computer.").color(th.fg()));
+        hint(ui, &th, "Install gh, then sign in or refresh the `repo` permission for private pull requests.");
+        if Btn::new("Set up / refresh GitHub access").kind(BtnKind::Primary).show(ui, &th).clicked() {
+            match start_gh_setup() {
+                Ok(()) => self.flash("Complete GitHub CLI setup in the terminal, then refresh Pull requests."),
+                Err(e) => self.flash(e),
+            }
+        }
+        ui.add_space(4.0);
+        if Btn::new("Open GitHub CLI installation guide").show(ui, &th).clicked() {
+            crate::updater::open_url("https://cli.github.com/");
         }
     }
 
@@ -641,7 +688,7 @@ mod tests {
         assert_eq!(Section::parse("appear"), Some(Section::Appearance));
         assert_eq!(Section::parse("agents"), Some(Section::Agents));
         assert_eq!(Section::parse(""), None);
-        assert_eq!(Section::ALL.len(), 7);
+        assert_eq!(Section::ALL.len(), 8);
         assert_eq!(Section::parse("remo"), Some(Section::Remotes));
     }
 

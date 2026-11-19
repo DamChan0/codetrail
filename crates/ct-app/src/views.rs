@@ -1139,13 +1139,11 @@ impl App {
                 "split" => self.settings.split_view = true,
                 "prs" => {
                     self.rail = RailTab::Prs;
-                    let q = self.smoke.as_ref().map(|s| s.query.clone()).unwrap_or_default();
-                    if let Ok(n) = q.parse::<u64>() {
-                        self.prs.selected = Some(n);
-                    }
-                    if q == "review" {
-                        self.prs.scope = crate::prs::Scope::ReviewRequested;
-                    }
+                    self.prs.scope = crate::prs::Scope::Mine;
+                    self.prs.selected = Some(204);
+                    self.prs.total = 4;
+                    self.prs.at = Some(Instant::now());
+                    self.prs.list = Some(crate::prs::demo_stack());
                 }
                 "update" => self.upd = crate::updater::UpdState::Available(crate::updater::Release { version: "9.0.0".into(), page: String::new(), tarball: None, sums: None }),
                 "light" => {
@@ -1267,6 +1265,21 @@ impl App {
         let Some(s) = &self.smoke else { return };
         let scene = s.scene.clone();
         ctx.request_repaint_after(Duration::from_millis(60));
+        // Opening the repository can reset the initial smoke state; apply the synthetic board
+        // once the app has entered its normal tick loop, after that reset.
+        if scene == "prs" && !self.prs.list.as_ref().is_some_and(|(slug, _)| slug == "codetrail (demo)") {
+            self.rail = RailTab::Prs;
+            self.prs.scope = crate::prs::Scope::Mine;
+            self.prs.selected = Some(204);
+            self.prs.total = 4;
+            self.prs.at = Some(Instant::now());
+            self.prs.list = Some(crate::prs::demo_stack());
+        }
+        if scene == "prs" {
+            self.prs.error = None;
+            self.prs.auth_prompt = false;
+            self.prs.loading = false;
+        }
         // Scene steps that need data.
         let failed = matches!(self.open_state, Loadable::Failed(_));
         let ready = failed || (!self.busy() && self.repo.is_some() && !self.commits.is_empty() && !matches!(self.diffset, Loadable::Loading));

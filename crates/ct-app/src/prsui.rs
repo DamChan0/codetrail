@@ -41,6 +41,7 @@ pub struct PrsState {
     pub total: usize,
     pub loading: bool,
     pub error: Option<String>,
+    pub auth_prompt: bool,
     pub at: Option<Instant>,
     pub selected: Option<u64>,
     pub filter: Option<Phase>,
@@ -72,6 +73,11 @@ pub fn review_color(th: &Theme, r: Review) -> Color32 {
         Review::Commented => th.accent(),
         Review::Pending | Review::Dismissed => th.muted(),
     }
+}
+
+/// Whether the authenticated viewer has an active approval on this PR.
+pub fn has_my_approval(p: &Pr) -> bool {
+    p.reviewers.iter().any(|r| r.mine && r.state == Review::Approved && !r.re_requested)
 }
 
 /// Short review summary for a card: the most important fact first.
@@ -111,6 +117,9 @@ pub fn layout_stack(stack: &[(usize, usize)]) -> Vec<(usize, usize)> {
 
 impl App {
     pub fn prs_refresh_if_stale(&mut self) {
+        if self.smoke.as_ref().is_some_and(|s| s.scene == "prs") {
+            return;
+        }
         if self.remote.is_some() || self.prs.loading || self.repo.is_none() {
             return;
         }
@@ -131,7 +140,7 @@ impl App {
     }
 
     pub fn prs_loaded(&mut self, scope: crate::prs::Scope, res: Result<(String, Vec<Pr>, usize), String>) {
-        if scope != self.prs.scope {
+        if self.smoke.as_ref().is_some_and(|s| s.scene == "prs") || scope != self.prs.scope {
             return;
         }
         self.prs.loading = false;
@@ -139,13 +148,17 @@ impl App {
         match res {
             Ok((slug, prs, total)) => {
                 self.prs.error = None;
+                self.prs.auth_prompt = false;
                 if self.prs.selected.is_some_and(|n| !prs.iter().any(|p| p.number == n)) {
                     self.prs.selected = None;
                 }
                 self.prs.total = total;
                 self.prs.list = Some((slug, prs));
             }
-            Err(e) => self.prs.error = Some(e),
+            Err(e) => {
+                self.prs.auth_prompt = crate::prs::needs_gh_login(&e);
+                self.prs.error = Some(e);
+            }
         }
     }
 
@@ -158,6 +171,7 @@ impl App {
         self.prs_refresh_if_stale();
         ui.ctx().request_repaint_after(Duration::from_secs(5));
         self.prs_header(ui, &th);
+        self.prs_auth_dialog(ui.ctx());
         if let Some(e) = self.prs.error.clone() {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -199,6 +213,36 @@ impl App {
         });
     }
 
+    fn prs_auth_dialog(&mut self, ctx: &egui::Context) {
+        if !self.prs.auth_prompt { return; }
+        let mut open = true;
+        let mut login = false;
+        let mut settings = false;
+        let mut retry = false;
+        egui::Window::new("GitHub CLI sign-in required").collapsible(false).resizable(false).open(&mut open).show(ctx, |ui| {
+            ui.label("CodeTrail uses `gh` to load pull requests, but GitHub reports missing authentication or permissions.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if Btn::new("Set up / refresh GitHub access").kind(BtnKind::Primary).show(ui, &self.th).clicked() { login = true; }
+                if Btn::new("Settings").show(ui, &self.th).clicked() { settings = true; }
+                if Btn::new("Retry").show(ui, &self.th).clicked() { retry = true; }
+            });
+        });
+        self.prs.auth_prompt = open && !retry;
+        if login {
+            match crate::settingspage::start_gh_setup() {
+                Ok(()) => self.flash("Complete GitHub CLI setup in the terminal, then retry."),
+                Err(e) => self.flash(e),
+            }
+        }
+        if settings {
+            self.prs.auth_prompt = false;
+            self.settings_open = true;
+            self.settings_section = crate::settingspage::Section::GitHub;
+        }
+        if retry { self.prs_fetch(); }
+    }
+
     fn prs_header(&mut self, ui: &mut Ui, th: &Theme) {
         egui::Frame::new().fill(th.raised()).stroke(Stroke::new(1.0, th.border())).inner_margin(egui::Margin::symmetric(16, 10)).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -215,6 +259,7 @@ impl App {
                     self.prs.selected = None;
                     self.prs.filter = None;
                     self.prs.error = None;
+                    self.prs.auth_prompt = false;
                     self.prs_fetch();
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -313,6 +358,7 @@ impl App {
         let (chains, singles): (Stack, Stack) = stacks.iter().filter(|s| visible(s)).partition(|s| s.len() > 1);
         let mut click = None;
         let scroll_to = self.prs_scroll_to.take();
+        let mut open_url = None;
         ScrollArea::vertical().id_salt("pr_board").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = GAP;
             for s in chains {
@@ -342,7 +388,11 @@ impl App {
                         for (k, &(i, d)) in s.iter().enumerate() {
                             let r = at(pos[k]);
                             if card(ui, th, &prs[i], r, self.prs.selected == Some(prs[i].number), filter, d == 0).clicked() {
-                                click = Some(prs[i].number);
+                                if ui.ctx().input(|i| i.modifiers.ctrl) {
+                                    if !prs[i].url.is_empty() { open_url = Some(prs[i].url.clone()); }
+                                } else {
+                                    click = Some(prs[i].number);
+                                }
                             }
                             if scroll_to == Some(prs[i].number) {
                                 ui.scroll_to_rect(r, Some(Align::Center));
@@ -362,7 +412,11 @@ impl App {
                         let i = s[0].0;
                         let r = Rect::from_min_size(area.min + vec2((k % cols) as f32 * (cw + GAP), (k / cols) as f32 * (ch + GAP)), vec2(cw, ch));
                         if card(ui, th, &prs[i], r, self.prs.selected == Some(prs[i].number), filter, false).clicked() {
-                            click = Some(prs[i].number);
+                            if ui.ctx().input(|i| i.modifiers.ctrl) {
+                                if !prs[i].url.is_empty() { open_url = Some(prs[i].url.clone()); }
+                            } else {
+                                click = Some(prs[i].number);
+                            }
                         }
                         if scroll_to == Some(prs[i].number) {
                             ui.scroll_to_rect(r, Some(Align::Center));
@@ -371,7 +425,9 @@ impl App {
                 });
             }
         });
-        if let Some(n) = click {
+        if let Some(url) = open_url {
+            crate::updater::open_url(&url);
+        } else if let Some(n) = click {
             self.prs.selected = if self.prs.selected == Some(n) { None } else { Some(n) };
         }
     }
@@ -412,7 +468,7 @@ impl App {
                 for r in &rv {
                     row(ui, th, |ui| {
                         let state = if r.re_requested { format!("Asked again (was {})", r.state.label().to_lowercase()) } else { r.state.label().to_string() };
-                        let col = if r.re_requested { th.warn() } else { review_color(th, r.state) };
+                        let col = if r.re_requested || (r.mine && r.state == Review::Approved) { th.warn() } else { review_color(th, r.state) };
                         let who = if r.team { format!("{} (team)", r.name) } else { r.name.clone() };
                         ui.label(RichText::new(who).color(th.fg()));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -570,8 +626,9 @@ fn card(ui: &mut Ui, th: &Theme, p: &Pr, r: Rect, selected: bool, filter: Option
         // status chips in priority order (the compact card keeps the most telling one); a chip
         // that does not fit is dropped, never clipped
         let (rv, rs) = review_summary(p);
+        let review_col = if has_my_approval(p) { th.warn() } else { review_color(th, rs) };
         let ci = (format!("CI {}", p.ci.label().to_lowercase()), ci_color(th, p.ci));
-        let mut chips: Vec<(String, Color32)> = if p.ci == Ci::Fail && !full { vec![ci] } else { vec![(rv, review_color(th, rs)), ci] };
+        let mut chips: Vec<(String, Color32)> = if p.ci == Ci::Fail && !full { vec![ci] } else { vec![(rv, review_col), ci] };
         if let Some((pos, _)) = &p.queue {
             chips.push((format!("Queue {pos}"), pcol));
         } else if let Some(m) = p.merge_label().filter(|m| *m != "Mergeable" && *m != "Blocked") {
@@ -593,12 +650,13 @@ fn card(ui: &mut Ui, th: &Theme, p: &Pr, r: Rect, selected: bool, filter: Option
         }
     }
     // what the smaller cards leave out is one hover away
-    let resp = if full {
-        resp
+    let hover = if full {
+        "Ctrl-click to open on GitHub".to_string()
     } else {
         let (rv, _) = review_summary(p);
-        resp.on_hover_text(format!("#{} {}\n{}{}\n{}, CI {}", p.number, p.title, if first { "Merge first. " } else { "" }, ph.label(), rv, p.ci.label().to_lowercase()))
+        format!("#{} {}\n{}{}\n{}, CI {}\nCtrl-click to open on GitHub", p.number, p.title, if first { "Merge first. " } else { "" }, ph.label(), rv, p.ci.label().to_lowercase())
     };
+    let resp = resp.on_hover_text(hover);
     if resp.has_focus() {
         painter.rect_stroke(r, th.radius() + 2.0, Stroke::new(th.m().focus_ring, th.accent()), egui::StrokeKind::Outside);
     }
@@ -618,7 +676,7 @@ mod tests {
     }
 
     fn pr(n: u64, head: &str, base: &str, decision: &str, ci: Ci) -> Pr {
-        Pr { number: n, repo: "o/n".into(), title: format!("PR {n}"), url: format!("https://x/{n}"), draft: false, head: head.into(), base: base.into(), additions: 1, deletions: 1, files: 1, updated: n as i64, decision: decision.into(), merge_state: "CLEAN".into(), queue: None, auto_merge: false, reviewers: vec![crate::prs::Reviewer { name: "ann".into(), state: Review::Approved, at: Some(0), re_requested: false, team: false }], unresolved: 0, ci, checks: vec![] }
+        Pr { number: n, repo: "o/n".into(), title: format!("PR {n}"), url: format!("https://x/{n}"), draft: false, head: head.into(), base: base.into(), additions: 1, deletions: 1, files: 1, updated: n as i64, decision: decision.into(), merge_state: "CLEAN".into(), queue: None, auto_merge: false, reviewers: vec![crate::prs::Reviewer { name: "ann".into(), state: Review::Approved, at: Some(0), re_requested: false, team: false, mine: false }], unresolved: 0, ci, checks: vec![] }
     }
 
     #[test]
@@ -654,16 +712,27 @@ mod tests {
         assert_eq!(app.prs.list.as_ref().unwrap().1.len(), 3);
         app.prs_loaded(Scope::Mine, Err("gh is not logged in".into()));
         assert!(app.prs.error.is_some() && app.prs.list.is_some(), "an error keeps the last list");
+        assert!(app.prs.auth_prompt, "authentication failures open the sign-in prompt");
         frame(&mut app, None);
+    }
+
+    #[test]
+    fn my_approval_is_detected_separately_for_yellow_emphasis() {
+        let mut p = pr(1, "a", "main", "", Ci::Pass);
+        assert!(!has_my_approval(&p));
+        p.reviewers[0].mine = true;
+        assert!(has_my_approval(&p));
+        p.reviewers[0].re_requested = true;
+        assert!(!has_my_approval(&p));
     }
 
     #[test]
     fn review_summary_puts_change_requests_first() {
         let mut p = pr(1, "a", "main", "", Ci::Pass);
         assert_eq!(review_summary(&p).0, "1 approved");
-        p.reviewers.push(crate::prs::Reviewer { name: "bob".into(), state: Review::Pending, at: None, re_requested: false, team: true });
+        p.reviewers.push(crate::prs::Reviewer { name: "bob".into(), state: Review::Pending, at: None, re_requested: false, team: true, mine: false });
         assert_eq!(review_summary(&p).0, "1 approved, 1 waiting");
-        p.reviewers.push(crate::prs::Reviewer { name: "cy".into(), state: Review::ChangesRequested, at: Some(1), re_requested: false, team: false });
+        p.reviewers.push(crate::prs::Reviewer { name: "cy".into(), state: Review::ChangesRequested, at: Some(1), re_requested: false, team: false, mine: false });
         assert_eq!(review_summary(&p), ("1 requested changes".into(), Review::ChangesRequested));
     }
 }
