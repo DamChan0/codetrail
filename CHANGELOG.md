@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.6
+
+- **Character-precise selection in diff and blame**: dragging selects and highlights exactly the text dragged over, also part of a line or across partial first / last lines; `Ctrl+C` copies just that text. A click or shift-click still selects whole lines.
+- **Copy absolute file path** is a command (`Ctrl+Alt+Shift+C`); it and *Copy absolute path:line* / *Copy code reference* can be rebound in Settings > Shortcuts.
+
 ## 0.5.5
 
 - **Copy code from the diff and blame views**: drag (or click / shift-click) over lines and press `Ctrl+C` to copy the code without line numbers or diff markers. In side by side, the pane you select in is the one copied (old lines on the left, new on the right).

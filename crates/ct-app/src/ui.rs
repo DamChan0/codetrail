@@ -17,6 +17,7 @@ pub enum Cmd {
     Save,
     CopyRef,
     CopyPathLine,
+    CopyAbsPath,
     AskAi,
     ToggleSplit,
     Settings,
@@ -31,7 +32,7 @@ pub enum Cmd {
     ShowRuns,
 }
 
-pub const COMMANDS: [(Cmd, &str, &str); 20] = [
+pub const COMMANDS: [(Cmd, &str, &str); 21] = [
     (Cmd::OpenProject, "Switch project", "Ctrl+O"),
     (Cmd::PickFile, "Go to file", "Ctrl+P"),
     (Cmd::SearchPanel, "Search in files", "Ctrl+Shift+F"),
@@ -45,6 +46,7 @@ pub const COMMANDS: [(Cmd, &str, &str); 20] = [
     (Cmd::Save, "Save file", "Ctrl+S"),
     (Cmd::CopyRef, "Copy code reference", "Ctrl+Shift+C"),
     (Cmd::CopyPathLine, "Copy absolute path:line", "Ctrl+Alt+C"),
+    (Cmd::CopyAbsPath, "Copy absolute file path", "Ctrl+Alt+Shift+C"),
     (Cmd::AskAi, "Ask AI about selection", "Ctrl+L"),
     (Cmd::ToggleSplit, "Toggle unified / side-by-side", ""),
     (Cmd::GotoLine, "Go to line", "Ctrl+G"),
@@ -314,6 +316,7 @@ impl App {
             }
             Cmd::CopyRef => self.copy_ref(),
             Cmd::CopyPathLine => self.copy_path_line(),
+            Cmd::CopyAbsPath => self.copy_file_path(true),
             Cmd::AskAi => self.start_ask(),
             Cmd::ToggleSplit => {
                 self.settings.split_view = !self.settings.split_view;

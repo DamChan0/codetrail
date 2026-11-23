@@ -217,8 +217,9 @@ The numbers in the last column come from other team members' test reports and we
 | `Ctrl+G` | Go to line |
 | `Ctrl+L` | Ask AI about the selection |
 | `Ctrl+Shift+C` | Copy code reference |
-| `Ctrl+C` | Copy the selected diff / blame lines as plain code (drag or shift-click to select; the side-by-side pane you select in is the one copied) |
+| `Ctrl+C` | Copy the selected diff / blame text as plain code: drag selects exactly the characters dragged over (partial lines too), a click or shift-click selects whole lines; in side by side the pane you select in is the one copied |
 | `Ctrl+Alt+C` | Copy the absolute `path:line` (`path:start-end`) of the selection, or the file's absolute path; also on right-click and the copy button beside the file path |
+| `Ctrl+Alt+Shift+C` | Copy the file's absolute path (all copy shortcuts can be rebound in Settings > Shortcuts) |
 | `j` / `k` | Next / previous commit |
 | `[` / `]` | Previous / next hunk |
 | `Esc` | Close popups |

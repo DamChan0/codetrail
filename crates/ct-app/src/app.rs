@@ -459,6 +459,10 @@ pub struct App {
     pub diff_anchor: Option<usize>,
     /// Diff column the current row selection was made in.
     pub diff_pane: Pane,
+    /// Character columns (anchor, head) of `diff_sel` in tab-expanded display text.
+    pub diff_cols: crate::selection::Cols,
+    /// Character columns (anchor, head) of `blame.selected`.
+    pub blame_cols: crate::selection::Cols,
     /// Code and `path:line` source of the last diff / blame selection, with the view it came from.
     pub copy_sel: Option<(Centre, CopySel)>,
     pub diff_scroll_to: Option<usize>,
@@ -571,6 +575,8 @@ impl App {
             diff_sel: None,
             diff_anchor: None,
             diff_pane: Pane::New,
+            diff_cols: (0, 0),
+            blame_cols: (0, 0),
             copy_sel: None,
             diff_scroll_to: None,
             diff_top_row: 0,

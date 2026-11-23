@@ -5,7 +5,7 @@ use crate::diffmodel::{cols, DiffModel, SplitRow, UnifiedRow};
 use crate::editor::ReadOnly;
 use crate::highlight::{self, Span};
 use crate::settings::ViewMode;
-use crate::selection::{code_ref_for_lines, code_ref_for_rows, copy_for_rows, CopySel, Pane, RowSel};
+use crate::selection::{char_span, code_ref_for_lines, code_ref_for_rows, copy_for_rows, is_char_sel, sel_text, CopySel, Pane, RowSel};
 use crate::theme::Theme;
 use crate::widgets::{self, Btn, BtnKind, Icon, Level};
 use ct_core::{LineKind, RefAt};
@@ -282,17 +282,17 @@ impl App {
             area = area.vertical_scroll_offset((r as f32 * row_h - row_h * 1.5).max(0.0));
         }
         let mut new_sel: Option<RowSel> = self.diff_sel;
+        let mut cols = self.diff_cols;
         let mut anchor = self.diff_anchor;
         let mut top_row = self.diff_top_row;
-        let shift = ui.input(|i| i.modifiers.shift);
-        let sel_now = self.diff_sel;
+        let (shift, press_at) = ui.input(|i| (i.modifiers.shift, i.pointer.press_origin()));
         let mut pane = match (split, self.diff_pane) {
             (false, _) => Pane::Unified,
             (true, Pane::Unified) => Pane::New,
             (true, p) => p,
         };
-        let pane_now = pane;
         let mut act: Option<CopyAct> = None;
+        let tab = self.settings.tab_width;
         let line_of = |r: usize, pane: Pane| -> Option<usize> {
             if split {
                 match model.split[r] {
@@ -337,10 +337,11 @@ impl App {
                     let rr = range.start + ((pos.y - first_top) / row_h).floor().max(0.0) as usize;
                     Some(rr.min(n_rows - 1))
                 };
+                let half = (rect.width() / 2.0).floor();
                 // Split view: the half under the pointer is the pane the selection copies from.
-                let pane_at = |resp: &egui::Response| match resp.interact_pointer_pos() {
+                let pane_of = |pp: Option<egui::Pos2>| match pp {
                     Some(pp) if split => {
-                        if pp.x < rect.min.x + (rect.width() / 2.0).floor() {
+                        if pp.x < rect.min.x + half {
                             Pane::Old
                         } else {
                             Pane::New
@@ -348,54 +349,82 @@ impl App {
                     }
                     _ => pane,
                 };
+                // Character column under x on line i of pane p.
+                let col_of = |i: usize, p: Pane, x: f32| -> usize {
+                    let ox = match p {
+                        Pane::Old => rect.min.x + num_w + 8.0,
+                        Pane::New => rect.min.x + half + num_w + 8.0,
+                        Pane::Unified => rect.min.x + 2.0 * num_w + 18.0,
+                    };
+                    col_at(ui, th, &model.lines[i].text, &mono, x - ox)
+                };
                 if resp.clicked() || resp.drag_started() {
-                    let pn = pane_at(&resp);
-                    if let Some(i) = line_of(r, pn) {
+                    let at = press_at.or(resp.interact_pointer_pos());
+                    let pn = pane_of(at);
+                    if let (Some(i), Some(at)) = (line_of(r, pn), at) {
+                        let c = col_of(i, pn, at.x);
                         match (shift, anchor) {
-                            (true, Some(a)) if pn == pane => new_sel = Some(RowSel { a, b: i }),
+                            (true, Some(a)) if pn == pane => {
+                                new_sel = Some(RowSel { a, b: i });
+                                cols.1 = c;
+                            }
                             _ => {
                                 anchor = Some(i);
                                 new_sel = Some(RowSel::single(i));
+                                cols = (c, c);
                             }
                         }
                         pane = pn;
                     }
                 } else if resp.dragged() {
-                    if let (Some(a), Some(pr)) = (anchor, pointer_row(&resp)) {
+                    if let (Some(a), Some(pr), Some(pp)) = (anchor, pointer_row(&resp), resp.interact_pointer_pos()) {
                         if let Some(i) = line_of(pr, pane) {
                             new_sel = Some(RowSel { a, b: i });
+                            cols.1 = col_of(i, pane, pp.x);
                         }
                     }
                 } else if resp.secondary_clicked() {
                     // Right-click outside the selection selects that line first.
-                    let pn = pane_at(&resp);
+                    let pn = pane_of(resp.interact_pointer_pos());
                     if let Some(i) = line_of(r, pn) {
                         if pn != pane || !new_sel.is_some_and(|s| s.contains(i)) {
                             anchor = Some(i);
                             new_sel = Some(RowSel::single(i));
+                            cols = (0, 0);
                             pane = pn;
                         }
                     }
                 }
                 resp.context_menu(|ui| copy_menu(ui, &mut act, &[CopyAct::Code, CopyAct::PathLine, CopyAct::AbsPath]));
-                let in_sel = |i: usize| (pane_now == pane && sel_now.is_some_and(|s| s.contains(i))) || new_sel.is_some_and(|s| s.contains(i));
+                let (ps, pc, pp) = (new_sel, cols, pane);
+                let hl = move |i: usize, side: Pane| -> Option<Hl> {
+                    let s = ps.filter(|_| side == pp)?;
+                    if !is_char_sel(s, pc) {
+                        return s.contains(i).then_some(Hl::Row);
+                    }
+                    char_span(s, pc, i).map(|(a, b)| Hl::Chars(a, b))
+                };
                 if split {
                     if let SplitRow::Pair(l, rr) = model.split[r] {
-                        let half = (rect.width() / 2.0).floor();
                         let lrect = Rect::from_min_size(rect.min, vec2(half, row_h));
                         let rrect = Rect::from_min_size(pos2(rect.min.x + half, rect.min.y), vec2(rect.width() - half, row_h));
-                        paint_cell(ui, &painter, th, model, l, lrect, num_w, cw, &mono, true, |i| pane == Pane::Old && in_sel(i));
-                        paint_cell(ui, &painter, th, model, rr, rrect, num_w, cw, &mono, false, |i| pane == Pane::New && in_sel(i));
+                        paint_cell(ui, &painter, th, model, l, lrect, num_w, cw, &mono, true, |i| hl(i, Pane::Old));
+                        paint_cell(ui, &painter, th, model, rr, rrect, num_w, cw, &mono, false, |i| hl(i, Pane::New));
                         painter.line_segment([rrect.left_top(), rrect.left_bottom()], egui::Stroke::new(1.0, th.border()));
                     }
                 } else if let UnifiedRow::Line(i) = model.unified[r] {
-                    paint_unified(ui, &painter, th, model, i, rect, num_w, cw, &mono, in_sel(i));
+                    paint_unified(ui, &painter, th, model, i, rect, num_w, cw, &mono, hl(i, Pane::Unified));
                 }
             }
         });
         self.diff_top_row = top_row;
         self.diff_anchor = anchor;
         let changed = new_sel != self.diff_sel || pane != self.diff_pane;
+        let cols_changed = cols != self.diff_cols;
+        self.diff_cols = cols;
+        if changed || cols_changed {
+            ui.ctx().request_repaint();
+        }
         if changed {
             self.diff_sel = new_sel;
             self.diff_pane = pane;
@@ -410,10 +439,10 @@ impl App {
             }
         }
         // The highlighted rows stay what Ctrl+C copies, also after a selection in another view.
-        if changed || !matches!(self.copy_sel, Some((Centre::Diff, _))) {
+        if changed || cols_changed || !matches!(self.copy_sel, Some((Centre::Diff, _))) {
             if let (Some(s), Some(path)) = (new_sel, self.file_sel.as_deref()) {
                 let raw: Vec<&str> = f.hunks.iter().flat_map(|h| h.lines.iter().map(|l| l.text.as_str())).collect();
-                self.copy_sel = copy_for_rows(&rows_lines, &raw, s, pane, path, f.old_path.as_deref()).map(|c| (Centre::Diff, c));
+                self.copy_sel = copy_for_rows(&rows_lines, &raw, s, cols, tab, pane, path, f.old_path.as_deref()).map(|c| (Centre::Diff, c));
             }
         }
         if let Some(a) = act {
@@ -465,11 +494,14 @@ impl App {
         let max_cols = data.lines.iter().map(|l| cols(&l.text)).max().unwrap_or(1);
         let width = ui.available_width().max(gutter + 50.0 + max_cols as f32 * cw + 24.0);
         let now = crate::timefmt::now();
-        let mut press: Option<usize> = None;
-        let mut drag_to: Option<usize> = None;
+        let mut press: Option<(usize, usize)> = None;
+        let mut drag_to: Option<(usize, usize)> = None;
         let mut rclick: Option<usize> = None;
         let mut act: Option<CopyAct> = None;
+        let press_at = ui.input(|i| i.pointer.press_origin());
         let sel = self.blame.selected.map(|(a, b)| (a.min(b), a.max(b)));
+        let cur_sel = self.blame.selected.map(|(a, b)| RowSel { a, b });
+        let cur_cols = self.blame_cols;
         let mut prev_sha_row: Option<usize> = None;
         let mut gutter_click: Option<usize> = None;
         let out = area.show_rows(ui, row_h, n, |ui, range| {
@@ -483,7 +515,9 @@ impl App {
                 }
                 let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
                 let selected = sel.is_some_and(|(a, b)| i >= a && i <= b);
-                if selected {
+                let text_x = rect.min.x + gutter + 50.0;
+                let span = cur_sel.filter(|s| is_char_sel(*s, cur_cols)).map(|s| char_span(s, cur_cols, i));
+                if selected && span.is_none() {
                     p.rect_filled(rect, 0.0, th.selection());
                 } else if resp.hovered() {
                     p.rect_filled(rect, 0.0, th.hover());
@@ -505,14 +539,21 @@ impl App {
                 p.text(pos2(rect.min.x + gutter + 40.0, rect.center().y), egui::Align2::RIGHT_CENTER, l.line_no.to_string(), mono.clone(), th.muted());
                 let job = line_job(&th, &l.text, &data.spans[i], &mono);
                 let g = ui.fonts(|f| f.layout_job(job));
-                p.galley(pos2(rect.min.x + gutter + 50.0, rect.center().y - g.size().y / 2.0), g, th.fg());
+                if let Some(Some((a, b))) = span {
+                    paint_char_sel(&p, &th, &g, &l.text, a, b, pos2(text_x, rect.min.y), rect);
+                }
+                p.galley(pos2(text_x, rect.center().y - g.size().y / 2.0), g, th.fg());
                 if resp.clicked() && resp.interact_pointer_pos().is_some_and(|pp| pp.x < rect.min.x + gutter) {
                     gutter_click = Some(i);
                 }
                 if resp.clicked() || resp.drag_started() {
-                    press = Some(i);
+                    let x = press_at.or(resp.interact_pointer_pos()).map_or(0.0, |pp| pp.x);
+                    press = Some((i, col_at(ui, &th, &l.text, &mono, x - text_x)));
                 } else if resp.dragged() {
-                    drag_to = resp.interact_pointer_pos().map(|pp| (range.start + ((pp.y - first_top) / row_h).floor().max(0.0) as usize).min(n - 1));
+                    drag_to = resp.interact_pointer_pos().map(|pp| {
+                        let j = (range.start + ((pp.y - first_top) / row_h).floor().max(0.0) as usize).min(n - 1);
+                        (j, col_at(ui, &th, &data.lines[j].text, &mono, pp.x - text_x))
+                    });
                 } else if resp.secondary_clicked() && !selected {
                     rclick = Some(i);
                 }
@@ -536,32 +577,41 @@ impl App {
         }
         let shift = ui.input(|i| i.modifiers.shift);
         let new = match (press, drag_to, rclick) {
-            (Some(i), _, _) => Some(match (shift, self.blame.selected) {
-                (true, Some((a, _))) => (a, i),
-                _ => (i, i),
+            (Some((i, c)), _, _) => Some(match (shift, self.blame.selected) {
+                (true, Some((a, _))) => ((a, i), (cur_cols.0, c)),
+                _ => ((i, i), (c, c)),
             }),
-            (None, Some(j), _) => self.blame.selected.map(|(a, _)| (a, j)),
-            (None, None, Some(i)) => Some((i, i)),
+            (None, Some((j, c)), _) => self.blame.selected.map(|(a, _)| ((a, j), (cur_cols.0, c))),
+            (None, None, Some(i)) => Some(((i, i), (0, 0))),
             _ => None,
         };
-        let lines_of = |(a, b): (usize, usize)| {
+        let lines_of = |(a, b): (usize, usize), c: crate::selection::Cols| {
             let (lo, hi) = (a.min(b), a.max(b));
-            let text = data.lines[lo..=hi].iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+            let text = sel_text((lo..=hi).map(|k| (k, data.lines[k].text.as_str())), RowSel { a, b }, c, None);
             (data.lines[lo].line_no, data.lines[hi].line_no, text)
         };
-        if let Some(s) = new.filter(|s| Some(*s) != self.blame.selected) {
-            self.blame.selected = Some(s);
-            let (ln_lo, ln_hi, text) = lines_of(s);
-            let at = match &self.blame.rev {
-                Some(r) => RefAt::Commit(r.clone()),
-                None => RefAt::Worktree,
-            };
-            let cr = code_ref_for_lines(&self.blame.path.clone(), ln_lo, ln_hi, &at);
-            self.set_selection(cr, SelSource::Blame, text);
+        let mut cols_changed = false;
+        if let Some((s, c)) = new {
+            cols_changed = c != self.blame_cols;
+            self.blame_cols = c;
+            if Some(s) != self.blame.selected {
+                self.blame.selected = Some(s);
+                let (ln_lo, ln_hi, text) = lines_of(s, c);
+                let at = match &self.blame.rev {
+                    Some(r) => RefAt::Commit(r.clone()),
+                    None => RefAt::Worktree,
+                };
+                let cr = code_ref_for_lines(&self.blame.path.clone(), ln_lo, ln_hi, &at);
+                self.set_selection(cr, SelSource::Blame, text);
+                cols_changed = true;
+            }
+            if cols_changed {
+                ui.ctx().request_repaint();
+            }
         }
-        // The highlighted lines stay what Ctrl+C copies, also after a selection in another view.
-        if let Some(s) = self.blame.selected.filter(|_| !matches!(self.copy_sel, Some((Centre::Blame, _)))) {
-            let (start, end, text) = lines_of(s);
+        // The highlighted text stays what Ctrl+C copies, also after a selection in another view.
+        if let Some(s) = self.blame.selected.filter(|_| cols_changed || !matches!(self.copy_sel, Some((Centre::Blame, _)))) {
+            let (start, end, text) = lines_of(s, self.blame_cols);
             self.copy_sel = Some((Centre::Blame, CopySel { path: self.blame.path.clone(), start, end, text }));
         }
         if let Some(a) = act {
@@ -1497,7 +1547,7 @@ fn kind_colors(th: &Theme, k: LineKind) -> (Option<Color32>, Color32) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn paint_text_cell(ui: &Ui, painter: &egui::Painter, th: &Theme, model: &DiffModel, i: usize, origin: egui::Pos2, row: Rect, mono: &FontId) {
+fn paint_text_cell(ui: &Ui, painter: &egui::Painter, th: &Theme, model: &DiffModel, i: usize, origin: egui::Pos2, row: Rect, mono: &FontId, chars: Option<(usize, usize)>) {
     let l = &model.lines[i];
     let (_, word) = kind_colors(th, l.kind);
     let g = ui.fonts(|f| f.layout_job(line_job(th, &l.text, &l.spans, mono)));
@@ -1506,13 +1556,47 @@ fn paint_text_cell(ui: &Ui, painter: &egui::Painter, th: &Theme, model: &DiffMod
         let (x0, x1) = (x_of(&g, &l.text, *s), x_of(&g, &l.text, *e));
         painter.rect_filled(Rect::from_min_max(pos2(origin.x + x0, row.min.y + 1.0), pos2(origin.x + x1.max(x0 + 2.0), row.max.y - 1.0)), 2.0, word);
     }
+    if let Some((a, b)) = chars {
+        paint_char_sel(painter, th, &g, &l.text, a, b, origin, row);
+    }
     painter.galley(pos2(origin.x, y), g, th.fg());
 }
 
+/// Row highlight of a diff line: whole row, or chars `[a, b)` (`b == usize::MAX` = line end).
+#[derive(Clone, Copy)]
+enum Hl {
+    Row,
+    Chars(usize, usize),
+}
+
+/// Selection box behind chars `[a, b)` of `text` laid out as `g` at `origin.x`.
 #[allow(clippy::too_many_arguments)]
-fn paint_unified(ui: &Ui, painter: &egui::Painter, th: &Theme, model: &DiffModel, i: usize, rect: Rect, num_w: f32, cw: f32, mono: &FontId, selected: bool) {
+fn paint_char_sel(painter: &egui::Painter, th: &Theme, g: &egui::Galley, text: &str, a: usize, b: usize, origin: egui::Pos2, row: Rect) {
+    let n = text.chars().count();
+    let x = |k: usize| g.pos_from_ccursor(CCursor::new(k)).min.x;
+    let x0 = x(a.min(n));
+    // Selection running past the line end shows a little tail, like a text editor.
+    let x1 = if b > n { g.size().x + 6.0 } else { x(b) };
+    if x1 > x0 {
+        painter.rect_filled(Rect::from_min_max(pos2(origin.x + x0, row.min.y), pos2(origin.x + x1, row.max.y)), 0.0, th.selection());
+    }
+}
+
+/// Char index of `text` nearest to `dx` pixels from its left edge.
+fn col_at(ui: &Ui, _th: &Theme, text: &str, mono: &FontId, dx: f32) -> usize {
+    let g = ui.fonts(|f| f.layout_no_wrap(text.to_string(), mono.clone(), Color32::WHITE));
+    g.cursor_from_pos(vec2(dx.max(0.0), 0.0)).ccursor.index
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_unified(ui: &Ui, painter: &egui::Painter, th: &Theme, model: &DiffModel, i: usize, rect: Rect, num_w: f32, cw: f32, mono: &FontId, hl: Option<Hl>) {
     let _ = cw;
     let l = &model.lines[i];
+    let selected = matches!(hl, Some(Hl::Row));
+    let chars = match hl {
+        Some(Hl::Chars(a, b)) => Some((a, b)),
+        _ => None,
+    };
     if let (Some(bg), _) = kind_colors(th, l.kind) {
         painter.rect_filled(rect, 0.0, bg);
     }
@@ -1549,14 +1633,14 @@ fn paint_unified(ui: &Ui, painter: &egui::Painter, th: &Theme, model: &DiffModel
     painter.text(pos2(gx + 2.0 * num_w + 4.0, rect.center().y), egui::Align2::LEFT_CENTER, marker, mono.clone(), mcol);
     let text_x = rect.min.x + 2.0 * num_w + 18.0;
     let clip = Rect::from_min_max(pos2(gx + 2.0 * num_w + 18.0, rect.min.y), rect.max).intersect(painter.clip_rect());
-    paint_text_cell(ui, &painter.with_clip_rect(clip), th, model, i, pos2(text_x, rect.min.y), rect, mono);
+    paint_text_cell(ui, &painter.with_clip_rect(clip), th, model, i, pos2(text_x, rect.min.y), rect, mono, chars);
     if l.no_newline {
         painter.text(pos2(rect.max.x - 8.0, rect.center().y), egui::Align2::RIGHT_CENTER, "no newline at end of file", widgets::small_font(th), th.muted());
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn paint_cell(ui: &Ui, painter: &egui::Painter, th: &Theme, model: &DiffModel, idx: Option<usize>, rect: Rect, num_w: f32, cw: f32, mono: &FontId, left: bool, in_sel: impl Fn(usize) -> bool) {
+fn paint_cell(ui: &Ui, painter: &egui::Painter, th: &Theme, model: &DiffModel, idx: Option<usize>, rect: Rect, num_w: f32, cw: f32, mono: &FontId, left: bool, hl: impl Fn(usize) -> Option<Hl>) {
     let _ = cw;
     let Some(i) = idx else {
         painter.rect_filled(rect, 0.0, th.sunken());
@@ -1566,9 +1650,14 @@ fn paint_cell(ui: &Ui, painter: &egui::Painter, th: &Theme, model: &DiffModel, i
     if let (Some(bg), _) = kind_colors(th, l.kind) {
         painter.rect_filled(rect, 0.0, bg);
     }
-    if in_sel(i) {
+    let h = hl(i);
+    if matches!(h, Some(Hl::Row)) {
         painter.rect_filled(rect, 0.0, th.selection());
     }
+    let chars = match h {
+        Some(Hl::Chars(a, b)) => Some((a, b)),
+        _ => None,
+    };
     let n = if left { l.old_no } else { l.new_no };
     painter.rect_filled(Rect::from_min_size(rect.min, vec2(num_w, rect.height())), 0.0, crate::theme::mix(th.sunken(), kind_colors(th, l.kind).0.unwrap_or(th.sunken()), 0.8));
     if let Some(n) = n {
@@ -1576,7 +1665,7 @@ fn paint_cell(ui: &Ui, painter: &egui::Painter, th: &Theme, model: &DiffModel, i
     }
     let text_rect = Rect::from_min_max(pos2(rect.min.x + num_w + 8.0, rect.min.y), rect.max);
     let p = painter.with_clip_rect(text_rect.intersect(painter.clip_rect()));
-    paint_text_cell(ui, &p, th, model, i, text_rect.min, rect, mono);
+    paint_text_cell(ui, &p, th, model, i, text_rect.min, rect, mono, chars);
 }
 
 // ---------------------------------------------------------------- copy menu

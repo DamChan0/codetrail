@@ -74,10 +74,62 @@ pub struct CopySel {
     pub text: String,
 }
 
-/// The lines of `sel` shown in `pane`, joined without numbers or markers (`texts[i]` is row i's
-/// raw text). Old pane: old-side numbers and `old_path`; new and unified panes: new-side numbers,
-/// old side only when nothing on the new side is selected.
-pub fn copy_for_rows(rows: &[RowLines], texts: &[&str], sel: RowSel, pane: Pane, path: &str, old_path: Option<&str>) -> Option<CopySel> {
+/// Character columns of a selection: `(anchor, head)` in the anchor line `sel.a` and head line
+/// `sel.b`. Equal columns on one line = a plain line selection (click), which copies whole lines.
+pub type Cols = (usize, usize);
+
+/// True when `sel` + `cols` covers characters rather than whole lines.
+pub fn is_char_sel(sel: RowSel, cols: Cols) -> bool {
+    !(sel.a == sel.b && cols.0 == cols.1)
+}
+
+/// Char range `[start, end)` of line `i` inside a character selection (either drag direction);
+/// `end == usize::MAX` = to the end of the line.
+pub fn char_span(sel: RowSel, cols: Cols, i: usize) -> Option<(usize, usize)> {
+    let ((l0, c0), (l1, c1)) = if (sel.a, cols.0) <= (sel.b, cols.1) { ((sel.a, cols.0), (sel.b, cols.1)) } else { ((sel.b, cols.1), (sel.a, cols.0)) };
+    if i < l0 || i > l1 {
+        return None;
+    }
+    Some((if i == l0 { c0 } else { 0 }, if i == l1 { c1 } else { usize::MAX }))
+}
+
+/// Char index in `raw` of display column `d` of its tab-expanded text (see `expand_tabs`).
+fn raw_col(raw: &str, tab: usize, d: usize) -> usize {
+    let (mut width, mut disp) = (0usize, 0usize);
+    for (k, ch) in raw.chars().enumerate() {
+        if disp >= d {
+            return k;
+        }
+        let n = if ch == '\t' { tab.max(1) - width % tab.max(1) } else { 1 };
+        width += if ch == '\t' { n } else { crate::diffmodel::cell_width(ch) };
+        disp += n;
+    }
+    usize::MAX
+}
+
+/// The selected text of `lines` (`(row index, raw text)` in order): partial first / last line for
+/// a character selection, whole lines otherwise. `tab`: columns are in tab-expanded display text.
+pub fn sel_text<'a>(lines: impl Iterator<Item = (usize, &'a str)>, sel: RowSel, cols: Cols, tab: Option<usize>) -> String {
+    let chars = is_char_sel(sel, cols);
+    let mut out: Vec<String> = Vec::new();
+    for (i, raw) in lines {
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        let Some((s, e)) = (if chars { char_span(sel, cols, i) } else { Some((0, usize::MAX)) }) else { continue };
+        let (s, e) = match tab {
+            Some(t) => (raw_col(raw, t, s), if e == usize::MAX { e } else { raw_col(raw, t, e) }),
+            None => (s, e),
+        };
+        out.push(raw.chars().skip(s).take(e.saturating_sub(s)).collect());
+    }
+    out.join("\n")
+}
+
+/// The selection of `sel` / `cols` shown in `pane`, without numbers or markers (`texts[i]` is row
+/// i's raw text, columns are in the `tab`-expanded display text). Old pane: old-side numbers and
+/// `old_path`; new and unified panes: new-side numbers, old side only when nothing on the new side
+/// is selected.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_for_rows(rows: &[RowLines], texts: &[&str], sel: RowSel, cols: Cols, tab: usize, pane: Pane, path: &str, old_path: Option<&str>) -> Option<CopySel> {
     let hi = sel.hi().min(rows.len().checked_sub(1)?);
     let idx: Vec<usize> = (sel.lo()..=hi)
         .filter(|&i| match pane {
@@ -94,7 +146,7 @@ pub fn copy_for_rows(rows: &[RowLines], texts: &[&str], sel: RowSel, pane: Pane,
         Pane::Old => (true, span(true)?),
         _ => span(false).map(|s| (false, s)).or_else(|| span(true).map(|s| (true, s)))?,
     };
-    let text = idx.iter().map(|&i| texts[i].strip_suffix('\r').unwrap_or(texts[i])).collect::<Vec<_>>().join("\n");
+    let text = sel_text(idx.iter().map(|&i| (i, texts[i])), sel, cols, Some(tab));
     Some(CopySel { path: if old { old_path.unwrap_or(path) } else { path }.to_string(), start, end, text })
 }
 
@@ -174,21 +226,44 @@ mod tests {
 
     const TEXTS: [&str; 7] = ["ctx9", "old10", "old11\r", "new10", "new11", "new12", "ctx13"];
 
+    const ALL: Cols = (0, usize::MAX);
+
     #[test]
     fn pane_copy_keeps_only_that_side_and_its_numbers() {
-        let old = copy_for_rows(&rows(), &TEXTS, RowSel { a: 0, b: 2 }, Pane::Old, "new.rs", Some("old.rs")).unwrap();
+        let old = copy_for_rows(&rows(), &TEXTS, RowSel { a: 0, b: 2 }, ALL, 4, Pane::Old, "new.rs", Some("old.rs")).unwrap();
         assert_eq!(old, CopySel { path: "old.rs".into(), start: 9, end: 11, text: "ctx9\nold10\nold11".into() });
-        let new = copy_for_rows(&rows(), &TEXTS, RowSel { a: 6, b: 0 }, Pane::New, "new.rs", Some("old.rs")).unwrap();
+        let new = copy_for_rows(&rows(), &TEXTS, RowSel { a: 6, b: 0 }, (usize::MAX, 0), 4, Pane::New, "new.rs", Some("old.rs")).unwrap();
         assert_eq!(new, CopySel { path: "new.rs".into(), start: 9, end: 13, text: "ctx9\nnew10\nnew11\nnew12\nctx13".into() });
     }
 
     #[test]
     fn unified_copy_takes_every_line_and_falls_back_to_old_numbers() {
-        let u = copy_for_rows(&rows(), &TEXTS, RowSel { a: 1, b: 3 }, Pane::Unified, "a", None).unwrap();
+        let u = copy_for_rows(&rows(), &TEXTS, RowSel { a: 1, b: 3 }, ALL, 4, Pane::Unified, "a", None).unwrap();
         assert_eq!((u.start, u.end, u.text.as_str()), (10, 10, "old10\nold11\nnew10"));
-        let d = copy_for_rows(&rows(), &TEXTS, RowSel { a: 1, b: 2 }, Pane::Unified, "a", None).unwrap();
+        let d = copy_for_rows(&rows(), &TEXTS, RowSel { a: 1, b: 2 }, ALL, 4, Pane::Unified, "a", None).unwrap();
         assert_eq!((d.start, d.end), (10, 11));
-        assert!(copy_for_rows(&rows(), &TEXTS, RowSel { a: 3, b: 5 }, Pane::Old, "a", None).is_none(), "added lines have no old side");
+        assert!(copy_for_rows(&rows(), &TEXTS, RowSel { a: 3, b: 5 }, ALL, 4, Pane::Old, "a", None).is_none(), "added lines have no old side");
+    }
+
+    #[test]
+    fn character_selection_copies_only_the_dragged_text() {
+        // within one line, either drag direction
+        let one = copy_for_rows(&rows(), &TEXTS, RowSel { a: 3, b: 3 }, (4, 1), 4, Pane::New, "a", None).unwrap();
+        assert_eq!((one.start, one.end, one.text.as_str()), (10, 10, "ew1"));
+        // partial first and last line, the old line in between is not on the new pane
+        let multi = copy_for_rows(&rows(), &TEXTS, RowSel { a: 0, b: 4 }, (2, 3), 4, Pane::New, "a", None).unwrap();
+        assert_eq!((multi.start, multi.end, multi.text.as_str()), (9, 11, "x9\nnew10\nnew"));
+        // a click (no drag) copies the whole line
+        let click = copy_for_rows(&rows(), &TEXTS, RowSel::single(5), (2, 2), 4, Pane::New, "a", None).unwrap();
+        assert_eq!(click.text, "new12");
+    }
+
+    #[test]
+    fn display_columns_map_back_through_tabs() {
+        // "\tab" shows as "    ab": display cols 4..6 are "ab"; a column inside the tab snaps after it
+        assert_eq!(sel_text([(0, "\tab")].into_iter(), RowSel::single(0), (4, 6), Some(4)), "ab");
+        assert_eq!(sel_text([(0, "\tab")].into_iter(), RowSel::single(0), (0, 5), Some(4)), "\ta");
+        assert_eq!(sel_text([(0, "한b")].into_iter(), RowSel::single(0), (1, 2), None), "b");
     }
 
     #[test]
