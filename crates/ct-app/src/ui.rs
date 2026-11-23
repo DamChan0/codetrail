@@ -16,6 +16,7 @@ pub enum Cmd {
     ToggleEdit,
     Save,
     CopyRef,
+    CopyPathLine,
     AskAi,
     ToggleSplit,
     Settings,
@@ -30,7 +31,7 @@ pub enum Cmd {
     ShowRuns,
 }
 
-pub const COMMANDS: [(Cmd, &str, &str); 19] = [
+pub const COMMANDS: [(Cmd, &str, &str); 20] = [
     (Cmd::OpenProject, "Switch project", "Ctrl+O"),
     (Cmd::PickFile, "Go to file", "Ctrl+P"),
     (Cmd::SearchPanel, "Search in files", "Ctrl+Shift+F"),
@@ -43,6 +44,7 @@ pub const COMMANDS: [(Cmd, &str, &str); 19] = [
     (Cmd::ToggleEdit, "Toggle editor", "Ctrl+E"),
     (Cmd::Save, "Save file", "Ctrl+S"),
     (Cmd::CopyRef, "Copy code reference", "Ctrl+Shift+C"),
+    (Cmd::CopyPathLine, "Copy absolute path:line", "Ctrl+Alt+C"),
     (Cmd::AskAi, "Ask AI about selection", "Ctrl+L"),
     (Cmd::ToggleSplit, "Toggle unified / side-by-side", ""),
     (Cmd::GotoLine, "Go to line", "Ctrl+G"),
@@ -311,6 +313,7 @@ impl App {
                 }
             }
             Cmd::CopyRef => self.copy_ref(),
+            Cmd::CopyPathLine => self.copy_path_line(),
             Cmd::AskAi => self.start_ask(),
             Cmd::ToggleSplit => {
                 self.settings.split_view = !self.settings.split_view;
@@ -337,6 +340,16 @@ impl App {
 
     pub(crate) fn shortcuts(&mut self, ctx: &egui::Context) {
         let mut cmds: Vec<Cmd> = Vec::new();
+        // egui-winit turns Ctrl+C with Shift/Alt into a bare Copy event, never a C key: give those
+        // chords their key back so they can be bound (and recorded on the Shortcuts page).
+        ctx.input_mut(|i| {
+            let m = i.modifiers;
+            for e in i.events.iter_mut().filter(|e| matches!(e, egui::Event::Copy)) {
+                if m.shift || m.alt {
+                    *e = egui::Event::Key { key: Key::C, physical_key: None, pressed: true, repeat: false, modifiers: m };
+                }
+            }
+        });
         if self.key_capture.is_some() {
             if self.settings_open && self.settings_section == crate::settingspage::Section::Shortcuts {
                 // the Shortcuts page is recording a key: nothing fires
@@ -358,6 +371,10 @@ impl App {
         }
         if typing || self.palette.open.is_some() {
             return;
+        }
+        // Ctrl+C over the diff / blame view copies the selected code.
+        if !self.settings_open && self.rail != RailTab::Prs && matches!(self.centre, Centre::Diff | Centre::Blame) && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) && self.copy_code() {
+            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Copy)));
         }
         let (next_h, prev_h, down, up, esc) = ctx.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::CloseBracket), i.consume_key(Modifiers::NONE, Key::OpenBracket), i.consume_key(Modifiers::NONE, Key::J), i.consume_key(Modifiers::NONE, Key::K), i.consume_key(Modifiers::NONE, Key::Escape)));
         if esc {

@@ -4,7 +4,7 @@ use crate::diffmodel::{DiffModel, LARGE_DIFF_LINES};
 use crate::editor::{self, Disk, FileStamp, Loaded, ReadOnly, SaveOutcome};
 use crate::highlight::{self, Span};
 use crate::jobs::{JobCtx, JobId, JobKind, Jobs};
-use crate::selection::{at_commit, RowSel};
+use crate::selection::{at_commit, path_line, CopySel, Pane, RowSel};
 use crate::settings::{Settings, ViewMode};
 use crate::theme::{Theme, ThemeFile};
 use ct_agent::ask as agent_ask;
@@ -457,6 +457,10 @@ pub struct App {
     pub show_large: bool,
     pub diff_sel: Option<RowSel>,
     pub diff_anchor: Option<usize>,
+    /// Diff column the current row selection was made in.
+    pub diff_pane: Pane,
+    /// Code and `path:line` source of the last diff / blame selection, with the view it came from.
+    pub copy_sel: Option<(Centre, CopySel)>,
     pub diff_scroll_to: Option<usize>,
     pub diff_top_row: usize,
     pub cmp_gen: u64,
@@ -566,6 +570,8 @@ impl App {
             show_large: false,
             diff_sel: None,
             diff_anchor: None,
+            diff_pane: Pane::New,
+            copy_sel: None,
             diff_scroll_to: None,
             diff_top_row: 0,
             cmp_gen: 0,
@@ -859,6 +865,7 @@ impl App {
         self.show_large = false;
         self.diff_sel = None;
         self.diff_anchor = None;
+        self.copy_sel = None;
         self.wt.quiet_gen = 0;
         self.request_file_diff();
         self.tt_discard();
@@ -999,10 +1006,12 @@ impl App {
         self.selection = None;
         self.diff_sel = None;
         self.diff_anchor = None;
+        self.copy_sel = None;
         self.why.clear();
     }
 
     pub fn set_selection(&mut self, code_ref: CodeRef, source: SelSource, text: String) {
+        self.copy_sel = None;
         self.why = self.compute_why(&code_ref, source);
         self.selection = Some(Sel { code_ref, source, text });
         if self.ask.for_ref.as_deref() != self.selection.as_ref().map(|s| s.code_ref.to_string()).as_deref() && !matches!(self.ask.phase, AskPhase::Running | AskPhase::Building | AskPhase::Preview(_)) {
@@ -1070,6 +1079,59 @@ impl App {
         } else {
             self.flash("Select lines first (click a line, shift-click to extend).");
         }
+    }
+
+    /// Repo-relative path of the file in the main pane.
+    pub fn view_path(&self) -> Option<String> {
+        match self.centre {
+            Centre::Editor => self.editor.as_ref().map(|e| e.path.clone()),
+            Centre::Blame => Some(self.blame.path.clone()).filter(|p| !p.is_empty()),
+            Centre::Diff | Centre::Run => self.file_sel.clone(),
+        }
+    }
+
+    /// Working-tree root joined with `rel` (the remote absolute path for ssh projects).
+    fn abs_path(&self, rel: &str) -> String {
+        match &self.repo {
+            Some(r) => r.root.join(rel).to_string_lossy().into_owned(),
+            None => rel.to_string(),
+        }
+    }
+
+    fn copy_flash(&mut self, text: String, what: &str) {
+        self.ctx.copy_text(text);
+        self.flash(format!("Copied {what}"));
+    }
+
+    fn view_copy_sel(&self) -> Option<&CopySel> {
+        self.copy_sel.as_ref().filter(|(c, _)| *c == self.centre).map(|(_, s)| s)
+    }
+
+    /// Ctrl+C in the diff / blame view: the selected code without line numbers or diff markers.
+    /// Returns false when nothing there is selected.
+    pub fn copy_code(&mut self) -> bool {
+        let Some(s) = self.view_copy_sel() else { return false };
+        let n = s.text.lines().count().max(1);
+        let text = s.text.clone();
+        self.copy_flash(text, &format!("{n} line{}", if n == 1 { "" } else { "s" }));
+        true
+    }
+
+    /// Absolute `path:line` (`path:start-end`) of the selected lines; the absolute file path
+    /// when no line is selected.
+    pub fn copy_path_line(&mut self) {
+        let text = match (self.view_copy_sel(), self.view_path()) {
+            (Some(s), _) => path_line(&self.abs_path(&s.path), s.start, s.end),
+            (None, Some(p)) => self.abs_path(&p),
+            (None, None) => return self.flash("No file to copy the path of."),
+        };
+        self.copy_flash(text.clone(), &text);
+    }
+
+    pub fn copy_file_path(&mut self, absolute: bool) {
+        let Some(p) = self.view_path() else { return self.flash("No file to copy the path of.") };
+        let text = if absolute { self.abs_path(&p) } else { p };
+        self.copy_flash(text.clone(), &text);
     }
 
     // ------------------------------------------------------------ search / files
@@ -1278,6 +1340,7 @@ impl App {
             return;
         }
         self.blame = BlameState { path: path.to_string(), rev: at.clone(), data: Loadable::Loading, selected: None, scroll_to: line, scroll_y: 0.0, apply_y: None };
+        self.copy_sel = None;
         let p = path.to_string();
         let timeout = self.git_timeout();
         self.jobs.spawn(JobKind::Blame, move |c| {

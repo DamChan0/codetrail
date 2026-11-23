@@ -550,6 +550,7 @@ impl App {
         widgets::heading(ui, &th, "Fixed");
         let rows = [
             ("Zoom in / out / reset", "Ctrl+Plus / Ctrl+Minus / Ctrl+0"),
+            ("Copy selected diff / blame lines as code", "Ctrl+C"),
             ("Next / previous hunk", "] / ["),
             ("Next / previous commit", "J / K"),
             ("History: step entries (Blame, Follow)", "↑ / ↓"),

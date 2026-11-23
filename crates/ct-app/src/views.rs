@@ -5,7 +5,7 @@ use crate::diffmodel::{cols, DiffModel, SplitRow, UnifiedRow};
 use crate::editor::ReadOnly;
 use crate::highlight::{self, Span};
 use crate::settings::ViewMode;
-use crate::selection::{code_ref_for_lines, code_ref_for_rows, RowSel};
+use crate::selection::{code_ref_for_lines, code_ref_for_rows, copy_for_rows, CopySel, Pane, RowSel};
 use crate::theme::Theme;
 use crate::widgets::{self, Btn, BtnKind, Icon, Level};
 use ct_core::{LineKind, RefAt};
@@ -127,16 +127,20 @@ impl App {
             ui.set_height(m.control_height);
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = m.space[1];
-                let name = match self.centre {
-                    Centre::Editor => self.editor.as_ref().map(|e| e.path.clone()),
-                    Centre::Blame => Some(self.blame.path.clone()).filter(|p| !p.is_empty()),
-                    Centre::Diff | Centre::Run => self.file_sel.clone(),
-                };
-                let w = (ui.available_width() - 330.0).max(80.0);
+                let name = self.view_path();
+                let w = (ui.available_width() - 360.0).max(80.0);
                 match &name {
                     Some(n) => {
                         let g = widgets::fit(ui, n, widgets::ui_font(&th), th.fg(), w);
-                        ui.label(g);
+                        let label = ui.add(egui::Label::new(g).sense(Sense::click()));
+                        let btn = widgets::icon_button(ui, &th, Icon::Copy, "Copy absolute path (right-click for more)");
+                        let mut act = btn.clicked().then_some(CopyAct::AbsPath);
+                        for r in [&label, &btn] {
+                            r.context_menu(|ui| copy_menu(ui, &mut act, &[CopyAct::AbsPath, CopyAct::RelPath, CopyAct::PathLine]));
+                        }
+                        if let Some(a) = act {
+                            self.run_copy(a);
+                        }
                         if let Some(e) = &self.editor {
                             if self.centre == Centre::Editor && e.dirty() {
                                 widgets::badge(ui, &th, "modified", th.warn());
@@ -282,9 +286,17 @@ impl App {
         let mut top_row = self.diff_top_row;
         let shift = ui.input(|i| i.modifiers.shift);
         let sel_now = self.diff_sel;
-        let line_of = |r: usize| -> Option<usize> {
+        let mut pane = match (split, self.diff_pane) {
+            (false, _) => Pane::Unified,
+            (true, Pane::Unified) => Pane::New,
+            (true, p) => p,
+        };
+        let pane_now = pane;
+        let mut act: Option<CopyAct> = None;
+        let line_of = |r: usize, pane: Pane| -> Option<usize> {
             if split {
                 match model.split[r] {
+                    SplitRow::Pair(l, rr) if pane == Pane::Old => l.or(rr),
                     SplitRow::Pair(l, rr) => rr.or(l),
                     SplitRow::Hunk(_) => None,
                 }
@@ -325,31 +337,55 @@ impl App {
                     let rr = range.start + ((pos.y - first_top) / row_h).floor().max(0.0) as usize;
                     Some(rr.min(n_rows - 1))
                 };
+                // Split view: the half under the pointer is the pane the selection copies from.
+                let pane_at = |resp: &egui::Response| match resp.interact_pointer_pos() {
+                    Some(pp) if split => {
+                        if pp.x < rect.min.x + (rect.width() / 2.0).floor() {
+                            Pane::Old
+                        } else {
+                            Pane::New
+                        }
+                    }
+                    _ => pane,
+                };
                 if resp.clicked() || resp.drag_started() {
-                    if let Some(i) = line_of(r) {
+                    let pn = pane_at(&resp);
+                    if let Some(i) = line_of(r, pn) {
                         match (shift, anchor) {
-                            (true, Some(a)) => new_sel = Some(RowSel { a, b: i }),
+                            (true, Some(a)) if pn == pane => new_sel = Some(RowSel { a, b: i }),
                             _ => {
                                 anchor = Some(i);
                                 new_sel = Some(RowSel::single(i));
                             }
                         }
+                        pane = pn;
                     }
                 } else if resp.dragged() {
                     if let (Some(a), Some(pr)) = (anchor, pointer_row(&resp)) {
-                        if let Some(i) = line_of(pr) {
+                        if let Some(i) = line_of(pr, pane) {
                             new_sel = Some(RowSel { a, b: i });
                         }
                     }
+                } else if resp.secondary_clicked() {
+                    // Right-click outside the selection selects that line first.
+                    let pn = pane_at(&resp);
+                    if let Some(i) = line_of(r, pn) {
+                        if pn != pane || !new_sel.is_some_and(|s| s.contains(i)) {
+                            anchor = Some(i);
+                            new_sel = Some(RowSel::single(i));
+                            pane = pn;
+                        }
+                    }
                 }
-                let in_sel = |i: usize| sel_now.is_some_and(|s| s.contains(i)) || new_sel.is_some_and(|s| s.contains(i));
+                resp.context_menu(|ui| copy_menu(ui, &mut act, &[CopyAct::Code, CopyAct::PathLine, CopyAct::AbsPath]));
+                let in_sel = |i: usize| (pane_now == pane && sel_now.is_some_and(|s| s.contains(i))) || new_sel.is_some_and(|s| s.contains(i));
                 if split {
                     if let SplitRow::Pair(l, rr) = model.split[r] {
                         let half = (rect.width() / 2.0).floor();
                         let lrect = Rect::from_min_size(rect.min, vec2(half, row_h));
                         let rrect = Rect::from_min_size(pos2(rect.min.x + half, rect.min.y), vec2(rect.width() - half, row_h));
-                        paint_cell(ui, &painter, th, model, l, lrect, num_w, cw, &mono, true, in_sel);
-                        paint_cell(ui, &painter, th, model, rr, rrect, num_w, cw, &mono, false, in_sel);
+                        paint_cell(ui, &painter, th, model, l, lrect, num_w, cw, &mono, true, |i| pane == Pane::Old && in_sel(i));
+                        paint_cell(ui, &painter, th, model, rr, rrect, num_w, cw, &mono, false, |i| pane == Pane::New && in_sel(i));
                         painter.line_segment([rrect.left_top(), rrect.left_bottom()], egui::Stroke::new(1.0, th.border()));
                     }
                 } else if let UnifiedRow::Line(i) = model.unified[r] {
@@ -359,9 +395,11 @@ impl App {
         });
         self.diff_top_row = top_row;
         self.diff_anchor = anchor;
-        if new_sel != self.diff_sel {
+        let changed = new_sel != self.diff_sel || pane != self.diff_pane;
+        if changed {
             self.diff_sel = new_sel;
-            if let (Some(s), Some(cur), Some(path)) = (new_sel, self.cur.clone(), self.file_sel.clone()) {
+            self.diff_pane = pane;
+            if let (Some(s), Some(path), Some(cur)) = (new_sel, self.file_sel.clone(), self.cur.clone()) {
                 let hi = s.hi().min(model.lines.len().saturating_sub(1));
                 let lo = s.lo().min(hi);
                 let new_at = cur.new_at.clone().unwrap_or(RefAt::Worktree);
@@ -370,6 +408,16 @@ impl App {
                     self.set_selection(cr, SelSource::Diff, text);
                 }
             }
+        }
+        // The highlighted rows stay what Ctrl+C copies, also after a selection in another view.
+        if changed || !matches!(self.copy_sel, Some((Centre::Diff, _))) {
+            if let (Some(s), Some(path)) = (new_sel, self.file_sel.as_deref()) {
+                let raw: Vec<&str> = f.hunks.iter().flat_map(|h| h.lines.iter().map(|l| l.text.as_str())).collect();
+                self.copy_sel = copy_for_rows(&rows_lines, &raw, s, pane, path, f.old_path.as_deref()).map(|c| (Centre::Diff, c));
+            }
+        }
+        if let Some(a) = act {
+            self.run_copy(a);
         }
     }
 
@@ -417,15 +465,19 @@ impl App {
         let max_cols = data.lines.iter().map(|l| cols(&l.text)).max().unwrap_or(1);
         let width = ui.available_width().max(gutter + 50.0 + max_cols as f32 * cw + 24.0);
         let now = crate::timefmt::now();
-        let mut click: Option<usize> = None;
+        let mut press: Option<usize> = None;
+        let mut drag_to: Option<usize> = None;
+        let mut rclick: Option<usize> = None;
+        let mut act: Option<CopyAct> = None;
         let sel = self.blame.selected.map(|(a, b)| (a.min(b), a.max(b)));
         let mut prev_sha_row: Option<usize> = None;
         let mut gutter_click: Option<usize> = None;
         let out = area.show_rows(ui, row_h, n, |ui, range| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            for i in range {
+            let first_top = ui.cursor().top();
+            for i in range.clone() {
                 let l = &data.lines[i];
-                let (rect, resp) = ui.allocate_exact_size(vec2(width, row_h), Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(vec2(width, row_h), Sense::click_and_drag());
                 if !ui.is_rect_visible(rect) {
                     continue;
                 }
@@ -454,12 +506,17 @@ impl App {
                 let job = line_job(&th, &l.text, &data.spans[i], &mono);
                 let g = ui.fonts(|f| f.layout_job(job));
                 p.galley(pos2(rect.min.x + gutter + 50.0, rect.center().y - g.size().y / 2.0), g, th.fg());
-                if resp.clicked() {
-                    if resp.interact_pointer_pos().is_some_and(|pp| pp.x < rect.min.x + gutter) {
-                        gutter_click = Some(i);
-                    }
-                    click = Some(i);
+                if resp.clicked() && resp.interact_pointer_pos().is_some_and(|pp| pp.x < rect.min.x + gutter) {
+                    gutter_click = Some(i);
                 }
+                if resp.clicked() || resp.drag_started() {
+                    press = Some(i);
+                } else if resp.dragged() {
+                    drag_to = resp.interact_pointer_pos().map(|pp| (range.start + ((pp.y - first_top) / row_h).floor().max(0.0) as usize).min(n - 1));
+                } else if resp.secondary_clicked() && !selected {
+                    rclick = Some(i);
+                }
+                resp.context_menu(|ui| copy_menu(ui, &mut act, &[CopyAct::Code, CopyAct::PathLine, CopyAct::AbsPath]));
             }
         });
         self.blame.scroll_y = out.state.offset.y;
@@ -477,22 +534,38 @@ impl App {
                 return;
             }
         }
-        if let Some(i) = click {
-            let shift = ui.input(|i| i.modifiers.shift);
-            let a = match (shift, self.blame.selected) {
-                (true, Some((a, _))) => a,
-                _ => i,
-            };
-            self.blame.selected = Some((a, i));
-            let (lo, hi) = (a.min(i), a.max(i));
-            let (ln_lo, ln_hi) = (data.lines[lo].line_no, data.lines[hi].line_no);
+        let shift = ui.input(|i| i.modifiers.shift);
+        let new = match (press, drag_to, rclick) {
+            (Some(i), _, _) => Some(match (shift, self.blame.selected) {
+                (true, Some((a, _))) => (a, i),
+                _ => (i, i),
+            }),
+            (None, Some(j), _) => self.blame.selected.map(|(a, _)| (a, j)),
+            (None, None, Some(i)) => Some((i, i)),
+            _ => None,
+        };
+        let lines_of = |(a, b): (usize, usize)| {
+            let (lo, hi) = (a.min(b), a.max(b));
             let text = data.lines[lo..=hi].iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+            (data.lines[lo].line_no, data.lines[hi].line_no, text)
+        };
+        if let Some(s) = new.filter(|s| Some(*s) != self.blame.selected) {
+            self.blame.selected = Some(s);
+            let (ln_lo, ln_hi, text) = lines_of(s);
             let at = match &self.blame.rev {
                 Some(r) => RefAt::Commit(r.clone()),
                 None => RefAt::Worktree,
             };
             let cr = code_ref_for_lines(&self.blame.path.clone(), ln_lo, ln_hi, &at);
             self.set_selection(cr, SelSource::Blame, text);
+        }
+        // The highlighted lines stay what Ctrl+C copies, also after a selection in another view.
+        if let Some(s) = self.blame.selected.filter(|_| !matches!(self.copy_sel, Some((Centre::Blame, _)))) {
+            let (start, end, text) = lines_of(s);
+            self.copy_sel = Some((Centre::Blame, CopySel { path: self.blame.path.clone(), start, end, text }));
+        }
+        if let Some(a) = act {
+            self.run_copy(a);
         }
     }
 
@@ -1504,4 +1577,45 @@ fn paint_cell(ui: &Ui, painter: &egui::Painter, th: &Theme, model: &DiffModel, i
     let text_rect = Rect::from_min_max(pos2(rect.min.x + num_w + 8.0, rect.min.y), rect.max);
     let p = painter.with_clip_rect(text_rect.intersect(painter.clip_rect()));
     paint_text_cell(ui, &p, th, model, i, text_rect.min, rect, mono);
+}
+
+// ---------------------------------------------------------------- copy menu
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyAct {
+    Code,
+    PathLine,
+    AbsPath,
+    RelPath,
+}
+
+/// Right-click menu of the code views and the file path bar.
+fn copy_menu(ui: &mut Ui, act: &mut Option<CopyAct>, items: &[CopyAct]) {
+    for &a in items {
+        let label = match a {
+            CopyAct::Code => "Copy",
+            CopyAct::PathLine => "Copy absolute path:line",
+            CopyAct::AbsPath => "Copy absolute path",
+            CopyAct::RelPath => "Copy relative path",
+        };
+        if ui.button(label).clicked() {
+            *act = Some(a);
+            ui.close_menu();
+        }
+    }
+}
+
+impl App {
+    fn run_copy(&mut self, a: CopyAct) {
+        match a {
+            CopyAct::Code => {
+                if !self.copy_code() {
+                    self.flash("Select lines first (click or drag over lines).");
+                }
+            }
+            CopyAct::PathLine => self.copy_path_line(),
+            CopyAct::AbsPath => self.copy_file_path(true),
+            CopyAct::RelPath => self.copy_file_path(false),
+        }
+    }
 }

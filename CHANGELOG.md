@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Copy code from the diff and blame views**: drag (or click / shift-click) over lines and press `Ctrl+C` to copy the code without line numbers or diff markers. In side by side, the pane you select in is the one copied (old lines on the left, new on the right).
+- **Copy absolute path:line**: `Ctrl+Alt+C`, a right-click on a code line, or the copy button beside the file path copies `/abs/path/file:12` (`:12-15` for several lines; old-side numbers on the left pane), or the file's absolute path when no line is selected. Remote projects use the remote path. The path bar menu also copies the repo-relative path.
+- **Ctrl+C chords with Shift / Alt** (`Ctrl+Shift+C` copy code reference, `Ctrl+Alt+C`) now reach the shortcut table and can be recorded on the Shortcuts page; the windowing layer delivered them only as a plain copy event.
+
 ## 0.5.4
 
 - **GitHub CLI setup**: PR authentication or permission errors offer sign-in / repository-scope refresh, also available in Settings > GitHub CLI.

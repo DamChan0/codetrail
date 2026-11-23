@@ -56,6 +56,57 @@ pub fn at_commit(sha: &str) -> RefAt {
     RefAt::Commit(sha[..sha.len().min(12)].to_ascii_lowercase())
 }
 
+/// Diff column a selection was made in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pane {
+    Old,
+    New,
+    Unified,
+}
+
+/// What Ctrl+C and "Copy path:line" take from a code view selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopySel {
+    pub path: String,
+    pub start: u32,
+    pub end: u32,
+    /// Code only: no line numbers or diff markers.
+    pub text: String,
+}
+
+/// The lines of `sel` shown in `pane`, joined without numbers or markers (`texts[i]` is row i's
+/// raw text). Old pane: old-side numbers and `old_path`; new and unified panes: new-side numbers,
+/// old side only when nothing on the new side is selected.
+pub fn copy_for_rows(rows: &[RowLines], texts: &[&str], sel: RowSel, pane: Pane, path: &str, old_path: Option<&str>) -> Option<CopySel> {
+    let hi = sel.hi().min(rows.len().checked_sub(1)?);
+    let idx: Vec<usize> = (sel.lo()..=hi)
+        .filter(|&i| match pane {
+            Pane::Old => rows[i].old_no.is_some(),
+            Pane::New => rows[i].new_no.is_some(),
+            Pane::Unified => true,
+        })
+        .collect();
+    let span = |old: bool| {
+        let n = idx.iter().filter_map(|&i| if old { rows[i].old_no } else { rows[i].new_no });
+        Some((n.clone().min()?, n.max()?))
+    };
+    let (old, (start, end)) = match pane {
+        Pane::Old => (true, span(true)?),
+        _ => span(false).map(|s| (false, s)).or_else(|| span(true).map(|s| (true, s)))?,
+    };
+    let text = idx.iter().map(|&i| texts[i].strip_suffix('\r').unwrap_or(texts[i])).collect::<Vec<_>>().join("\n");
+    Some(CopySel { path: if old { old_path.unwrap_or(path) } else { path }.to_string(), start, end, text })
+}
+
+/// `path:12`, or `path:12-15` for a range.
+pub fn path_line(path: &str, start: u32, end: u32) -> String {
+    if start == end {
+        format!("{path}:{start}")
+    } else {
+        format!("{path}:{start}-{end}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +170,30 @@ mod tests {
     fn line_selection_clamps_to_one_based() {
         let c = code_ref_for_lines("a", 0, 3, &RefAt::Worktree);
         assert_eq!((c.start, c.end), (1, 3));
+    }
+
+    const TEXTS: [&str; 7] = ["ctx9", "old10", "old11\r", "new10", "new11", "new12", "ctx13"];
+
+    #[test]
+    fn pane_copy_keeps_only_that_side_and_its_numbers() {
+        let old = copy_for_rows(&rows(), &TEXTS, RowSel { a: 0, b: 2 }, Pane::Old, "new.rs", Some("old.rs")).unwrap();
+        assert_eq!(old, CopySel { path: "old.rs".into(), start: 9, end: 11, text: "ctx9\nold10\nold11".into() });
+        let new = copy_for_rows(&rows(), &TEXTS, RowSel { a: 6, b: 0 }, Pane::New, "new.rs", Some("old.rs")).unwrap();
+        assert_eq!(new, CopySel { path: "new.rs".into(), start: 9, end: 13, text: "ctx9\nnew10\nnew11\nnew12\nctx13".into() });
+    }
+
+    #[test]
+    fn unified_copy_takes_every_line_and_falls_back_to_old_numbers() {
+        let u = copy_for_rows(&rows(), &TEXTS, RowSel { a: 1, b: 3 }, Pane::Unified, "a", None).unwrap();
+        assert_eq!((u.start, u.end, u.text.as_str()), (10, 10, "old10\nold11\nnew10"));
+        let d = copy_for_rows(&rows(), &TEXTS, RowSel { a: 1, b: 2 }, Pane::Unified, "a", None).unwrap();
+        assert_eq!((d.start, d.end), (10, 11));
+        assert!(copy_for_rows(&rows(), &TEXTS, RowSel { a: 3, b: 5 }, Pane::Old, "a", None).is_none(), "added lines have no old side");
+    }
+
+    #[test]
+    fn path_line_formats_single_and_range() {
+        assert_eq!(path_line("/r/a.cpp", 7, 7), "/r/a.cpp:7");
+        assert_eq!(path_line("/r/a.cpp", 7, 9), "/r/a.cpp:7-9");
     }
 }
