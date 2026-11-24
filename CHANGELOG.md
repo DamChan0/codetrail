@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.9
 
 - **Remotes: pick a Tailscale peer from the Host field**: the add/edit form lists the tailnet (`name — 100.x.y.z · OS`, online first, offline only on request, filtered by what you type, plus *Type manually*). Picking fills Host with the peer's Tailscale IP and Name with its host name; User is prefilled only from a saved remote or `~/.ssh/config` and says where from. Replaces the separate *Discover Tailscale peers* panel. Without Tailscale, Host stays a text field with a short note.
 - **New remotes default to plain SSH** (`ssh user@host` with your agent, keys and `~/.ssh/config`), which also works with Tailscale SSH hosts; Tailscale SSH is an explicit choice. Before, new remotes defaulted to Tailscale SSH, which fails unless the host runs `tailscale set --ssh`.
