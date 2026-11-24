@@ -59,7 +59,9 @@ pub fn describe(kind: &RemoteErrorKind, detail: &str) -> String {
     let hint = match kind {
         RemoteErrorKind::HostKeyUnknown => "host key not trusted yet: enable 'Trust new host key' or run `ssh <host>` once",
         RemoteErrorKind::HostKeyChanged => "host key CHANGED (possible man-in-the-middle): verify the host, then `ssh-keygen -R <host>`",
-        RemoteErrorKind::AuthFailed => "authentication failed. Use Tailscale (no keys): set Transport to Tailscale SSH and run `tailscale set --ssh` on that machine, or add your key (authorized_keys, ssh-agent or an identity file); password prompts are disabled",
+        // the detail already carries the explanation (see `auth_failed_detail`)
+        RemoteErrorKind::AuthFailed if !detail.is_empty() => return format!("authentication failed: {detail}"),
+        RemoteErrorKind::AuthFailed => "authentication failed: `ssh user@host` must log in with your key (ssh-copy-id or ssh-agent) or Tailscale SSH; codetrail never prompts for passwords",
         RemoteErrorKind::Unreachable => "host unreachable: check the name/address, that sshd is running and the network/Tailscale connection",
         RemoteErrorKind::Timeout => "connection timed out",
         RemoteErrorKind::NoGit => "git was not found on the remote (non-interactive PATH)",
@@ -72,6 +74,33 @@ pub fn describe(kind: &RemoteErrorKind, detail: &str) -> String {
         (false, true) => hint.to_string(),
         (false, false) => format!("{hint} [{detail}]"),
     }
+}
+
+/// This machine's login name: the account ssh uses when a remote has no User (and `~/.ssh/config`
+/// sets none either).
+pub fn local_user() -> String {
+    ["USER", "LOGNAME"].iter().find_map(|k| std::env::var(k).ok().filter(|u| !u.is_empty())).unwrap_or_else(|| "your local user name".into())
+}
+
+/// Detail of an `AuthFailed` error: which account was tried and what to fix, then ssh's own words.
+pub fn auth_failed_detail(spec: &RemoteSpec, stderr: &str) -> String {
+    let mut s = String::new();
+    if spec.user.is_none() {
+        // ssh names the account it tried: `damchan@host: Permission denied (publickey,password).`
+        let local = local_user();
+        let tried = stderr.lines().find(|l| l.contains("Permission denied")).and_then(|l| l.split_once('@')).map(|(u, _)| u.trim()).filter(|u| plain_token(u, "._-"));
+        match tried {
+            Some(u) if u != local => s += &format!("User is empty: ssh tried the account {u} (User from ~/.ssh/config). Enter the account name on the remote host. "),
+            _ => s += &format!("User is empty: connecting as local user {local}. Enter the account name on the remote host. "),
+        }
+    }
+    let target = format!("{}@{}", spec.user.as_deref().unwrap_or("<user>"), spec.host);
+    let port = spec.port.map(|p| format!(" -p {p}")).unwrap_or_default();
+    s += &match spec.transport {
+        Transport::TailscaleSsh => "Tailscale SSH: run `tailscale set --ssh` on the host and check that the tailnet ACL `ssh` rules allow this user; for a normal sshd login with your key, set Transport to SSH.".to_string(),
+        _ => format!("`ssh{port} {target}` must log in from your shell without a password (codetrail never prompts): add your key with `ssh-copy-id{port} {target}` or ssh-agent. If the host uses Tailscale SSH, run `tailscale set --ssh` on it and check the tailnet ACL `ssh` rules."),
+    };
+    format!("{s} [{}]", exec::short_detail(stderr))
 }
 
 fn plain_token(s: &str, extra: &str) -> bool {
@@ -266,6 +295,24 @@ mod tests {
         assert_eq!(describe(&RemoteErrorKind::Other, ""), "remote command failed");
         assert_eq!(describe(&RemoteErrorKind::Other, "boom"), "remote: boom");
         assert_eq!(describe(&RemoteErrorKind::Timeout, ""), "connection timed out");
+    }
+
+    #[test]
+    fn auth_failure_names_the_account_tried_and_the_fix_for_the_transport() {
+        let mut s = spec();
+        s.user = None;
+        let local = local_user();
+        let m = describe(&RemoteErrorKind::AuthFailed, &auth_failed_detail(&s, &format!("{local}@h: Permission denied (publickey,password).")));
+        assert!(m.starts_with("authentication failed: ") && m.contains(&format!("User is empty: connecting as local user {local}. Enter the account name on the remote host")), "{m}");
+        assert!(m.contains("ssh-copy-id -p 22 <user>@box.tail1234.ts.net") && m.contains("never prompts") && m.ends_with("Permission denied (publickey,password).]"), "{m}");
+        // a User from ~/.ssh/config is reported as such, not as the local name
+        let m = auth_failed_detail(&s, "Warning: Permanently added 'h'\nzz-cfg@h: Permission denied (publickey).");
+        assert!(m.contains("ssh tried the account zz-cfg (User from ~/.ssh/config)"), "{m}");
+        // explicit user + Tailscale SSH: no user remark, the tailscale hint instead
+        s.user = Some("dmkimd".into());
+        s.transport = Transport::TailscaleSsh;
+        let m = auth_failed_detail(&s, "dmkimd@h: Permission denied (publickey).");
+        assert!(!m.contains("User is empty") && m.contains("tailscale set --ssh") && m.contains("ACL"), "{m}");
     }
 
     #[test]

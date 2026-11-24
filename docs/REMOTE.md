@@ -25,22 +25,31 @@ machine. Nothing is installed on the remote side: CodeTrail runs `git` there ove
   under `~/.cache/codetrail/remote/<hash>/` (hard cap 64 MiB), so the Why panel works. **[unverified]**
 - The `ssh` binary can be overridden with the environment variable `CT_SSH_BIN` (used by tests).
 
-## Recommended setup: Tailscale
+## Setup: plain ssh over the tailnet
 
-Use Tailscale first, keys last. Settings > Remotes > **Discover Tailscale peers** lists your tailnet;
-picking a peer creates a remote with transport **Tailscale SSH (no key)**: plain `ssh` to the tailnet
-name, authenticated by your tailnet identity (the target runs `tailscale up --ssh`). There is no key,
-no `-i`, no ProxyCommand and nothing to rotate. Fall back to *SSH via Tailscale nc* (host has sshd but
-no route into the tailnet) or plain *SSH (key)* only when Tailscale is not an option. If `tailscale`
-is missing or logged out, the settings page shows the install/login hint and key-based SSH stays usable.
+Settings > Remotes > **Add remote**. The Host field has a **Tailnet** list (`tailscale status
+--json`): `name — 100.x.y.z · OS`, online peers only unless *Show offline peers* is ticked, filtered
+by the Host text, and a *Type manually* entry. Picking a peer fills Host with its **Tailscale IPv4**
+(no MagicDNS needed on this machine; the IP is stable for the node) and Name with its host name.
+
+*User* is the account **on the remote host**. Tailscale only knows tailnet logins (emails), so
+CodeTrail prefills it only from a saved remote for the same host or a matching `~/.ssh/config`
+entry, and says where it came from. Empty User means ssh logs in as your local user name; the form
+says so.
+
+The default transport **SSH (your keys)** is exactly `ssh user@host` from your shell: ssh-agent,
+default keys, `~/.ssh/config`, `BatchMode=yes`. It also works with hosts that run Tailscale SSH.
+CodeTrail never prompts for a password: when `ssh user@100.x.y.z` asks for one, run
+`ssh-copy-id user@100.x.y.z` (or load your key with `ssh-add`).
 
 | Transport (`RemoteSpec.transport`) | ssh arguments added | Auth |
 |---|---|---|
-| Tailscale SSH — `tailscale_ssh` (default for new/discovered remotes) | none (never `-i`/`IdentitiesOnly`, even if an identity file is stored) | tailnet identity |
+| SSH (your keys) — `ssh` (default) | `-i <file> -o IdentitiesOnly=yes` if an identity file is set | ssh key / agent / `~/.ssh/config`; Tailscale SSH too |
+| Tailscale SSH — `tailscale_ssh` (explicit choice) | none (never `-i`/`IdentitiesOnly`) | tailnet identity; the host must run `tailscale set --ssh` and the tailnet ACL must allow your login as that user |
 | SSH via Tailscale nc — `tailscale_nc` | `-o ProxyCommand="tailscale nc %h %p"` | sshd login (key or Tailscale SSH) |
-| SSH (key) — `ssh` | `-i <file> -o IdentitiesOnly=yes` if an identity file is set | ssh key / agent |
 
-Existing saved remotes keep loading unchanged (`ssh`, `tailscale_nc`).
+If `tailscale` is missing or logged out, the form says so under Host and the field stays a plain text
+input.
 
 ## SSH requirements (key-based transports only)
 
@@ -68,17 +77,16 @@ it changed.
 
 ## Tailscale details
 
-1. **Peers list**: the settings page runs `tailscale status --json` (cleared environment, only
-   `PATH`; 5 s timeout, process-group kill, 4 MiB output cap) and lists this node and up to 200
-   peers, online ones first. Peers without a Tailscale IP are skipped. Choosing a peer fills the
-   host with its MagicDNS name (or first IP if MagicDNS is off). Verified against a real tailnet
-   (172 nodes parsed).
-2. **Plain ssh over the tailnet**: the MagicDNS name / `100.x` address is just an ssh host.
-   Transport *SSH* works as long as your normal `ssh` can reach it.
-3. **Tailscale SSH** (recommended): if the target runs `tailscale up --ssh`, authentication is handled
-   by Tailscale (ACLs), no keys needed. Use transport *Tailscale SSH (no key)* with the tailnet name.
-   The ssh arguments for this transport are covered by unit tests; a real Tailscale SSH login was
-   **[unverified]**.
+1. **Peers list**: the add/edit form runs `tailscale status --json` (cleared environment, only
+   `PATH`; 5 s timeout, process-group kill, 4 MiB output cap) and lists up to 200 peers, online
+   ones first. Peers without a Tailscale IP are skipped. Choosing a peer fills the host with its
+   Tailscale IPv4 (MagicDNS name only if it has no IP). Peers that advertise SSH host keys are
+   tagged *Tailscale SSH*.
+2. **Plain ssh over the tailnet**: the `100.x` address is just an ssh host. Transport *SSH* works as
+   long as your normal `ssh user@100.x` works without a prompt.
+3. **Tailscale SSH**: if the target runs `tailscale set --ssh` and the ACL `ssh` rules allow you,
+   authentication is handled by Tailscale, no keys needed. Transport *SSH* already works against such
+   a host; choose *Tailscale SSH* only to ignore a stored identity file.
 4. **Transport *SSH via Tailscale nc***: adds `-o ProxyCommand="tailscale nc %h %p"`. Use it when
    the machine runs in userspace-networking mode or the OS has no route into the tailnet.
    **[unverified]**
@@ -109,7 +117,7 @@ applying changes, anything that writes to the remote.
 |---|---|---|
 | `HostKeyUnknown` | Host not in `known_hosts` and policy is strict. | Run `ssh <host>` once, or enable *Trust new host key*. |
 | `HostKeyChanged` | Key differs from `known_hosts`. | Verify the machine was reinstalled/changed, then `ssh-keygen -R <host>`. Never bypass blindly. |
-| `AuthFailed` | No key accepted, or a prompt would be needed (BatchMode). | `ssh-add` your key, set *Identity file*, check `user`, or use Tailscale SSH. Test in a terminal with `ssh -o BatchMode=yes <host> true`. |
+| `AuthFailed` | No key accepted, or a prompt would be needed (BatchMode). | The message names the account ssh tried (empty User = your local user name) and the fix: `ssh-copy-id user@host` or `ssh-add`; for Tailscale SSH hosts `tailscale set --ssh` on the host and the tailnet ACL `ssh` rules. Test in a terminal with `ssh -o BatchMode=yes user@host true`. |
 | `Unreachable` | DNS/route/port failure. | Check the name/IP/port, that sshd runs, that Tailscale is up (`tailscale status`). For tailnet hosts try transport *Tailscale (nc)*. |
 | `Timeout` | No answer within the time budget. | Host asleep/offline or very slow link; retry. |
 | `NoGit` | `git` not found on the remote `PATH` for non-interactive shells. | Install git, or make it available in the non-login shell `PATH`. |

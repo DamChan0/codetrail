@@ -48,7 +48,7 @@ codetrail [/path/to/repo]
 
 ## 원격 저장소
 
-다른 머신의 저장소 diff를 읽기 전용으로 봅니다: 설정 > Remotes. **Tailscale 권장** — *Discover Tailscale peers*를 눌러 머신을 고르면 Tailscale SSH로 연결되어 관리할 키가 없습니다(대상에 `tailscale up --ssh`와 git 필요). 키 기반 SSH는 tailnet 밖 머신을 위한 마지막 수단입니다. 자세한 내용: [docs/REMOTE.md](docs/REMOTE.md).
+다른 머신의 저장소 diff를 읽기 전용으로 봅니다: 설정 > Remotes > *Add remote*. Host 칸에서 Tailscale peer(`이름 — 100.x.y.z`)를 고르고 *User*에 그 호스트의 계정을 넣은 뒤 *Test connection*을 누르세요. 연결은 터미널의 `ssh user@host`와 같습니다(ssh-agent, 기본 키, `~/.ssh/config`). 비밀번호는 묻지 않으므로 `ssh`가 비밀번호를 요구하면 먼저 `ssh-copy-id user@host`를 실행하세요. 자세한 내용: [docs/REMOTE.md](docs/REMOTE.md).
 
 ## 에이전트 연동
 

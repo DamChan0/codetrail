@@ -42,16 +42,16 @@ pub struct TailnetPeer {
     pub os: String,
     pub online: bool,
     pub is_self: bool,
+    /// The peer advertises SSH host keys, which Tailscale only does while it runs Tailscale SSH
+    /// (`tailscale set --ssh`).
+    pub tailscale_ssh: bool,
 }
 
 impl TailnetPeer {
-    /// Best address to hand to ssh: MagicDNS name, else first IP.
+    /// Address handed to ssh: the Tailscale IPv4 (what `ssh user@100.x.y.z` uses; needs no
+    /// MagicDNS/resolver setup on this machine), else any Tailscale IP, else the MagicDNS name.
     pub fn address(&self) -> &str {
-        if !self.dns_name.is_empty() {
-            &self.dns_name
-        } else {
-            self.ips.first().map_or("", String::as_str)
-        }
+        self.ips.iter().find(|ip| !ip.contains(':')).or(self.ips.first()).map_or(self.dns_name.as_str(), String::as_str)
     }
 }
 
@@ -81,7 +81,8 @@ fn peer_from(v: &Value, is_self: bool) -> Option<TailnetPeer> {
     }
     // The local node reports Online=true; a missing flag on Self still means "this machine".
     let online = v.get("Online").and_then(Value::as_bool).unwrap_or(is_self);
-    Some(TailnetPeer { name, dns_name, ips, os: str_of(v, "OS"), online, is_self })
+    let tailscale_ssh = v.get("sshHostKeys").and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+    Some(TailnetPeer { name, dns_name, ips, os: str_of(v, "OS"), online, is_self, tailscale_ssh })
 }
 
 /// Pure parser for `tailscale status --json`. Unknown fields are ignored; a missing `Peer` map is
@@ -197,7 +198,7 @@ pub fn tailscale_peers(timeout: Duration) -> Result<Vec<TailnetPeer>> {
     let cap = match run_bounded(cmd, timeout, MAX_STATUS_BYTES) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(remote_err("`tailscale` was not found in PATH: install Tailscale (https://tailscale.com/download) or enter the host manually"))
+            return Err(remote_err("`tailscale` was not found in PATH (install: https://tailscale.com/download)"))
         }
         Err(e) => return Err(remote_err(format!("could not run `tailscale`: {e}"))),
     };
@@ -497,7 +498,19 @@ mod tests {
         assert_eq!(p[0].dns_name, "me.tail1.ts.net");
         assert!(!p[2].online && !p[2].is_self);
         assert_eq!(p[1].os, "macOS");
-        assert_eq!(p[1].address(), "alpha.tail1.ts.net");
+        assert_eq!(p[1].address(), "100.64.0.3");
+    }
+
+    #[test]
+    fn ssh_address_is_the_ipv4_and_advertised_host_keys_mean_tailscale_ssh() {
+        // Shape of a real `tailscale status --json` peer (trimmed): IPv4 listed after IPv6 must still win.
+        let p = parse_tailscale_status(
+            r#"{"BackendState":"Running","Peer":{
+"k1":{"HostName":"dev","DNSName":"dev.tail57be1b.ts.net.","OS":"linux","TailscaleIPs":["fd7a:115c:a1e0::972d:f517","100.104.245.22"],"Online":true,"sshHostKeys":["ssh-ed25519 AAAA"]},
+"k2":{"HostName":"v6only","DNSName":"v6.tail57be1b.ts.net.","OS":"linux","TailscaleIPs":["fd7a::9"],"Online":true,"sshHostKeys":[]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(p.iter().map(|x| (x.name.as_str(), x.address(), x.tailscale_ssh)).collect::<Vec<_>>(), [("dev", "100.104.245.22", true), ("v6only", "fd7a::9", false)]);
     }
 
     #[test]

@@ -77,6 +77,20 @@ impl RemoteForm {
     }
 }
 
+/// `(user, source)` to prefill for a tailnet peer: the User of a saved remote, else of a
+/// `~/.ssh/config` Host, that points at one of the peer's names or addresses. `None` rather than a
+/// guess: `tailscale status` only knows tailnet logins (e-mail addresses), not host accounts.
+pub fn peer_user(peer: &TailnetPeer, remotes: &[RemoteSpec], hosts: &[SshHost]) -> Option<(String, String)> {
+    let label = peer.dns_name.split('.').next().unwrap_or_default();
+    let is_peer = |h: &str| {
+        let h = h.trim_end_matches('.');
+        !h.is_empty() && (h.eq_ignore_ascii_case(&peer.dns_name) || h.eq_ignore_ascii_case(label) || h.eq_ignore_ascii_case(&peer.name) || peer.ips.iter().any(|ip| ip == h))
+    };
+    let saved = remotes.iter().filter(|r| is_peer(&r.host)).find_map(|r| Some((r.user.clone()?, format!("saved remote \"{}\"", r.name))));
+    // an alias only counts when it has no HostName pointing elsewhere
+    saved.or_else(|| hosts.iter().filter(|h| h.hostname.as_deref().map_or(is_peer(&h.alias), is_peer)).find_map(|h| Some((h.user.clone()?, format!("~/.ssh/config Host {}", h.alias)))))
+}
+
 /// Remotes shown by the `remote-*` smoke scenes (they run against the fake ssh).
 pub fn smoke_remotes() -> Vec<RemoteSpec> {
     let r = |name: &str, host: &str, user: &str| RemoteSpec { name: name.into(), host: host.into(), user: Some(user.into()), port: None, identity_file: None, transport: Transport::Ssh, trust_new_host: false };
@@ -204,6 +218,19 @@ mod tests {
             assert!(!is_connection_error(&ct_core::remote::describe(&k, "x")), "{k:?}");
         }
         assert!(!is_connection_error("fatal: bad revision"));
+    }
+
+    #[test]
+    fn peer_user_comes_only_from_entries_that_point_at_the_peer() {
+        let peer = TailnetPeer { name: "Bear1400".into(), dns_name: "bear1400.tail57be1b.ts.net".into(), ips: vec!["100.76.18.109".into()], os: "linux".into(), online: true, is_self: false, tailscale_ssh: false };
+        let h = |alias: &str, hostname: Option<&str>, user: Option<&str>| SshHost { alias: alias.into(), hostname: hostname.map(Into::into), user: user.map(Into::into), port: None, identity_file: None };
+        // an alias named like the peer but pointing elsewhere is not the peer
+        assert_eq!(peer_user(&peer, &[], &[h("bear1400", Some("10.0.0.5"), Some("wrong")), h("*", None, Some("any"))]), None);
+        let hosts = [h("robot", Some("bear1400.tail57be1b.ts.net."), Some("bear")), h("bear1400", None, Some("alias"))];
+        assert_eq!(peer_user(&peer, &[], &hosts), Some(("bear".into(), "~/.ssh/config Host robot".into())));
+        // a saved remote for the same IP wins; one without a user is skipped
+        let saved = |n: &str, user: Option<&str>| RemoteSpec { name: n.into(), host: "100.76.18.109".into(), user: user.map(Into::into), port: None, identity_file: None, transport: Transport::Ssh, trust_new_host: false };
+        assert_eq!(peer_user(&peer, &[saved("nouser", None), saved("old", Some("dmkimd"))], &hosts), Some(("dmkimd".into(), "saved remote \"old\"".into())));
     }
 
     #[test]

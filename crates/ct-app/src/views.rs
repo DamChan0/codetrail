@@ -1286,14 +1286,18 @@ impl App {
                         self.rs_form_edit("build-server");
                         if let Some(f) = &mut self.rs.form {
                             f.f.trust_new_host = true;
-                            f.test = Some(Err(ct_core::remote::describe(&ct_core::RemoteErrorKind::AuthFailed, "Permission denied (publickey)")));
+                            let spec = self.settings.remotes.iter().find(|r| r.name == "build-server").cloned().expect("smoke remote");
+                            f.test = Some(Err(ct_core::remote::describe(&ct_core::RemoteErrorKind::AuthFailed, &ct_core::remote::auth_failed_detail(&spec, "ci@build.tail1234.ts.net: Permission denied (publickey)."))));
                         }
                     }
-                    if q == "new" {
+                    // `new`, `pick:<peer>` and `test:<peer>` ask the real `tailscale status`; `test:` then
+                    // runs a real connection test from the form (see smoke_tick)
+                    if q == "new" || q.starts_with("pick:") || q.starts_with("test:") {
                         self.rs_form_new();
                     }
                     if q == "no-tailscale" {
-                        self.rs_peers_done(Err("`tailscale` was not found in PATH: install Tailscale (https://tailscale.com/download) or enter the host manually".into()));
+                        self.rs_peers_done(Err("`tailscale` was not found in PATH (install: https://tailscale.com/download)".into()));
+                        self.rs_form_new();
                     }
                     self.settings_open_section(crate::settingspage::Section::Remotes);
                 }
@@ -1425,10 +1429,26 @@ impl App {
             // the live bug: widths saved on a big screen + a remote that rejects authentication
             self.settings.rail_width = 520.0;
             self.settings.inspector_width = 560.0;
-            let e = ct_core::remote::describe(&ct_core::RemoteErrorKind::AuthFailed, "dmkimd@100.103.68.41: Permission denied (publickey,password).");
+            let spec = ct_core::remote::RemoteSpec { name: "lab".into(), host: "100.103.68.41".into(), user: None, port: None, identity_file: None, transport: Default::default(), trust_new_host: false };
+            let e = ct_core::remote::describe(&ct_core::RemoteErrorKind::AuthFailed, &ct_core::remote::auth_failed_detail(&spec, "dmkimd@100.103.68.41: Permission denied (publickey,password)."));
             self.rs.conn_lost = Some(e.clone());
             self.open_state = Loadable::Failed(e);
         }
+        let rq = if scene == "remote-settings" { self.smoke.as_ref().map(|s| s.query.clone()).unwrap_or_default() } else { String::new() };
+        let (pick_q, test_q) = (rq.strip_prefix("pick:"), rq.strip_prefix("test:"));
+        if let Some(label) = pick_q.or(test_q) {
+            // pick the peer whose MagicDNS label is `label`, exactly as a click in the Host list does
+            let peer = self.rs.peers.as_ref().and_then(Loadable::ready).and_then(|v| v.iter().find(|p| p.dns_name.split('.').next() == Some(label)).cloned());
+            if let Some(p) = peer.filter(|_| self.rs.form.as_ref().is_some_and(|f| f.f.host.is_empty())) {
+                self.rs_peer_use(&p);
+                if let Some(spec) = self.rs.form.as_ref().and_then(|f| f.f.build(&[]).ok()).filter(|_| test_q.is_some()) {
+                    self.rs_test(crate::remoteapp::TestTarget::Form, spec);
+                }
+            }
+        }
+        let form = self.rs.form.as_ref();
+        let remote_ready = scene != "remote-settings"
+            || (!matches!(self.rs.peers, Some(Loadable::Loading)) && (pick_q.is_none() || form.is_some_and(|f| !f.f.host.is_empty())) && (test_q.is_none() || form.is_some_and(|f| f.test.is_some())));
         if scene == "model-picker" && !self.insp_open && !self.smoke.as_ref().is_some_and(|s| s.requested) {
             self.insp_open = true;
         }
@@ -1458,7 +1478,7 @@ impl App {
             }
             self.ag_select_run("r1");
         }
-        let mut settled = ag_ready && browser_ready && ready && (scene != "search" || self.search.ran.is_some()) && (scene != "search-hit" || self.editor.as_ref().is_some_and(|e| e.load.ready().is_some()));
+        let mut settled = remote_ready && ag_ready && browser_ready && ready && (scene != "search" || self.search.ran.is_some()) && (scene != "search-hit" || self.editor.as_ref().is_some_and(|e| e.load.ready().is_some()));
         // Fixture scenes (see docs): g.txt line 5 has a multi-commit history across a rename.
         if scene == "history-time-travel" && ready {
             if self.tt.is_none() && self.blame.path.is_empty() {

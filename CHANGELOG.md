@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Remotes: pick a Tailscale peer from the Host field**: the add/edit form lists the tailnet (`name — 100.x.y.z · OS`, online first, offline only on request, filtered by what you type, plus *Type manually*). Picking fills Host with the peer's Tailscale IP and Name with its host name; User is prefilled only from a saved remote or `~/.ssh/config` and says where from. Replaces the separate *Discover Tailscale peers* panel. Without Tailscale, Host stays a text field with a short note.
+- **New remotes default to plain SSH** (`ssh user@host` with your agent, keys and `~/.ssh/config`), which also works with Tailscale SSH hosts; Tailscale SSH is an explicit choice. Before, new remotes defaulted to Tailscale SSH, which fails unless the host runs `tailscale set --ssh`.
+- **Clearer authentication errors**: an empty User is called out in the form and in the error ("connecting as local user …"), and a failed login names the account ssh tried and the fix (`ssh-copy-id` / `ssh-add`; `tailscale set --ssh` and the ACL `ssh` rules for Tailscale SSH). codetrail never prompts for passwords.
+
 ## 0.5.8
 
 - **Tab in the Open folder path box (local and remote) now reaches the suggestions**: Tab completes the common prefix, then highlights the first suggestion and cycles (Shift+Tab back), Enter accepts. Before, egui moved keyboard focus to the next widget on Tab, so the dropdown never got it. Esc likewise closes only the dropdown and keeps the cursor in the field; with the dropdown closed, Tab moves focus as usual.

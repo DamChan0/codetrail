@@ -28,12 +28,19 @@ pub enum TestTarget {
     Form,
 }
 
+#[derive(Default)]
 pub struct FormState {
     /// Name of the remote being edited (`None` = new).
     pub orig: Option<String>,
     pub f: RemoteForm,
     pub error: Option<String>,
     pub test: Option<Result<RemoteInfo, String>>,
+    /// The tailnet peer list under Host is unfolded.
+    pub peers_open: bool,
+    /// Offline peers are listed too (dimmed, not pickable).
+    pub show_offline: bool,
+    /// `(user, source)` when User was prefilled from a saved remote or `~/.ssh/config`.
+    pub user_src: Option<(String, String)>,
 }
 
 pub struct ImportState {
@@ -174,13 +181,16 @@ impl App {
 
     // ------------------------------------------------------------ settings model
 
+    /// New remote: plain ssh (exactly what `ssh user@host` does in a terminal), peer list unfolded.
     pub fn rs_form_new(&mut self) {
-        self.rs.form = Some(FormState { orig: None, f: RemoteForm { transport: Transport::TailscaleSsh, ..Default::default() }, error: None, test: None });
+        self.rs.form = Some(FormState { peers_open: true, ..Default::default() });
+        self.rs_ensure_peers();
     }
 
     pub fn rs_form_edit(&mut self, name: &str) {
         if let Some(s) = self.settings.remotes.iter().find(|r| r.name == name) {
-            self.rs.form = Some(FormState { orig: Some(name.to_string()), f: RemoteForm::from_spec(s), error: None, test: None });
+            self.rs.form = Some(FormState { orig: Some(name.to_string()), f: RemoteForm::from_spec(s), ..Default::default() });
+            self.rs_ensure_peers();
         }
     }
 
@@ -251,6 +261,13 @@ impl App {
         added
     }
 
+    /// Asks tailscale for peers once per session (the form's Host list); "Retry" asks again.
+    fn rs_ensure_peers(&mut self) {
+        if self.rs.peers.is_none() {
+            self.rs_discover();
+        }
+    }
+
     pub fn rs_discover(&mut self) {
         self.rs.peers = Some(Loadable::Loading);
         let be = self.rs.backend();
@@ -270,11 +287,33 @@ impl App {
         });
     }
 
-    /// Prefills the add form from a tailnet peer (host = MagicDNS name, transport = Tailscale SSH:
-    /// authenticates by tailnet identity, no keys; the nc transport / plain ssh stay selectable).
+    /// Fills the open add/edit form from a tailnet peer: Host = its Tailscale IP, Name if empty,
+    /// User only from a saved remote or `~/.ssh/config` entry for that peer (never guessed). The
+    /// transport is left alone (new forms default to plain ssh).
     pub fn rs_peer_use(&mut self, p: &TailnetPeer) {
-        let name: String = p.name.chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).collect();
-        self.rs.form = Some(FormState { orig: None, f: RemoteForm { name, host: p.address().to_string(), transport: Transport::TailscaleSsh, ..Default::default() }, error: None, test: None });
+        let hosts = self.rs.backend().ssh_hosts();
+        let user = crate::remote_backend::peer_user(p, &self.settings.remotes, &hosts);
+        let auto_name = |p: &TailnetPeer| -> String {
+            let n: String = p.name.chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).collect();
+            if n.is_empty() { p.dns_name.split('.').next().unwrap_or_default().to_string() } else { n }
+        };
+        let form = self.rs.form.get_or_insert_with(Default::default);
+        // a name that was filled from the previously picked peer follows the new pick
+        let prev = self.rs.peers.as_ref().and_then(Loadable::ready).and_then(|v| v.iter().find(|q| q.address() == form.f.host)).map(auto_name);
+        if form.f.name.trim().is_empty() || prev.as_deref() == Some(form.f.name.as_str()) {
+            form.f.name = auto_name(p);
+        }
+        form.f.host = p.address().to_string();
+        // an untouched prefill belonged to the previously picked peer
+        if form.user_src.take().is_some_and(|(u, _)| u == form.f.user) {
+            form.f.user.clear();
+        }
+        if let Some((u, _)) = user.as_ref().filter(|_| form.f.user.trim().is_empty()) {
+            form.f.user = u.clone();
+            form.user_src = user;
+        }
+        form.peers_open = false;
+        form.test = None;
     }
 
     // ------------------------------------------------------------ project picker
@@ -439,10 +478,10 @@ fn info_line(i: &RemoteInfo) -> String {
 impl App {
     pub(crate) fn sec_remotes(&mut self, ui: &mut Ui) {
         let th = self.th.clone();
-        hint(ui, &th, "Remote repositories are read-only: git runs on the remote over ssh. Nothing connects until you test a remote or open a project on it. Passwords are never asked for. Recommended: Tailscale (no keys to manage); key-based ssh only if Tailscale isn't available.");
+        hint(ui, &th, "Remote repositories are read-only: git runs on the remote over ssh. Nothing connects until you test a remote or open a project on it. codetrail connects like `ssh user@host` in your terminal (~/.ssh/config, ssh-agent, your keys) and never asks for passwords.");
         let mut act: Option<(&'static str, String)> = None;
         if self.settings.remotes.is_empty() && self.rs.form.is_none() {
-            widgets::empty_state(ui, &th, "No remotes yet", "Add one below, import from ~/.ssh/config, or discover Tailscale peers.");
+            widgets::empty_state(ui, &th, "No remotes yet", "Add one below (Tailscale peers are listed under Host) or import from ~/.ssh/config.");
         }
         let remotes = self.settings.remotes.clone();
         for r in &remotes {
@@ -499,46 +538,82 @@ impl App {
         self.remote_form_ui(ui);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
-            if Btn::new("Discover Tailscale peers").kind(BtnKind::Primary).enabled(!matches!(self.rs.peers, Some(Loadable::Loading))).show(ui, &th).clicked() {
-                self.rs_discover();
-            }
-            if Btn::new("Add manually").show(ui, &th).clicked() {
+            if Btn::new("Add remote").kind(BtnKind::Primary).show(ui, &th).clicked() {
                 self.rs_form_new();
             }
             if Btn::new("Import from ~/.ssh/config").show(ui, &th).clicked() {
                 self.rs_import_open();
             }
         });
-        hint(ui, &th, "Recommended: Tailscale \u{2014} no keys to manage.");
         self.remote_import_ui(ui);
-        self.remote_peers_ui(ui);
     }
 
     fn remote_form_ui(&mut self, ui: &mut Ui) {
         let th = self.th.clone();
         let Some(mut form) = self.rs.form.take() else { return };
-        let (mut save, mut cancel, mut test) = (false, false, false);
+        let (mut save, mut cancel, mut test, mut retry) = (false, false, false, false);
+        let mut pick: Option<TailnetPeer> = None;
         let testing = self.rs.testing == Some(TestTarget::Form);
+        let peers = self.rs.peers.as_ref();
         egui::Frame::new().fill(th.sunken()).stroke(egui::Stroke::new(1.0, th.border())).corner_radius(th.radius()).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             widgets::heading(ui, &th, if form.orig.is_some() { "Edit remote" } else { "Add remote" });
             let f = &mut form.f;
             text_field(ui, &th, "Name", &mut f.name, "dev-box");
-            text_field(ui, &th, "Host", &mut f.host, "dev.example.com, 100.x.y.z or ssh alias");
-            text_field(ui, &th, "User", &mut f.user, "optional");
+            let host_id = egui::Id::new("rs_form_host");
+            let listed = peers.and_then(Loadable::ready).filter(|v| !v.is_empty());
+            row(ui, &th, "Host", |ui| {
+                let w = (ui.available_width() - if listed.is_some() { 104.0 } else { 0.0 }).clamp(120.0, 360.0);
+                ui.add(egui::TextEdit::singleline(&mut f.host).id(host_id).hint_text("100.x.y.z, dev.example.com or ssh alias").desired_width(w).margin(vec2(8.0, 6.0)));
+                if listed.is_some() && widgets::chip(ui, &th, "", "Tailnet", true, 100.0).on_hover_text("Pick a Tailscale peer").clicked() {
+                    form.peers_open = !form.peers_open;
+                }
+                if matches!(peers, Some(Loadable::Loading)) {
+                    ui.add(egui::Spinner::new().size(14.0));
+                }
+            });
+            match peers {
+                Some(Loadable::Loading) => hint(ui, &th, "Looking for Tailscale peers\u{2026} You can type the host meanwhile."),
+                Some(Loadable::Failed(e)) => {
+                    hint(ui, &th, &format!("Tailscale peers unavailable: {e}. Type the host manually."));
+                    if Btn::new("Retry Tailscale").compact().show(ui, &th).clicked() {
+                        retry = true;
+                    }
+                }
+                Some(Loadable::Ready(v)) if v.is_empty() => hint(ui, &th, "No other peers on this tailnet: type the host manually."),
+                _ => {}
+            }
+            if let Some(v) = listed.filter(|_| form.peers_open) {
+                pick = peer_list_ui(ui, &th, v, &mut form, host_id);
+            }
+            let f = &mut form.f;
+            text_field(ui, &th, "User", &mut f.user, "account on the remote host");
+            if f.user.trim().is_empty() {
+                let m = format!("User is empty: connecting as local user {} (unless ~/.ssh/config sets one for this host). Enter the account name on the remote host.", ct_core::remote::local_user());
+                ui.label(RichText::new(m).font(widgets::small_font(&th)).color(widgets::level_color(&th, Level::Warn)));
+            } else if let Some((_, src)) = form.user_src.as_ref().filter(|(u, _)| *u == f.user) {
+                hint(ui, &th, &format!("Prefilled from {src}: check it is your account on that host."));
+            }
             text_field(ui, &th, "Port", &mut f.port, "22");
             row(ui, &th, "Transport", |ui| {
-                const T: [Transport; 3] = [Transport::TailscaleSsh, Transport::TailscaleNc, Transport::Ssh];
+                const T: [Transport; 3] = [Transport::Ssh, Transport::TailscaleSsh, Transport::TailscaleNc];
                 let mut i = T.iter().position(|t| *t == f.transport).unwrap_or(0);
-                let labels: [&str; 3] = if ui.available_width() >= 430.0 { ["Tailscale SSH (no key)", "SSH via Tailscale nc", "SSH (key)"] } else { ["Tailscale SSH", "Tailscale nc", "SSH key"] };
+                let labels: [&str; 3] = if ui.available_width() >= 430.0 { ["SSH (your keys)", "Tailscale SSH", "SSH via Tailscale nc"] } else { ["SSH", "Tailscale SSH", "Tailscale nc"] };
                 if widgets::segmented(ui, &th, &labels, &mut i) {
                     f.transport = T[i];
                 }
             });
             match f.transport {
-                Transport::TailscaleSsh => hint(ui, &th, "Recommended. Plain ssh to the tailnet name; Tailscale authenticates you, so there is no key to manage (the host must run `tailscale up --ssh`)."),
+                Transport::Ssh => hint(ui, &th, "Recommended: the same as `ssh user@host` in your terminal (~/.ssh/config, ssh-agent, default keys). Works over Tailscale with a peer's IP, also when the host runs Tailscale SSH."),
+                Transport::TailscaleSsh => {
+                    hint(ui, &th, "Only for hosts that run Tailscale SSH (`tailscale set --ssh` on the host); the tailnet ACL `ssh` rules decide which users may log in. No identity file is used.");
+                    let host = f.host.trim();
+                    if let Some(p) = listed.and_then(|v| v.iter().find(|p| !p.tailscale_ssh && (p.address() == host || p.dns_name == host))) {
+                        let m = format!("{} does not advertise Tailscale SSH: run `tailscale set --ssh` on it, or use SSH.", p.name);
+                        ui.label(RichText::new(m).font(widgets::small_font(&th)).color(widgets::level_color(&th, Level::Warn)));
+                    }
+                }
                 Transport::TailscaleNc => hint(ui, &th, "Reaches the host through `tailscale nc`; the host still needs sshd and a login (key or Tailscale SSH)."),
-                Transport::Ssh => hint(ui, &th, "Key-based SSH: use only if Tailscale isn't available."),
             }
             if f.transport == Transport::Ssh {
                 row(ui, &th, "Identity file", |ui| {
@@ -602,6 +677,12 @@ impl App {
             }
         }
         self.rs.form = if cancel { None } else { Some(form) };
+        if retry {
+            self.rs_discover();
+        }
+        if let Some(p) = pick.filter(|_| !cancel) {
+            self.rs_peer_use(&p);
+        }
         if save {
             self.rs_form_save();
         }
@@ -638,55 +719,54 @@ impl App {
             self.rs_import_apply();
         }
     }
+}
 
-    fn remote_peers_ui(&mut self, ui: &mut Ui) {
-        let th = self.th.clone();
-        let Some(state) = &self.rs.peers else { return };
-        let mut pick: Option<TailnetPeer> = None;
-        let mut close = false;
-        egui::Frame::new().fill(th.sunken()).stroke(egui::Stroke::new(1.0, th.border())).corner_radius(th.radius()).inner_margin(egui::Margin::same(16)).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            widgets::heading(ui, &th, "Tailscale peers");
-            match state {
-                Loadable::Loading => {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().size(14.0));
-                        hint(ui, &th, "Asking the local tailscale daemon…");
-                    });
+/// The tailnet peers under the Host field (combo-box list): "Type manually" first, then online
+/// peers as `name — 100.x.y.z`, filtered by the Host text; offline ones only on request (dimmed,
+/// not pickable). Returns the picked peer.
+fn peer_list_ui(ui: &mut Ui, th: &crate::theme::Theme, v: &[TailnetPeer], form: &mut FormState, host_id: egui::Id) -> Option<TailnetPeer> {
+    let mut pick = None;
+    let host = form.f.host.trim().to_lowercase();
+    // the Host text filters, unless it already is a listed peer's address (then show them all)
+    let filtering = !host.is_empty() && !v.iter().any(|p| p.address() == host);
+    let hit = |p: &&TailnetPeer| !filtering || p.name.to_lowercase().contains(&host) || p.dns_name.contains(&host) || p.ips.iter().any(|ip| ip.contains(&host));
+    let offline = v.iter().filter(|p| !p.online).count();
+    egui::Frame::new().fill(th.raised()).stroke(egui::Stroke::new(1.0, th.border())).corner_radius(th.radius()).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        hint(ui, th, &format!("{} online Tailscale peers{}. Picking one fills Host with its Tailscale IP.", v.len() - offline, if filtering { ", filtered by the Host text" } else { "" }));
+        let (resp, rect) = widgets::list_row(ui, th, 28.0, false);
+        widgets::paint_text_fit(ui, egui::Rect::from_min_max(pos2(rect.min.x + 18.0, rect.min.y), rect.max), "Type manually", widgets::ui_font(th), th.fg());
+        if resp.clicked() {
+            form.peers_open = false;
+            ui.memory_mut(|m| m.request_focus(host_id));
+        }
+        ScrollArea::vertical().id_salt("peer_list").max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
+            let mut shown = 0;
+            for p in v.iter().filter(|p| p.online || form.show_offline).filter(hit) {
+                shown += 1;
+                let (resp, rect) = widgets::list_row(ui, th, 28.0, false);
+                ui.painter().circle_filled(pos2(rect.min.x + 6.0, rect.center().y), 4.0, if p.online { th.p().diff.add.fg.0 } else { th.muted() });
+                let os = if p.os.is_empty() { String::new() } else { format!("  \u{b7}  {}", p.os) };
+                let ts = if p.tailscale_ssh { "  \u{b7}  Tailscale SSH" } else { "" };
+                let text = format!("{} \u{2014} {}{os}{ts}{}", p.name, p.address(), if p.online { "" } else { "  \u{b7}  offline" });
+                widgets::paint_text_fit(ui, egui::Rect::from_min_max(pos2(rect.min.x + 18.0, rect.min.y), rect.max), &text, widgets::ui_font(th), if p.online { th.fg() } else { th.muted() });
+                if p.online {
+                    if resp.on_hover_text(&p.dns_name).clicked() {
+                        pick = Some(p.clone());
+                    }
+                } else {
+                    resp.on_hover_text("Offline: not reachable right now");
                 }
-                Loadable::Failed(e) => {
-                    widgets::banner(ui, &th, Level::Warn, e, None, false);
-                    hint(ui, &th, "Install Tailscale (https://tailscale.com/download) and run `tailscale up` to log in. Plain SSH (key) still works: use \"Add manually\".");
-                }
-                Loadable::Ready(v) if v.is_empty() => hint(ui, &th, "No other peers on this tailnet."),
-                Loadable::Ready(v) => {
-                    hint(ui, &th, "Click a peer to prefill the add form. Online peers first.");
-                    ScrollArea::vertical().id_salt("peer_list").max_height(220.0).auto_shrink([true, true]).show(ui, |ui| {
-                        for p in v {
-                            let (resp, rect) = widgets::list_row(ui, &th, 32.0, false);
-                            let col = if p.online { th.p().diff.add.fg.0 } else { th.muted() };
-                            ui.painter().circle_filled(pos2(rect.min.x + 6.0, rect.center().y), 4.0, col);
-                            let text = format!("{}  ·  {}{}", p.name, p.address(), if p.os.is_empty() { String::new() } else { format!("  ·  {}", p.os) });
-                            widgets::paint_text_fit(ui, egui::Rect::from_min_max(pos2(rect.min.x + 18.0, rect.min.y), rect.max), &text, widgets::ui_font(&th), if p.online { th.fg() } else { th.muted() });
-                            if resp.on_hover_text(if p.online { "Use as host" } else { "Offline" }).clicked() {
-                                pick = Some(p.clone());
-                            }
-                        }
-                    });
-                }
-                Loadable::Idle => {}
             }
-            if Btn::new("Close").show(ui, &th).clicked() {
-                close = true;
+            if shown == 0 {
+                hint(ui, th, "No peer matches the Host text.");
             }
         });
-        if let Some(p) = pick {
-            self.rs_peer_use(&p);
+        if offline > 0 {
+            ui.checkbox(&mut form.show_offline, format!("Show offline peers ({offline})"));
         }
-        if close {
-            self.rs.peers = None;
-        }
-    }
+    });
+    pick
 }
 
 /// Remote half of the folder browser (inside the dialog).
@@ -995,14 +1075,27 @@ mod tests {
         assert_eq!(app.rs_import_apply(), 1);
         assert_eq!(app.settings.remotes.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["taken", "web"]);
         assert_eq!(app.settings.remotes[1].host, "web", "the alias is kept so ~/.ssh/config applies");
-        let p = |n: &str, online: bool, me: bool| TailnetPeer { name: n.into(), dns_name: format!("{n}.ts.net"), ips: vec![], os: "linux".into(), online, is_self: me };
-        app.rs_peers_done(Ok(vec![p("zeta", false, false), p("alpha", true, false), p("me", true, true), p("beta", true, false)]));
+        let p = |n: &str, ip: &str, online: bool, me: bool| TailnetPeer { name: n.into(), dns_name: format!("{n}.ts.net"), ips: vec![format!("fd7a::{ip}"), format!("100.64.0.{ip}")], os: "linux".into(), online, is_self: me, tailscale_ssh: false };
+        app.rs_peers_done(Ok(vec![p("zeta", "9", false, false), p("alpha", "2", true, false), p("me", "1", true, true), p("beta", "3", true, false)]));
         let Some(Loadable::Ready(v)) = &app.rs.peers else { panic!() };
         assert_eq!(v.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["alpha", "beta", "zeta"]);
-        let peer = v[0].clone();
-        app.rs_peer_use(&peer);
+        let (alpha, beta) = (v[0].clone(), v[1].clone());
+        // alpha was saved before with its account: that user is prefilled; beta has none
+        app.settings.remotes.push(RemoteSpec { user: Some("dmkimd".into()), ..spec("old-alpha", "100.64.0.2") });
+        app.rs_form_new();
+        app.rs_peer_use(&alpha);
+        let form = app.rs.form.as_ref().unwrap();
+        assert_eq!((form.f.name.as_str(), form.f.host.as_str(), form.f.user.as_str(), form.f.transport), ("alpha", "100.64.0.2", "dmkimd", Transport::Ssh), "host is the IPv4, transport plain ssh");
+        assert_eq!(form.user_src.as_ref().map(|s| s.1.as_str()), Some("saved remote \"old-alpha\""));
+        // re-picking replaces what the first pick filled, never what the user typed
+        app.rs_peer_use(&beta);
         let f = &app.rs.form.as_ref().unwrap().f;
-        assert_eq!((f.name.as_str(), f.host.as_str()), ("alpha", "alpha.ts.net"));
+        assert_eq!((f.name.as_str(), f.host.as_str(), f.user.as_str()), ("beta", "100.64.0.3", ""));
+        app.rs.form.as_mut().unwrap().f.name = "mine".into();
+        app.rs.form.as_mut().unwrap().f.user = "me2".into();
+        app.rs_peer_use(&alpha);
+        let f = &app.rs.form.as_ref().unwrap().f;
+        assert_eq!((f.name.as_str(), f.host.as_str(), f.user.as_str()), ("mine", "100.64.0.2", "me2"));
         app.rs_peers_done(Err("`tailscale` was not found in PATH".into()));
         assert!(matches!(app.rs.peers, Some(Loadable::Failed(_))));
     }
@@ -1121,12 +1214,16 @@ mod tests {
             let mut app = crate::ui::settings_window_tests::test_app(&ctx);
             app.settings.remotes = vec![spec("alpha", "alpha.tail1234.ts.net"), spec("beta-with-a-rather-long-name", "10.0.0.7")];
             app.rs.status.insert("alpha".into(), Status::Failed("host key not trusted yet: enable 'Trust new host key' or run `ssh <host>` once [Host key verification failed.]".into()));
+            // peers known before the form opens: no `tailscale` child in tests. The wide size shows
+            // the unfolded peer list, the narrow ones the "unavailable" note.
+            let peer = |n: &str, online| TailnetPeer { name: n.into(), dns_name: format!("{n}.tail1234.ts.net"), ips: vec!["100.64.0.2".into()], os: "linux".into(), online, is_self: false, tailscale_ssh: true };
+            app.rs_peers_done(if size.x < 1000.0 { Err("`tailscale` was not found in PATH: install Tailscale or enter the host manually".into()) } else { Ok(vec![peer("a-peer-with-a-very-long-host-name-for-layout", true), peer("off", false)]) });
             app.rs_form_new();
+            app.rs.form.as_mut().unwrap().show_offline = true;
             app.rs.form.as_mut().unwrap().f.trust_new_host = true;
             // narrow sizes also exercise the key-based form (identity file row)
             app.rs.form.as_mut().unwrap().f.transport = if size.x < 1000.0 { ct_core::remote::Transport::Ssh } else { ct_core::remote::Transport::TailscaleSsh };
             app.rs.import = Some(ImportState { hosts: vec![(SshHost { alias: "web".into(), hostname: Some("web.example".into()), user: Some("me".into()), port: Some(22), identity_file: None }, false)] });
-            app.rs_peers_done(Err("`tailscale` was not found in PATH: install Tailscale or enter the host manually".into()));
             app.settings_open_section(crate::settingspage::Section::Remotes);
             let mut heights = Vec::new();
             for _ in 0..8 {

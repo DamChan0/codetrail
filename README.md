@@ -86,10 +86,11 @@ Activity bar (far left): **Commits** · **Changes** · **Search** · **Files** �
 
 ## Remote repositories
 
-View diffs of repositories on another machine (read-only): Settings > Remotes. **Recommended: Tailscale**
-— click *Discover Tailscale peers*, pick a machine; it uses Tailscale SSH, so there are no keys to
-manage (the target needs `tailscale up --ssh` and git). Plain key-based SSH is the last resort for
-machines not on your tailnet. Details, limits and troubleshooting: [docs/REMOTE.md](docs/REMOTE.md).
+View diffs of repositories on another machine (read-only): Settings > Remotes > *Add remote*. The
+Host field lists your Tailscale peers (`name — 100.x.y.z`); pick one, enter your account on that host
+as *User*, and *Test connection*. codetrail connects like `ssh user@host` in your terminal (ssh-agent,
+default keys, `~/.ssh/config`) and never prompts for passwords: if `ssh` asks for one, run
+`ssh-copy-id user@host` first. Details, limits and troubleshooting: [docs/REMOTE.md](docs/REMOTE.md).
 
 ## Agent integration
 

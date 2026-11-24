@@ -116,7 +116,8 @@ pub struct Proc {
     watchdog: Option<thread::Thread>,
     desc: String,
     timeout: Duration,
-    remote: bool,
+    /// The host of a remote (ssh) child: its failures are classified and explained against it.
+    remote: Option<Arc<RemoteSpec>>,
     /// Held until the child is reaped (field order: dropped last).
     _slot: Slot,
 }
@@ -133,7 +134,7 @@ impl Proc {
             let script = exec::git_script(cwd, args)?;
             let cmd = exec::ssh_command(spec, &exec::wrap_sh(&script), !o.ephemeral_master)?;
             let desc = format!("git {} (on {})", args.join(" "), spec.name);
-            return Proc::start(cmd, desc, true, stdin_data, o);
+            return Proc::start(cmd, desc, Some(spec.clone()), stdin_data, o);
         }
         let mut cmd = Command::new("git");
         cmd.current_dir(cwd)
@@ -143,7 +144,7 @@ impl Proc {
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_PAGER", "cat");
-        Proc::start(cmd, format!("git {}", args.join(" ")), false, stdin_data, o)
+        Proc::start(cmd, format!("git {}", args.join(" ")), None, stdin_data, o)
     }
 
     /// Runs a (non-git) shell `script` on the remote under the same limits.
@@ -155,10 +156,10 @@ impl Proc {
         }
         exec::check_no_nul(script)?;
         let cmd = exec::ssh_command(spec, &exec::wrap_sh(script), !o.ephemeral_master)?;
-        Proc::start(cmd, format!("{desc} (on {})", spec.name), true, stdin_data, o)
+        Proc::start(cmd, format!("{desc} (on {})", spec.name), Some(Arc::new(spec.clone())), stdin_data, o)
     }
 
-    fn start(mut cmd: Command, desc: String, remote: bool, stdin_data: Option<Vec<u8>>, o: &RunOpts) -> Result<Proc> {
+    fn start(mut cmd: Command, desc: String, remote: Option<Arc<RemoteSpec>>, stdin_data: Option<Vec<u8>>, o: &RunOpts) -> Result<Proc> {
         // one absolute deadline for the whole call: slot wait and runtime share it
         let deadline = Instant::now() + o.timeout;
         let slot = git_slots().acquire(o, deadline)?;
@@ -264,11 +265,12 @@ impl Proc {
             Ok(code)
         } else {
             let text = String::from_utf8_lossy(&stderr).trim().to_string();
-            if self.remote {
+            if let Some(spec) = &self.remote {
                 // 255 is ssh's own failure code; other codes only count when the text is recognisable
                 let kind = exec::classify_stderr(&text).or((code == 255).then_some(RemoteErrorKind::Other));
                 if let Some(kind) = kind {
-                    return Err(Error::Remote { kind, detail: exec::short_detail(&text) });
+                    let detail = if kind == RemoteErrorKind::AuthFailed { crate::remote::auth_failed_detail(spec, &text) } else { exec::short_detail(&text) };
+                    return Err(Error::Remote { kind, detail });
                 }
             }
             Err(Error::Git { cmd: self.desc.clone(), code, stderr: text })
@@ -445,7 +447,7 @@ mod tests {
         let t0 = Instant::now();
         let mut cmd = Command::new("sleep");
         cmd.arg("0.5"); // would end at ~0.9 s: after the 0.7 s budget, before a restarted budget
-        let mut p = Proc::start(cmd, "sleep".into(), false, None, &o).unwrap();
+        let mut p = Proc::start(cmd, "sleep".into(), None, None, &o).unwrap();
         let waited = t0.elapsed();
         // like `collect`: read to EOF (the watchdog kills the group at the deadline), then reap
         let _ = std::io::copy(&mut p.take_stdout(), &mut std::io::sink());
