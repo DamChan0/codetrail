@@ -485,17 +485,30 @@ impl App {
                 }
 
                 let n = |c: Ci| p.checks.iter().filter(|k| k.state == c).count();
-                section(ui, th, &format!("Checks: {} ({} failing, {} running, {} passing)", p.ci.label().to_lowercase(), n(Ci::Fail), n(Ci::Running), n(Ci::Pass)));
+                let opt = p.optional_failing();
+                let opt_note = if opt > 0 { format!(", {opt} optional failing") } else { String::new() };
+                section(ui, th, &format!("Checks: {} ({} failing{opt_note}, {} running, {} passing)", p.ci.label().to_lowercase(), n(Ci::Fail) - opt, n(Ci::Running), n(Ci::Pass)));
                 if p.checks.is_empty() {
                     ui.label(RichText::new("No checks reported for the head commit.").color(th.muted()));
                 }
                 for c in &p.checks {
+                    // a failing check branch protection does not require is shown dimmed: it does not block
+                    let col = if c.state == Ci::Fail && c.required == Some(false) { th.muted() } else { ci_color(th, c.state) };
                     let resp = row(ui, th, |ui| {
-                        ui.label(RichText::new(c.state.label()).font(widgets::small_font(th)).color(ci_color(th, c.state)));
+                        ui.label(RichText::new(c.state.label()).font(widgets::small_font(th)).color(col));
                         ui.add_space(4.0);
-                        let w = ui.available_width();
+                        let tag = match c.required {
+                            Some(true) => "required",
+                            Some(false) => "optional",
+                            None => "",
+                        };
+                        let tag_w = if tag.is_empty() { 0.0 } else { 64.0 };
+                        let w = ui.available_width() - tag_w;
                         let g = widgets::fit(ui, &c.name, widgets::ui_font(th), th.fg(), w);
                         ui.label(g);
+                        if !tag.is_empty() {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(RichText::new(tag).font(widgets::small_font(th)).color(th.muted())));
+                        }
                     });
                     if !c.url.is_empty() && resp.on_hover_text(&c.url).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         crate::updater::open_url(&c.url);
@@ -629,6 +642,9 @@ fn card(ui: &mut Ui, th: &Theme, p: &Pr, r: Rect, selected: bool, filter: Option
         let review_col = if has_my_approval(p) { th.warn() } else { review_color(th, rs) };
         let ci = (format!("CI {}", p.ci.label().to_lowercase()), ci_color(th, p.ci));
         let mut chips: Vec<(String, Color32)> = if p.ci == Ci::Fail && !full { vec![ci] } else { vec![(rv, review_col), ci] };
+        if p.optional_failing() > 0 {
+            chips.push((format!("{} optional failing", p.optional_failing()), th.muted()));
+        }
         if let Some((pos, _)) = &p.queue {
             chips.push((format!("Queue {pos}"), pcol));
         } else if let Some(m) = p.merge_label().filter(|m| *m != "Mergeable" && *m != "Blocked") {
@@ -654,7 +670,8 @@ fn card(ui: &mut Ui, th: &Theme, p: &Pr, r: Rect, selected: bool, filter: Option
         "Ctrl-click to open on GitHub".to_string()
     } else {
         let (rv, _) = review_summary(p);
-        format!("#{} {}\n{}{}\n{}, CI {}\nCtrl-click to open on GitHub", p.number, p.title, if first { "Merge first. " } else { "" }, ph.label(), rv, p.ci.label().to_lowercase())
+        let opt = if p.optional_failing() > 0 { format!(" ({} optional failing)", p.optional_failing()) } else { String::new() };
+        format!("#{} {}\n{}{}\n{}, CI {}{opt}\nCtrl-click to open on GitHub", p.number, p.title, if first { "Merge first. " } else { "" }, ph.label(), rv, p.ci.label().to_lowercase())
     };
     let resp = resp.on_hover_text(hover);
     if resp.has_focus() {

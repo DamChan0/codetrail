@@ -79,6 +79,8 @@ pub struct Check {
     pub name: String,
     pub state: Ci,
     pub url: String,
+    /// Branch protection requires this check; `None` when GitHub did not say.
+    pub required: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,10 +134,10 @@ pub fn demo_stack() -> (String, Vec<Pr>) {
     };
     let mut root = mk(204, "Add the search overview ruler", "feature/search-ruler", "main", "APPROVED", "CLEAN", Ci::Pass, vec![reviewer("you", Review::Approved), reviewer("reviewer-b", Review::Pending)], 1);
     root.additions = 164;
-    root.checks = vec![Check { name: "unit-tests".into(), state: Ci::Pass, url: String::new() }, Check { name: "clippy".into(), state: Ci::Pass, url: String::new() }];
+    root.checks = vec![Check { name: "unit-tests".into(), state: Ci::Pass, url: String::new(), required: Some(true) }, Check { name: "clippy".into(), state: Ci::Pass, url: String::new(), required: Some(false) }];
     let mut child = mk(205, "Support multiple search matches", "feature/multi-match", "feature/search-ruler", "REVIEW_REQUIRED", "BEHIND", Ci::Running, vec![reviewer("reviewer-a", Review::Pending)], 2);
     child.additions = 72;
-    child.checks = vec![Check { name: "unit-tests".into(), state: Ci::Running, url: String::new() }];
+    child.checks = vec![Check { name: "unit-tests".into(), state: Ci::Running, url: String::new(), required: Some(true) }];
     let leaf = mk(206, "Add keyboard shortcuts for sections", "feature/section-shortcuts", "feature/multi-match", "REVIEW_REQUIRED", "CLEAN", Ci::Pass, vec![reviewer("reviewer-a", Review::Pending)], 0);
     let mut draft = mk(207, "Polish compact PR cards", "feature/compact-cards", "main", "", "CLEAN", Ci::None, vec![], 0);
     draft.draft = true;
@@ -185,6 +187,11 @@ impl Pr {
         self.reviewers.iter().filter(|r| r.state == Review::Approved && !r.re_requested).count()
     }
 
+    /// Failing checks branch protection does not require (they do not hold the PR back).
+    pub fn optional_failing(&self) -> usize {
+        self.checks.iter().filter(|c| c.state == Ci::Fail && c.required == Some(false)).count()
+    }
+
     pub fn merge_label(&self) -> Option<&'static str> {
         Some(match self.merge_state.as_str() {
             "DIRTY" => "Conflicts",
@@ -229,6 +236,36 @@ fn s(v: &Value) -> String {
     v.as_str().unwrap_or_default().to_string()
 }
 
+/// The checks of a `statusCheckRollup`, failures first. `isRequired` is read when the query asked
+/// for it.
+fn parse_checks(rollup: &Value) -> Vec<Check> {
+    let mut checks: Vec<Check> = rollup["contexts"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            let required = c["isRequired"].as_bool();
+            if c["__typename"] == "CheckRun" {
+                Check { name: s(&c["name"]), state: ci_of(c["conclusion"].as_str().unwrap_or(""), c["status"].as_str().unwrap_or("")), url: s(&c["detailsUrl"]), required }
+            } else {
+                Check { name: s(&c["context"]), state: ci_of(c["state"].as_str().unwrap_or(""), ""), url: s(&c["targetUrl"]), required }
+            }
+        })
+        .collect();
+    checks.sort_by(|a, b| a.state.cmp(&b.state).then_with(|| a.name.cmp(&b.name)));
+    checks
+}
+
+/// Overall CI state. Once GitHub said which checks are required, a failing optional check no
+/// longer counts as a failure; otherwise GitHub's own rollup state (any failure fails).
+fn ci_of_rollup(rollup: &Value, checks: &[Check]) -> Ci {
+    let Some(st) = rollup["state"].as_str() else { return Ci::None };
+    if !checks.iter().any(|c| c.required.is_some()) {
+        return ci_of(st, "");
+    }
+    checks.iter().filter(|c| !(c.state == Ci::Fail && c.required == Some(false))).map(|c| c.state).min().unwrap_or(Ci::Pass)
+}
+
 fn parse_pr(p: &Value, viewer: &str) -> Option<Pr> {
     let number = p["number"].as_u64()?;
     let mut reviewers: Vec<Reviewer> = p["latestReviews"]["nodes"]
@@ -250,23 +287,8 @@ fn parse_pr(p: &Value, viewer: &str) -> Option<Pr> {
         }
     }
     let rollup = &p["commits"]["nodes"][0]["commit"]["statusCheckRollup"];
-    let mut checks: Vec<Check> = rollup["contexts"]["nodes"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|c| {
-            if c["__typename"] == "CheckRun" {
-                Check { name: s(&c["name"]), state: ci_of(c["conclusion"].as_str().unwrap_or(""), c["status"].as_str().unwrap_or("")), url: s(&c["detailsUrl"]) }
-            } else {
-                Check { name: s(&c["context"]), state: ci_of(c["state"].as_str().unwrap_or(""), ""), url: s(&c["targetUrl"]) }
-            }
-        })
-        .collect();
-    checks.sort_by(|a, b| a.state.cmp(&b.state).then_with(|| a.name.cmp(&b.name)));
-    let ci = match rollup["state"].as_str() {
-        None => Ci::None,
-        Some(st) => ci_of(st, ""),
-    };
+    let checks = parse_checks(rollup);
+    let ci = ci_of_rollup(rollup, &checks);
     Some(Pr {
         number,
         repo: s(&p["repository"]["nameWithOwner"]),
@@ -386,8 +408,54 @@ pub fn fetch(root: &Path, scope: Scope, cancel: &std::sync::atomic::AtomicBool) 
         }
     };
     prs.truncate(MAX_PRS);
+    resolve_required(root, &mut prs, cancel);
     prs.sort_by_key(|p| std::cmp::Reverse(p.updated));
     Ok((slug, prs, total))
+}
+
+/// `isRequired` needs the PR number as an argument, so the search query cannot ask for it. One
+/// follow-up query asks it for the PRs with a failing check only (the only ones it can change);
+/// when that query fails those PRs keep GitHub's rollup state, where any failure fails.
+fn resolve_required(root: &Path, prs: &mut [Pr], cancel: &std::sync::atomic::AtomicBool) {
+    let failing: Vec<usize> = (0..prs.len()).filter(|&i| prs[i].ci == Ci::Fail).collect();
+    if failing.is_empty() {
+        return;
+    }
+    let Some(q) = required_query(&failing.iter().map(|&i| (prs[i].repo.as_str(), prs[i].number)).collect::<Vec<_>>()) else { return };
+    let mut c = Command::new("gh");
+    c.current_dir(root).args(["api", "graphql", "-f"]).arg(format!("query={q}"));
+    let Ok(o) = run_bounded(c, Duration::from_secs(45), Some(cancel)) else { return };
+    let Ok(v) = serde_json::from_slice::<Value>(&o.stdout) else { return };
+    for (k, &i) in failing.iter().enumerate() {
+        let rollup = &v["data"][format!("p{k}")]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"];
+        apply_required(&mut prs[i], rollup);
+    }
+}
+
+/// One aliased lookup (`p0`, `p1`, ...) per `(owner/name, number)`; `None` for a malformed slug.
+fn required_query(prs: &[(&str, u64)]) -> Option<String> {
+    let mut q = String::from("query{");
+    for (k, (slug, n)) in prs.iter().enumerate() {
+        let (owner, name) = slug.split_once('/')?;
+        if [owner, name].iter().any(|x| x.is_empty() || x.contains(['"', '\\'])) {
+            return None;
+        }
+        q += &format!(
+            r#" p{k}: repository(owner:"{owner}", name:"{name}"){{ pullRequest(number:{n}){{ commits(last:1){{ nodes{{ commit{{ statusCheckRollup{{ state contexts(first:100){{ nodes{{ __typename ... on CheckRun{{ name status conclusion detailsUrl isRequired(pullRequestNumber:{n}) }} ... on StatusContext{{ context state targetUrl isRequired(pullRequestNumber:{n}) }} }} }} }} }} }} }} }} }}"#
+        );
+    }
+    Some(q + "}")
+}
+
+/// Replaces the checks of `pr` with `rollup` from [`required_query`] when it says which are
+/// required; leaves `pr` as is otherwise.
+fn apply_required(pr: &mut Pr, rollup: &Value) {
+    let checks = parse_checks(rollup);
+    if checks.is_empty() || checks.iter().all(|c| c.required.is_none()) {
+        return;
+    }
+    pr.ci = ci_of_rollup(rollup, &checks);
+    pr.checks = checks;
 }
 
 /// Groups PRs into stacks (a PR whose base is another PR's head sits on top of it). Each stack is
@@ -505,6 +573,48 @@ mod tests {
         assert_eq!(p.phase(), Phase::Draft);
     }
 
+    /// A rollup as [`required_query`] returns it: `ping` was cancelled, `required` says if the
+    /// failing check is required.
+    fn rollup_with_failing_ping(required: bool) -> Value {
+        serde_json::json!({"state":"FAILURE","contexts":{"nodes":[
+            {"__typename":"CheckRun","name":"ping","status":"COMPLETED","conclusion":"CANCELLED","detailsUrl":"","isRequired":required},
+            {"__typename":"CheckRun","name":"ping","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"","isRequired":required},
+            {"__typename":"StatusContext","context":"coverage-diff","state":"SUCCESS","targetUrl":"","isRequired":true}]}})
+    }
+
+    fn approved_failing() -> Pr {
+        let mut p = pr(1, "a", "main", 0);
+        (p.decision, p.merge_state, p.ci) = ("APPROVED".into(), "BLOCKED".into(), Ci::Fail);
+        p
+    }
+
+    #[test]
+    fn approved_with_only_an_optional_check_failing_is_ready() {
+        let mut p = approved_failing();
+        assert_eq!(p.phase(), Phase::NeedsWork, "without isRequired any failure fails");
+        apply_required(&mut p, &rollup_with_failing_ping(false));
+        assert_eq!((p.ci, p.optional_failing(), p.phase()), (Ci::Pass, 1, Phase::Ready));
+    }
+
+    #[test]
+    fn approved_with_a_required_check_failing_needs_work() {
+        let mut p = approved_failing();
+        apply_required(&mut p, &rollup_with_failing_ping(true));
+        assert_eq!((p.ci, p.optional_failing(), p.phase()), (Ci::Fail, 0, Phase::NeedsWork));
+        let mut q = approved_failing();
+        apply_required(&mut q, &rollup_with_failing_ping(false));
+        q.merge_state = "DIRTY".into();
+        assert_eq!(q.phase(), Phase::NeedsWork, "conflicts still need work");
+    }
+
+    #[test]
+    fn required_query_aliases_each_pr_and_rejects_bad_slugs() {
+        let q = required_query(&[("o/a", 7), ("o/b", 9)]).unwrap();
+        assert!(q.contains(r#"p0: repository(owner:"o", name:"a"){ pullRequest(number:7)"#) && q.contains("isRequired(pullRequestNumber:9)"));
+        assert!(required_query(&[("noslash", 1)]).is_none());
+        assert!(required_query(&[(r#"o/a"){x}"#, 1)]).is_none());
+    }
+
     /// Network: `CT_PRS_REPO=/path/to/clone cargo test real_fetch -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -514,7 +624,7 @@ mod tests {
         let (slug, prs, total) = fetch(Path::new(&root), scope, &std::sync::atomic::AtomicBool::new(false)).unwrap();
         eprintln!("{} of {total}", prs.len());
         for st in stacks(&prs) {
-            let line: Vec<String> = st.iter().map(|&(i, _)| format!("#{} {:?} ci={:?} rv={}", prs[i].number, prs[i].phase(), prs[i].ci, prs[i].reviewers.len())).collect();
+            let line: Vec<String> = st.iter().map(|&(i, _)| format!("#{} {:?} ci={:?} optfail={} rv={}", prs[i].number, prs[i].phase(), prs[i].ci, prs[i].optional_failing(), prs[i].reviewers.len())).collect();
             eprintln!("{slug}: {}", line.join("  ->  "));
         }
         assert!(!prs.is_empty());
