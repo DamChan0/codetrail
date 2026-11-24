@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.7
 
 - **Optional failing checks no longer mark a PR "Needs work"**: only a failing check that branch protection requires does. Optional failures show as a dim "N optional failing" chip on the card, and the inspector tags every check *required* or *optional*. When GitHub cannot say which checks are required, any failure still counts.
 
