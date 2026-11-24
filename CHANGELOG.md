@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Tab in the Open folder path box (local and remote) now reaches the suggestions**: Tab completes the common prefix, then highlights the first suggestion and cycles (Shift+Tab back), Enter accepts. Before, egui moved keyboard focus to the next widget on Tab, so the dropdown never got it. Esc likewise closes only the dropdown and keeps the cursor in the field; with the dropdown closed, Tab moves focus as usual.
+
 ## 0.5.7
 
 - **Optional failing checks no longer mark a PR "Needs work"**: only a failing check that branch protection requires does. Optional failures show as a dim "N optional failing" chip on the card, and the inspector tags every check *required* or *optional*. When GitHub cannot say which checks are required, any failure still counts.

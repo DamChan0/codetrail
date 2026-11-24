@@ -224,7 +224,8 @@ pub struct FieldOut {
 /// Path text field with the dropdown under it. Keys while the field has focus:
 /// Tab completes the common prefix, or (nothing to complete / a row already highlighted) steps
 /// through the dropdown like Down (Shift+Tab back, both wrap); Up/Down move in the dropdown, Enter accepts the highlighted row (otherwise
-/// submits), Esc closes the dropdown (a second Esc is left for the dialog).
+/// submits), Esc closes the dropdown (a second Esc is left for the dialog). Once the dropdown is
+/// closed (Esc, click outside, a folder opened) Tab moves focus as usual.
 pub fn path_field(ui: &mut Ui, th: &crate::theme::Theme, text: &mut String, a: &mut Auto, salt: &str, hint: &str, width: f32, grab_focus: bool) -> FieldOut {
     let id = Id::new(("path_field", salt));
     track_ime(ui.ctx(), a);
@@ -253,17 +254,19 @@ pub fn path_field(ui: &mut Ui, th: &crate::theme::Theme, text: &mut String, a: &
         } else if ui.input(|i| i.key_pressed(Key::Enter)) {
             out.submit = true;
         }
-        if ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab)) && shown {
-            a.cycle_sel(false);
-        }
-        if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
-            match (a.sel, tab_complete(a.parent_str(), &a.seg, &a.matches)) {
-                (None, Some(t)) => {
-                    *text = t;
-                    changed = true;
+        if a.open {
+            if ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab)) && shown {
+                a.cycle_sel(false);
+            }
+            if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
+                match (a.sel, tab_complete(a.parent_str(), &a.seg, &a.matches)) {
+                    (None, Some(t)) => {
+                        *text = t;
+                        changed = true;
+                    }
+                    _ if shown => a.cycle_sel(true),
+                    _ => {}
                 }
-                _ if shown => a.cycle_sel(true),
-                _ => {}
             }
         }
     }
@@ -337,6 +340,11 @@ pub fn path_field(ui: &mut Ui, th: &crate::theme::Theme, text: &mut String, a: &
             }
         }
     }
+    // egui turns Tab and Esc into focus moves when the next frame begins, before any widget
+    // runs, unless the focused widget's filter claims them; `consume_key` above cannot undo
+    // that. Claim them for this field while they have work here.
+    let filter = egui::EventFilter { tab: a.open, escape: a.visible(), horizontal_arrows: true, vertical_arrows: true };
+    ui.memory_mut(|m| m.set_focus_lock_filter(id, filter));
     out
 }
 
@@ -463,5 +471,47 @@ mod tests {
         a.edit("abc", Instant::now());
         assert!(!a.visible());
         assert_eq!(a.poll(Instant::now() + DEBOUNCE * 3), Poll::Idle);
+    }
+
+    fn key(k: Key, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    /// Runs real egui frames, so egui's own Tab/Esc focus handling is in the loop (the pure
+    /// cycling tests above passed while Tab still left the field).
+    #[test]
+    fn tab_and_esc_stay_in_the_field_while_the_dropdown_needs_them() {
+        let ctx = egui::Context::default();
+        let th = crate::theme::Theme { file: crate::theme::ThemeFile::default(), ui_font: 14.0, code_font: 13.0 };
+        let mut text = "/p/a".to_string();
+        let mut a = Auto::default();
+        let t0 = Instant::now();
+        a.edit(&text, t0);
+        let Poll::Request { token, .. } = a.poll(t0 + DEBOUNCE) else { panic!("due") };
+        a.arrived(token, "/p/", Some(["alpha", "alpine", "apple"].map(|n| Child { name: n.into(), is_git: false }).to_vec()));
+        let id = Id::new(("path_field", "t"));
+        let frame = |text: &mut String, a: &mut Auto, events: Vec<egui::Event>, grab: bool| {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0))), events, ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    path_field(ui, &th, text, a, "t", "", 400.0, grab);
+                    let _ = ui.button("next");
+                });
+            });
+            ctx.memory(|m| m.has_focus(id))
+        };
+        frame(&mut text, &mut a, vec![], true);
+        assert!(frame(&mut text, &mut a, vec![], false));
+        assert!(frame(&mut text, &mut a, vec![key(Key::Tab, Modifiers::NONE)], false), "Tab must not leave the field");
+        assert_eq!(a.sel, Some(0), "first Tab highlights the first suggestion");
+        assert!(frame(&mut text, &mut a, vec![key(Key::Tab, Modifiers::NONE)], false));
+        assert_eq!(a.sel, Some(1));
+        assert!(frame(&mut text, &mut a, vec![key(Key::Tab, Modifiers::SHIFT)], false));
+        assert_eq!(a.sel, Some(0));
+        assert!(frame(&mut text, &mut a, vec![key(Key::Escape, Modifiers::NONE)], false), "Esc closes the dropdown, not the focus");
+        assert!(!a.visible());
+        frame(&mut text, &mut a, vec![], false);
+        assert!(!frame(&mut text, &mut a, vec![key(Key::Tab, Modifiers::NONE)], false), "dropdown closed: Tab moves focus on");
+        assert_eq!(text, "/p/a");
     }
 }
