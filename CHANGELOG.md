@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **Tab in the Open folder path box (local and remote) now reaches the suggestions**: Tab completes the common prefix, then highlights the first suggestion and cycles (Shift+Tab back), Enter accepts. Before, egui moved keyboard focus to the next widget on Tab, so the dropdown never got it. Esc likewise closes only the dropdown and keeps the cursor in the field; with the dropdown closed, Tab moves focus as usual.
+- **The PRs page follows the active GitHub CLI account**: after `gh auth login`, `logout` or `switch`, the list, reviewers, checks, *Review requested* and the activity-bar badge reload as the new account: on the next refresh check while the page is open, or when the window regains focus. The header shows the account (`@login`) the list was loaded as. Switching accounts clears the selection and phase filter, and a failed load after a switch no longer leaves the previous account's PRs on screen. Before, the page kept the old account's PRs until the minute timer or Refresh.
 
 ## 0.5.7
 

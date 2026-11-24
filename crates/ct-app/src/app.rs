@@ -218,7 +218,7 @@ pub enum Msg {
     RunReview { res: Result<(String, String), String> },
     UpdCheck(Result<Option<crate::updater::Release>, String>),
     UpdInstalled(Result<String, String>),
-    Prs { scope: crate::prs::Scope, res: Result<(String, Vec<crate::prs::Pr>, usize), String> },
+    Prs { scope: crate::prs::Scope, res: Result<crate::prs::Fetched, String> },
 }
 
 pub const REMOTE_RO: &str = "remote repositories are read-only";

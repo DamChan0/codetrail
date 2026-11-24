@@ -8,7 +8,7 @@ use crate::prs::{Ci, Phase, Pr, Review, Scope};
 use crate::theme::{mix, Theme};
 use crate::widgets::{self, Btn, BtnKind, Icon, Level};
 use egui::{pos2, vec2, Align, Color32, Key, Layout, Modifiers, Rect, RichText, ScrollArea, Sense, Stroke, Ui};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Refresh interval while the page is open.
 pub const REFRESH: Duration = Duration::from_secs(60);
@@ -37,6 +37,13 @@ const DETAIL_W: f32 = 380.0;
 pub struct PrsState {
     pub scope: Scope,
     pub list: Option<(String, Vec<Pr>)>,
+    /// The gh account `list` was loaded as.
+    pub login: Option<String>,
+    /// [`crate::prs::gh_auth_stamp`] when the last load started, and when the load of `list` did:
+    /// a different stamp now means the active gh account may have changed since.
+    pub auth: Option<SystemTime>,
+    pub list_auth: Option<SystemTime>,
+    pub was_focused: bool,
     /// How many PRs match in total (more than loaded when over [`crate::prs::MAX_PRS`]).
     pub total: usize,
     pub loading: bool,
@@ -123,7 +130,28 @@ impl App {
         if self.remote.is_some() || self.prs.loading || self.repo.is_none() {
             return;
         }
-        if self.prs.at.is_none_or(|t| t.elapsed() >= REFRESH) {
+        if self.prs.at.is_none_or(|t| t.elapsed() >= REFRESH) || self.prs_account_changed() {
+            self.prs_fetch();
+        }
+    }
+
+    /// gh logged in, out or switched accounts since the last load.
+    fn prs_account_changed(&self) -> bool {
+        self.prs.at.is_some() && crate::prs::gh_auth_stamp() != self.prs.auth
+    }
+
+    /// `gh auth switch` happens in a terminal: when the window comes back, reload if the account
+    /// changed, so the activity-bar badge follows it too (the page itself also checks every
+    /// refresh).
+    pub fn prs_focus_tick(&mut self, ctx: &egui::Context) {
+        if self.smoke.is_some() {
+            return;
+        }
+        if !ctx.input(|i| i.focused) {
+            self.prs.was_focused = false;
+            return;
+        }
+        if !std::mem::replace(&mut self.prs.was_focused, true) && self.remote.is_none() && self.repo.is_some() && !self.prs.loading && self.prs_account_changed() {
             self.prs_fetch();
         }
     }
@@ -133,29 +161,44 @@ impl App {
         let scope = self.prs.scope;
         self.prs.loading = true;
         self.prs.at = Some(Instant::now());
+        self.prs.auth = crate::prs::gh_auth_stamp();
         self.jobs.spawn(JobKind::Prs, move |c| {
             let res = crate::prs::fetch(&root, scope, &c.cancel);
             c.finish(crate::app::Msg::Prs { scope, res });
         });
     }
 
-    pub fn prs_loaded(&mut self, scope: crate::prs::Scope, res: Result<(String, Vec<Pr>, usize), String>) {
+    pub fn prs_loaded(&mut self, scope: crate::prs::Scope, res: Result<crate::prs::Fetched, String>) {
         if self.smoke.as_ref().is_some_and(|s| s.scene == "prs") || scope != self.prs.scope {
             return;
         }
         self.prs.loading = false;
         self.prs.at = Some(Instant::now());
         match res {
-            Ok((slug, prs, total)) => {
+            Ok(f) => {
                 self.prs.error = None;
                 self.prs.auth_prompt = false;
-                if self.prs.selected.is_some_and(|n| !prs.iter().any(|p| p.number == n)) {
+                if self.prs.login.as_ref().is_some_and(|l| *l != f.login) {
+                    // another account: its selection and filter mean nothing here
+                    self.prs.selected = None;
+                    self.prs.filter = None;
+                }
+                if self.prs.selected.is_some_and(|n| !f.prs.iter().any(|p| p.number == n)) {
                     self.prs.selected = None;
                 }
-                self.prs.total = total;
-                self.prs.list = Some((slug, prs));
+                self.prs.total = f.total;
+                self.prs.list = Some((f.slug, f.prs));
+                self.prs.login = Some(f.login);
+                self.prs.list_auth = self.prs.auth;
             }
             Err(e) => {
+                // An error keeps the last list, unless that list may be another account's.
+                if self.prs.list_auth != self.prs.auth {
+                    self.prs.list = None;
+                    self.prs.login = None;
+                    self.prs.selected = None;
+                    self.prs.total = 0;
+                }
                 self.prs.auth_prompt = crate::prs::needs_gh_login(&e);
                 self.prs.error = Some(e);
             }
@@ -251,6 +294,9 @@ impl App {
                 ui.label(RichText::new("Pull requests").font(widgets::heading_font(th)).color(th.fg()));
                 if let Some((slug, _)) = &self.prs.list {
                     ui.label(RichText::new(slug).font(widgets::mono_font(th)).color(th.muted()));
+                }
+                if let Some(login) = &self.prs.login {
+                    ui.label(RichText::new(format!("@{login}")).font(widgets::small_font(th)).color(th.muted())).on_hover_text("GitHub CLI account these pull requests were loaded as. `gh auth switch` changes it; the page follows.");
                 }
                 let mut i = usize::from(self.prs.scope == Scope::ReviewRequested);
                 if widgets::segmented(ui, th, &["Mine", "Review requested"], &mut i) {
@@ -725,12 +771,44 @@ mod tests {
         frame(&mut app, Some(Key::ArrowDown));
         assert_eq!(app.prs.selected, Some(2), "the filter limits keyboard order to matching PRs");
         // a late answer for the other scope is ignored
-        app.prs_loaded(Scope::ReviewRequested, Ok(("o/n".into(), vec![], 0)));
+        app.prs_loaded(Scope::ReviewRequested, Ok(fetched("ann", vec![])));
         assert_eq!(app.prs.list.as_ref().unwrap().1.len(), 3);
         app.prs_loaded(Scope::Mine, Err("gh is not logged in".into()));
         assert!(app.prs.error.is_some() && app.prs.list.is_some(), "an error keeps the last list");
         assert!(app.prs.auth_prompt, "authentication failures open the sign-in prompt");
         frame(&mut app, None);
+    }
+
+    fn fetched(login: &str, prs: Vec<Pr>) -> crate::prs::Fetched {
+        crate::prs::Fetched { slug: "o/n".into(), login: login.into(), total: prs.len(), prs }
+    }
+
+    #[test]
+    fn a_gh_account_switch_replaces_the_view_and_never_leaves_the_old_accounts_prs() {
+        let ctx = egui::Context::default();
+        let mut app = crate::ui::settings_window_tests::test_app(&ctx);
+        let (t0, t1) = (SystemTime::UNIX_EPOCH, SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        app.prs.auth = Some(t0);
+        app.prs_loaded(Scope::Mine, Ok(fetched("ann", vec![pr(1, "a", "main", "", Ci::Pass), pr(2, "b", "main", "", Ci::Fail)])));
+        app.prs.selected = Some(1);
+        app.prs.filter = Some(Phase::Ready);
+        // same account, PR 1 still there: the view is kept
+        app.prs_loaded(Scope::Mine, Ok(fetched("ann", vec![pr(1, "a", "main", "", Ci::Pass)])));
+        assert_eq!((app.prs.selected, app.prs.filter), (Some(1), Some(Phase::Ready)));
+        // a transient failure with the same account keeps ann's list
+        app.prs_loaded(Scope::Mine, Err("GitHub timed out answering".into()));
+        assert_eq!(app.prs.login.as_deref(), Some("ann"));
+        assert!(app.prs.list.is_some());
+        // `gh auth switch`: a load started after it answers as bob, with the same PR number
+        app.prs.auth = Some(t1);
+        app.prs_loaded(Scope::Mine, Ok(fetched("bob", vec![pr(1, "a", "main", "", Ci::Pass)])));
+        assert_eq!(app.prs.login.as_deref(), Some("bob"));
+        assert_eq!((app.prs.selected, app.prs.filter), (None, None), "ann's selection and filter are dropped");
+        // switch again, and this time the load fails: bob's PRs must not stay on screen
+        app.prs.auth = Some(t0);
+        app.prs_loaded(Scope::Mine, Err("HTTP 401: Bad credentials".into()));
+        assert!(app.prs.list.is_none() && app.prs.login.is_none(), "the previous account's list is dropped");
+        assert!(app.prs.error.is_some() && app.prs.auth_prompt);
     }
 
     #[test]

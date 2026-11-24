@@ -4,9 +4,10 @@
 
 use crate::proc::run_bounded;
 use serde_json::Value;
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Scope {
@@ -20,6 +21,31 @@ pub fn needs_gh_login(error: &str) -> bool {
     let e = error.to_ascii_lowercase();
     ["auth login", "not logged in", "http 401", "http 403", "bad credentials", "resource not accessible", "authentication required", "must have admin rights", "saml"]
         .iter().any(|needle| e.contains(needle))
+}
+
+/// gh's `hosts.yml`, where it records the active account; `gh auth login`, `logout` and `switch`
+/// rewrite it. Same lookup as gh: `GH_CONFIG_DIR`, then `XDG_CONFIG_HOME/gh`, then `~/.config/gh`.
+fn gh_hosts_file(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let var = |k: &str| var(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let dir = var("GH_CONFIG_DIR").or_else(|| var("XDG_CONFIG_HOME").map(|d| d.join("gh"))).or_else(|| var("HOME").map(|h| h.join(".config/gh")))?;
+    Some(dir.join("hosts.yml"))
+}
+
+/// Changes whenever the active gh account may have changed (one `stat`).
+pub fn gh_auth_stamp() -> Option<SystemTime> {
+    std::fs::metadata(gh_hosts_file(|k| std::env::var_os(k))?).and_then(|m| m.modified()).ok()
+}
+
+/// One load of the PRs page.
+#[derive(Debug)]
+pub struct Fetched {
+    pub slug: String,
+    /// The gh account the PRs were loaded as (GitHub's `viewer`).
+    pub login: String,
+    /// Newest update first, at most [`MAX_PRS`].
+    pub prs: Vec<Pr>,
+    /// How many match in total.
+    pub total: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -320,8 +346,9 @@ pub fn parse(json: &[u8]) -> Result<Vec<Pr>, String> {
     Ok(prs)
 }
 
-/// One page of the search: its PRs, the cursor of the next page, the total match count.
-pub fn parse_page(json: &[u8]) -> Result<(Vec<Pr>, Option<String>, usize), String> {
+/// One page of the search: its PRs, the cursor of the next page, the total match count, the
+/// viewer's login.
+pub fn parse_page(json: &[u8]) -> Result<(Vec<Pr>, Option<String>, usize, String), String> {
     let v: Value = serde_json::from_slice(json).map_err(|e| format!("unexpected answer from gh: {e}"))?;
     if let Some(e) = v["errors"][0]["message"].as_str() {
         return Err(e.to_string());
@@ -330,7 +357,7 @@ pub fn parse_page(json: &[u8]) -> Result<(Vec<Pr>, Option<String>, usize), Strin
     let viewer = s(&v["data"]["viewer"]["login"]);
     let prs = search["nodes"].as_array().ok_or("unexpected answer from gh")?.iter().filter_map(|p| parse_pr(p, &viewer)).collect();
     let next = (search["pageInfo"]["hasNextPage"] == true).then(|| search["pageInfo"]["endCursor"].as_str().map(str::to_string)).flatten();
-    Ok((prs, next, search["issueCount"].as_u64().unwrap_or(0) as usize))
+    Ok((prs, next, search["issueCount"].as_u64().unwrap_or(0) as usize, viewer))
 }
 
 /// PRs per request: the per-PR checks and threads make bigger pages time out (HTTP 504).
@@ -359,7 +386,6 @@ const QUERY: &str = r#"query($q:String!, $n:Int!, $after:String){ viewer{login} 
  commits(last:1){ nodes{ commit{ statusCheckRollup{ state contexts(first:100){ nodes{ __typename ... on CheckRun{ name status conclusion detailsUrl } ... on StatusContext{ context state targetUrl } } } } } } }
 }}}}"#;
 
-/// Fetches the open PRs of the repository at `root` (its `origin` remote must be on GitHub).
 /// GitHub search for a scope. Mine: open PRs I wrote in this repository. Review requested: like
 /// GitHub's own review list, PRs anywhere in the owner's organisation that ask me personally (not
 /// through a team), open, not draft, not archived.
@@ -373,9 +399,9 @@ pub fn search_query(slug: &str, scope: Scope) -> String {
     }
 }
 
-/// Returns the repository slug, the PRs (newest update first, at most [`MAX_PRS`]) and how many
-/// match in total.
-pub fn fetch(root: &Path, scope: Scope, cancel: &std::sync::atomic::AtomicBool) -> Result<(String, Vec<Pr>, usize), String> {
+/// Fetches the open PRs of the repository at `root` (its `origin` remote must be on GitHub) as
+/// the active gh account.
+pub fn fetch(root: &Path, scope: Scope, cancel: &std::sync::atomic::AtomicBool) -> Result<Fetched, String> {
     let mut g = Command::new("git");
     g.arg("-C").arg(root).args(["remote", "get-url", "origin"]);
     let o = run_bounded(g, Duration::from_secs(5), Some(cancel))?;
@@ -383,7 +409,7 @@ pub fn fetch(root: &Path, scope: Scope, cancel: &std::sync::atomic::AtomicBool) 
     let slug = github_slug(&url).ok_or_else(|| format!("origin is not a GitHub repository ({})", url.trim()))?;
     let q = search_query(&slug, scope);
     let (mut prs, mut after) = (Vec::new(), None::<String>);
-    let total = loop {
+    let (total, login) = loop {
         let mut c = Command::new("gh");
         c.current_dir(root).args(["api", "graphql", "-F"]).arg(format!("q={q}")).args(["-F", &format!("n={PAGE}")]).arg("-f").arg(format!("query={QUERY}"));
         if let Some(a) = &after {
@@ -400,17 +426,17 @@ pub fn fetch(root: &Path, scope: Scope, cancel: &std::sync::atomic::AtomicBool) 
                 format!("gh failed: {e}")
             });
         }
-        let (page, next, n) = parse_page(&o.stdout)?;
+        let (page, next, n, viewer) = parse_page(&o.stdout)?;
         prs.extend(page);
         match next {
             Some(cur) if prs.len() < MAX_PRS => after = Some(cur),
-            _ => break n,
+            _ => break (n, viewer),
         }
     };
     prs.truncate(MAX_PRS);
     resolve_required(root, &mut prs, cancel);
     prs.sort_by_key(|p| std::cmp::Reverse(p.updated));
-    Ok((slug, prs, total))
+    Ok(Fetched { slug, login, prs, total })
 }
 
 /// `isRequired` needs the PR number as an argument, so the search query cannot ask for it. One
@@ -531,6 +557,15 @@ mod tests {
     }
 
     #[test]
+    fn gh_account_state_is_watched_where_gh_keeps_it() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|p| p.0 == k).map(|p| OsString::from(p.1));
+        assert_eq!(gh_hosts_file(env(&[("GH_CONFIG_DIR", "/g"), ("XDG_CONFIG_HOME", "/x"), ("HOME", "/h")])), Some(PathBuf::from("/g/hosts.yml")));
+        assert_eq!(gh_hosts_file(env(&[("GH_CONFIG_DIR", ""), ("XDG_CONFIG_HOME", "/x"), ("HOME", "/h")])), Some(PathBuf::from("/x/gh/hosts.yml")), "empty means unset");
+        assert_eq!(gh_hosts_file(env(&[("HOME", "/h")])), Some(PathBuf::from("/h/.config/gh/hosts.yml")));
+        assert_eq!(gh_hosts_file(env(&[])), None);
+    }
+
+    #[test]
     fn review_requested_matches_the_github_review_list_query() {
         assert_eq!(search_query("bearrobotics/pennybot", Scope::ReviewRequested), "is:pr user-review-requested:@me archived:false is:open user:bearrobotics draft:false sort:updated-desc");
         assert_eq!(search_query("o/n", Scope::Mine), "repo:o/n is:pr is:open author:@me sort:updated-desc");
@@ -621,8 +656,8 @@ mod tests {
     fn real_fetch() {
         let root = std::env::var("CT_PRS_REPO").expect("CT_PRS_REPO");
         let scope = if std::env::var("CT_PRS_SCOPE").is_ok_and(|s| s == "review") { Scope::ReviewRequested } else { Scope::Mine };
-        let (slug, prs, total) = fetch(Path::new(&root), scope, &std::sync::atomic::AtomicBool::new(false)).unwrap();
-        eprintln!("{} of {total}", prs.len());
+        let Fetched { slug, login, prs, total } = fetch(Path::new(&root), scope, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        eprintln!("{} of {total} as {login}", prs.len());
         for st in stacks(&prs) {
             let line: Vec<String> = st.iter().map(|&(i, _)| format!("#{} {:?} ci={:?} optfail={} rv={}", prs[i].number, prs[i].phase(), prs[i].ci, prs[i].optional_failing(), prs[i].reviewers.len())).collect();
             eprintln!("{slug}: {}", line.join("  ->  "));

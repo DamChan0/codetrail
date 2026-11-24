@@ -79,6 +79,7 @@ impl eframe::App for App {
         }
         self.debounce(ctx);
         self.wt_tick(ctx);
+        self.prs_focus_tick(ctx);
         self.res_tick(ctx);
         self.tt_keys(ctx);
         if self.editor.is_some() && self.centre == Centre::Editor {
