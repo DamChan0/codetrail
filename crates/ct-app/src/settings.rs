@@ -82,6 +82,9 @@ pub struct Settings {
     pub view_mode: ViewMode,
     /// Wrap long lines in the editor.
     pub wrap: bool,
+    pub vim_mode: bool,
+    /// Case-sensitive Vim bindings to pass through to the native file editor.
+    pub vim_excluded_keys: std::collections::BTreeSet<String>,
     pub startup: Startup,
     /// Show app/run memory and CPU in the status bar.
     pub status_monitor: bool,
@@ -113,6 +116,8 @@ impl Default for Settings {
             inspector_width: 360.0,
             view_mode: ViewMode::Diff,
             wrap: false,
+            vim_mode: false,
+            vim_excluded_keys: Default::default(),
             startup: Startup::Last,
             status_monitor: true,
             remotes: Vec::new(),
@@ -187,6 +192,8 @@ mod tests {
         let mut s = Settings::default();
         s.code_font_size = 15.0;
         s.split_view = true;
+        s.vim_mode = true;
+        s.vim_excluded_keys.insert("j".into());
         s.save(&p).unwrap();
         assert_eq!(Settings::load(&p), (s, None));
         std::fs::write(&p, "ui_font_size = 16.0\n").unwrap();

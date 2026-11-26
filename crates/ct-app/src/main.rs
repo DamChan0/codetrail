@@ -7,6 +7,7 @@ mod agentvm;
 mod app;
 mod diffmodel;
 mod editor;
+mod editor_vim;
 mod fonts;
 mod fsutil;
 mod highlight;

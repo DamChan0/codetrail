@@ -482,6 +482,28 @@ impl App {
     fn sec_shortcuts(&mut self, ui: &mut Ui) {
         use crate::keymap;
         let th = self.th.clone();
+        widgets::heading(ui, &th, "File editor");
+        if ui.checkbox(&mut self.settings.vim_mode, "Enable Vim bindings").changed() {
+            self.settings_dirty_at = Some(Instant::now());
+        }
+        if self.settings.vim_mode {
+            hint(ui, &th, "Uncheck a key to leave it to the standard editor. Bindings only apply while the file editor has focus.");
+            ui.horizontal_wrapped(|ui| {
+                for (key, action) in crate::editor_vim::BINDINGS {
+                    let mut enabled = !self.settings.vim_excluded_keys.contains(key);
+                    if ui.checkbox(&mut enabled, format!("{key} · {action}")).changed() {
+                        if enabled {
+                            self.settings.vim_excluded_keys.remove(key);
+                        } else {
+                            self.settings.vim_excluded_keys.insert(key.into());
+                        }
+                        self.settings_dirty_at = Some(Instant::now());
+                    }
+                }
+            });
+        }
+        ui.add_space(12.0);
+        widgets::heading(ui, &th, "App shortcuts");
         if let Some(c) = self.key_capture {
             let got = ui.input_mut(|i| {
                 let ev = i.events.iter().find_map(|e| match e {

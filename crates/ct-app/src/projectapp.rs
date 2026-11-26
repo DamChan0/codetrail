@@ -663,6 +663,80 @@ mod tests {
     }
 
     #[test]
+    fn file_editor_vim_moves_without_typing_and_excluded_keys_keep_native_input() {
+        let d = tempfile::tempdir().unwrap();
+        let a = repo(d.path(), "alpha", "a.txt");
+        let original = "한글 abc\nx\nthird line";
+        std::fs::write(a.join("a.txt"), original).unwrap();
+        let mut app = app_for(a);
+        app.settings.vim_mode = true;
+        pump_until(&mut app, "repo", |x| x.repo.is_some());
+        app.open_editor("a.txt", Some(1));
+        pump_until(&mut app, "loaded", |x| x.editor.as_ref().is_some_and(|e| e.load.ready().is_some()));
+        let ctx = app.ctx.clone();
+        let frame = |app: &mut App, events: Vec<egui::Event>| {
+            let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+                app.shortcuts(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| app.editor_ui(ui));
+            });
+        };
+        let text = |s: &str| egui::Event::Text(s.into());
+        let key = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let cursor = || egui::text_edit::TextEditState::load(&ctx, egui::Id::new("editor_text"))
+            .unwrap().cursor.char_range().unwrap().primary.index;
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![text("$"), text("j"), text("j")]);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_line, 3);
+        assert_eq!(cursor(), "한글 abc\nx\n".chars().count() + 5, "j restores the column after a short line");
+        frame(&mut app, vec![key(egui::Key::G), text("g"), key(egui::Key::G), text("g")]);
+        assert_eq!(cursor(), 0);
+        assert_eq!(app.editor.as_ref().unwrap().text, original);
+        frame(&mut app, vec![text("i"), text("Z")]);
+        frame(&mut app, vec![key(egui::Key::Escape)]);
+        frame(&mut app, vec![text("j")]);
+        let e = app.editor.as_ref().unwrap();
+        assert_eq!(e.text, format!("Z{original}"));
+        assert_eq!(e.cursor_line, 2, "Escape keeps focus and restores Normal");
+        app.settings.vim_excluded_keys.insert("j".into());
+        frame(&mut app, vec![text("j")]);
+        let e = app.editor.as_ref().unwrap();
+        assert_eq!(e.text, "Z한글 abc\njx\nthird line");
+        assert_eq!(e.cursor_line, 2, "an excluded key uses native editor behavior");
+    }
+
+    #[test]
+    fn file_editor_gutter_numbers_source_lines_not_wrapped_rows() {
+        let d = tempfile::tempdir().unwrap();
+        let a = repo(d.path(), "alpha", "a.txt");
+        let text = format!("{}\nsecond\n", "wrap here ".repeat(8));
+        std::fs::write(a.join("a.txt"), &text).unwrap();
+        let mut app = app_for(a);
+        app.settings.wrap = true;
+        pump_until(&mut app, "repo", |x| x.repo.is_some());
+        app.open_editor("a.txt", None);
+        pump_until(&mut app, "loaded", |x| x.editor.as_ref().is_some_and(|e| e.load.ready().is_some()));
+        let ctx = app.ctx.clone();
+        let out = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 400.0))),
+            ..Default::default()
+        }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.editor_ui(ui));
+        });
+        let painted: Vec<_> = out.shapes.iter().filter_map(|s| match &s.shape {
+            egui::Shape::Text(t) => Some(t),
+            _ => None,
+        }).collect();
+        let code = painted.iter().find(|t| t.galley.text() == text).unwrap();
+        let numbers: Vec<_> = painted.iter().filter(|t| t.galley.text().parse::<u32>().is_ok()).collect();
+        assert_eq!(numbers.iter().map(|t| t.galley.text()).collect::<Vec<_>>(), ["1", "2", "3"]);
+        let first_end = code.galley.rows.iter().position(|r| r.ends_with_newline).unwrap();
+        assert!(first_end > 0, "fixture must wrap");
+        let row = &code.galley.rows[first_end + 1];
+        let number_center = numbers[1].pos.y + numbers[1].galley.size().y / 2.0;
+        assert!((number_center - (code.pos.y + row.rect.center().y)).abs() < 1.0);
+    }
+
+    #[test]
     fn only_git_repositories_can_be_opened() {
         let d = tempfile::tempdir().unwrap();
         let a = repo(d.path(), "alpha", "a.txt");

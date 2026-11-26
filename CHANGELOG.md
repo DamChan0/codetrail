@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.10
+
+- **File editor:** line numbers stay visible while scrolling horizontally and follow source lines when wrapping is enabled. Settings > Shortcuts adds optional Vim navigation and per-key exclusions.
+
 ## 0.5.9
 
 - **Remotes: pick a Tailscale peer from the Host field**: the add/edit form lists the tailnet (`name — 100.x.y.z · OS`, online first, offline only on request, filtered by what you type, plus *Type manually*). Picking fills Host with the peer's Tailscale IP and Name with its host name; User is prefilled only from a saved remote or `~/.ssh/config` and says where from. Replaces the separate *Discover Tailscale peers* panel. Without Tailscale, Host stays a text field with a short note.

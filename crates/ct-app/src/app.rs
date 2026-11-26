@@ -309,7 +309,7 @@ pub struct EditorState {
     /// (text key, per line: (byte offset, char offset) of its start), for match painting.
     pub line_index: Option<(u64, Arc<Vec<(usize, usize)>>)>,
     pub cursor_line: u32,
-    pub spans_key: u64,
+    pub(crate) vim: crate::editor_vim::Vim,
 }
 
 impl EditorState {
@@ -1274,7 +1274,7 @@ impl App {
             layout_cache: None,
             line_index: None,
             cursor_line: 1,
-            spans_key: 0,
+            vim: Default::default(),
         });
         let p = path.to_string();
         self.jobs.spawn(JobKind::Load, move |c| {

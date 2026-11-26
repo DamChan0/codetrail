@@ -88,6 +88,8 @@ GUI 유휴 CPU ≈0.6%, RSS 86–104MB(팀 테스트 보고 수치, 이 문서 �
 
 `~/.config/codetrail/config.toml`, `theme.toml` (키 목록은 [README.md](README.md#configuration)). 섹션 이동은 `Ctrl+1` Commits, `Ctrl+2` Changes, `Ctrl+4` Files, `Ctrl+6` Runs, `Ctrl+Shift+P` PRs. 그 밖에 `Ctrl+P` 파일, `Ctrl+Shift+F` 검색, `Ctrl+K` 팔레트, `Ctrl+O` 프로젝트, `Ctrl+B` base, `Ctrl+E`/`Ctrl+S` 편집/저장, `Ctrl+G` 줄 이동, `Ctrl+L` Ask AI, `Ctrl+Shift+C` 코드 위치 복사. Ctrl 단축키는 Settings > Shortcuts에서 바꿀 수 있음 (`config.toml`의 `[keys]`).
 
+파일 뷰 왼쪽에 원본 줄 번호가 표시된다. 줄바꿈으로 여러 화면 줄에 걸쳐도 번호는 한 번만 표시된다. **Settings > Shortcuts > File editor**에서 Vim 바인딩을 켜면 `h/j/k/l`, `0`/`$`, `gg`/`G`로 이동할 수 있다. 편집 가능한 파일에서 `i`/`a`는 Insert 모드, `Esc`는 Normal 모드로 전환한다. 개별 키의 체크를 해제하면 해당 키는 기본 편집기 동작을 따르며, 기존 앱 단축키는 그대로 작동한다.
+
 ## 문제 해결
 
 - 모델이 안 보임: 로그인 여부, `claude`/`codex` CLI 설치, Pi 런타임 설치(`npm` + 네트워크) 확인.

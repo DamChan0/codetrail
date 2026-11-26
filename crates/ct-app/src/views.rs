@@ -29,6 +29,28 @@ pub fn line_index(text: &str) -> Vec<(usize, usize)> {
     v
 }
 
+fn paint_editor_gutter(ui: &Ui, th: &Theme, rect: Rect, galley: &egui::Galley, y: f32, wrap: bool, cursor_line: u32) {
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, th.raised());
+    painter.vline(rect.right(), rect.y_range(), egui::Stroke::new(1.0, th.border()));
+    let rows = &galley.rows;
+    let first = rows.partition_point(|r| r.rect.bottom() + y <= rect.top());
+    let mut line = if wrap { rows[..first].iter().filter(|r| r.ends_with_newline).count() } else { first } + 1;
+    let mut start = first == 0 || rows[first - 1].ends_with_newline;
+    let mono = widgets::mono_font(th);
+    for row in &rows[first..] {
+        if row.rect.top() + y >= rect.bottom() {
+            break;
+        }
+        if start {
+            let color = if line == cursor_line as usize { th.fg() } else { th.muted() };
+            painter.text(pos2(rect.right() - 8.0, y + row.rect.center().y), egui::Align2::RIGHT_CENTER, line.to_string(), mono.clone(), color);
+        }
+        start = row.ends_with_newline;
+        line += usize::from(start);
+    }
+}
+
 /// Overview ruler beside the editor: the visible part of the file as a band, one marker per
 /// matching line. A hovered marker grows and names its line; a click returns that line.
 #[allow(clippy::too_many_arguments)]
@@ -711,8 +733,6 @@ impl App {
             ci
         });
         let mut cache = e.layout_cache.take();
-        let mut out_cursor: Option<usize> = None;
-        let mut scroll_rect: Option<Rect> = None;
         let th2 = th.clone();
         let wrap_on = self.settings.wrap;
         // Search matches of this file as char ranges: every range of every hit (only while the
@@ -725,6 +745,21 @@ impl App {
                 v
             }
         };
+        let vim = self.settings.vim_mode && self.palette.open.is_none() && !e.goto_open;
+        let excluded = &self.settings.vim_excluded_keys;
+        let focused = ui.memory(|m| m.has_focus(id));
+        let mut scroll_to = goto.map(|ci| (ci, Some(Align::Center)));
+        if focused && vim {
+            let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+            let cursor = state.cursor.char_range().map_or(0, |r| r.primary.index);
+            if let Some(ci) = ui.input_mut(|i| e.vim.handle(&mut i.events, &e.text, &idx, cursor, excluded, editable)) {
+                state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(ci))));
+                state.store(ui.ctx(), id);
+                scroll_to = Some((ci, None));
+            }
+        } else if !focused || !self.settings.vim_mode {
+            e.vim = Default::default();
+        }
         let char_range = |line: u32, s: usize, end: usize| -> Option<(usize, usize)> {
             let &(lb, lc) = idx.get((line as usize).checked_sub(1)?)?;
             let le = idx.get(line as usize).map_or(e.text.len(), |x| x.0.saturating_sub(1));
@@ -754,13 +789,17 @@ impl App {
         ruler_lines.dedup_by_key(|x| x.0);
         let full = ui.available_rect_before_wrap();
         let ruler_w = if ruler_lines.is_empty() { 0.0 } else { 16.0 };
-        let body = Rect::from_min_max(full.min, pos2(full.max.x - ruler_w, full.max.y));
+        let digits = (total_lines.ilog10() + 1) as f32;
+        let gutter_w = ui.fonts(|f| f.glyph_width(&mono, '0')) * digits + 16.0;
+        let body = Rect::from_min_max(pos2(full.min.x + gutter_w.min((full.width() - ruler_w).max(0.0)), full.min.y), pos2(full.max.x - ruler_w, full.max.y));
         let ruler = Rect::from_min_max(pos2(body.max.x, full.min.y), full.max);
         let area = if wrap_on { ScrollArea::vertical() } else { ScrollArea::both() };
         let so = ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| area.id_salt("editor_scroll").auto_shrink([false, false]).show(ui, |ui| {
+            let mut first_layout = true;
             let mut layouter = |ui: &Ui, text: &str, wrap: f32| -> Arc<egui::Galley> {
+                let first = std::mem::take(&mut first_layout);
                 let job = match &cache {
-                    Some((k, j)) if *k == key => j.clone(),
+                    Some((k, j)) if *k == key && (first || j.text == text) => j.clone(),
                     _ => {
                         let lines: Vec<&str> = text.split('\n').collect();
                         let spans = highlight::highlight(lang, &lines);
@@ -786,8 +825,23 @@ impl App {
             };
             // reserved under the text so the highlight does not cover glyphs
             let mark_slot = ui.painter().add(egui::Shape::Noop);
-            let te = egui::TextEdit::multiline(&mut e.text).id(id).font(FontId::monospace(th.code_font)).code_editor().desired_width(if wrap_on { ui.available_width() } else { f32::INFINITY }).desired_rows(30).interactive(editable || true).layouter(&mut layouter).frame(false).margin(egui::Margin::symmetric(12, 8));
-            let out = if editable { te.show(ui) } else { egui::TextEdit::multiline(&mut e.text.as_str()).id(id).font(FontId::monospace(th.code_font)).code_editor().desired_width(if wrap_on { ui.available_width() } else { f32::INFINITY }).desired_rows(30).layouter(&mut layouter).frame(false).margin(egui::Margin::symmetric(12, 8)).show(ui) };
+            let mut readonly;
+            let text: &mut dyn egui::TextBuffer = if editable {
+                &mut e.text
+            } else {
+                readonly = e.text.as_str();
+                &mut readonly
+            };
+            let native_tab = !vim || e.vim.insert;
+            let out = egui::TextEdit::multiline(text).id(id).font(mono.clone()).code_editor()
+                .cursor_at_end(!vim).lock_focus(native_tab)
+                .desired_width(if wrap_on { ui.available_width() } else { f32::INFINITY }).desired_rows(30)
+                .layouter(&mut layouter).frame(false).margin(egui::Margin::symmetric(12, 8)).show(ui);
+            if vim {
+                ui.memory_mut(|m| m.set_focus_lock_filter(id, egui::EventFilter {
+                    escape: !excluded.contains("Esc"), tab: native_tab, horizontal_arrows: true, vertical_arrows: true,
+                }));
+            }
             if out.response.changed() {
                 e.mark = None;
             } else if !matches.is_empty() {
@@ -813,22 +867,23 @@ impl App {
                 }
                 ui.painter().set(mark_slot, egui::Shape::Vec(shapes));
             }
-            if let Some(cr) = out.cursor_range {
-                out_cursor = Some(cr.primary.ccursor.index);
+            if let Some(cr) = &out.cursor_range {
+                e.cursor_line = cr.primary.pcursor.paragraph as u32 + 1;
+            } else if let Some(ci) = goto {
+                e.cursor_line = idx.partition_point(|&(_, start)| start <= ci) as u32;
             }
-            if let Some(ci) = goto {
-                // from the galley, not cursor_range: that is only reported while focused
-                let r = out.galley.pos_from_ccursor(CCursor::new(ci));
-                scroll_rect = Some(r.translate(out.galley_pos.to_vec2()));
+            if let Some((ci, align)) = scroll_to {
+                let rect = out.galley.pos_from_ccursor(CCursor::new(ci)).translate(out.galley_pos.to_vec2());
+                ui.scroll_to_rect(if align.is_some() { rect.expand2(vec2(0.0, 80.0)) } else { rect }, align);
             }
-            if let Some(r) = scroll_rect {
-                ui.scroll_to_rect(r.expand2(vec2(0.0, 80.0)), Some(Align::Center));
-            }
+            (out.galley, out.galley_pos.y)
         }));
         e.layout_cache = cache;
+        let so = so.inner;
+        let gutter = Rect::from_min_max(pos2(full.min.x, so.inner_rect.top()), pos2(body.min.x, so.inner_rect.bottom()));
+        paint_editor_gutter(ui, &th, gutter, &so.inner.0, so.inner.1, wrap_on, e.cursor_line);
         let mut jump: Option<u32> = None;
         if !ruler_lines.is_empty() {
-            let so = so.inner;
             jump = overview_ruler(ui, &th, ruler, &ruler_lines, total_lines, cur_line, so.state.offset.y, so.inner_rect.height(), so.content_size.y);
         }
         if let Some(line) = jump {
@@ -838,12 +893,6 @@ impl App {
                 e.mark = hit.ranges.first().map(|&(s, end)| (line, s as usize, end as usize));
                 self.search.selected = Some((gi, h));
                 self.search_scroll_to = true;
-            }
-        }
-        if let Some(ci) = out_cursor {
-            if ci as u64 != e.spans_key {
-                e.spans_key = ci as u64;
-                e.cursor_line = 1 + e.text.chars().take(ci).filter(|c| *c == '\n').count() as u32;
             }
         }
         match act {

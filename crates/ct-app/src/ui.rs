@@ -509,6 +509,10 @@ impl App {
                 if let Some(e) = &self.editor {
                     if self.centre == Centre::Editor {
                         ui.label(RichText::new(format!("Ln {}", e.cursor_line)).font(f.clone()).color(th.muted()));
+                        if self.settings.vim_mode && !self.settings_open && e.load.ready().is_some() {
+                            let mode = if e.vim.insert { "Vim: Insert" } else { "Vim: Normal" };
+                            ui.label(RichText::new(mode).font(f.clone()).color(th.fg()));
+                        }
                     }
                 }
                 self.resource_label(ui, &th, f.clone());

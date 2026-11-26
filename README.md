@@ -225,7 +225,11 @@ The numbers in the last column come from other team members' test reports and we
 | `[` / `]` | Previous / next hunk |
 | `Esc` | Close popups |
 
-Single-key shortcuts are ignored while a text field has focus. The Ctrl shortcuts (and Settings `Ctrl+,`) can be rebound in Settings > Shortcuts; overrides are saved under `[keys]` in `config.toml` (`OpenProject = "Ctrl+Shift+O"`, `""` = unbound).
+The single-key app shortcuts above are ignored while a text field has focus. The Ctrl shortcuts (and Settings `Ctrl+,`) can be rebound in Settings > Shortcuts; overrides are saved under `[keys]` in `config.toml` (`OpenProject = "Ctrl+Shift+O"`, `""` = unbound).
+
+The file editor shows source line numbers on the left. Wrapped rows share one number. To use Vim navigation, enable **Settings > Shortcuts > File editor > Enable Vim bindings** (off by default). With the editor focused, use `h/j/k/l` to move, `0`/`$` for line start/end, and `gg`/`G` for the first/last line. `i`/`a` enter Insert mode in editable files, and `Esc` returns to Normal mode. The status bar shows the current mode.
+
+Uncheck any listed Vim binding to pass that key through to the standard editor. App shortcuts still take precedence. The options are stored as `vim_mode` and `vim_excluded_keys` in `config.toml` (`vim_excluded_keys = ["j", "G"]`, for example; keys are case-sensitive).
 
 ## Troubleshooting
 
